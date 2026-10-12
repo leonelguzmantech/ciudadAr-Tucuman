@@ -2,9 +2,7 @@
 node_modules/
 
 # Claves, tokens y configuraciones privadas
-.env
-.env.*
-!.env.example
+
 
 # Carpetas generadas al compilar
 dist/
