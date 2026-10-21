@@ -1,9 +1,10 @@
-# 🧪 Guía de Prueba del Sistema Multi-Tenant
+# 🧪 Guía de Prueba del Sistema de Reportes Municipales
 
-## ✅ Configuración Verificada
-- **SUPER_ADMIN**: `leonelguzman.tech@gmail.com`
+## ✅ Configuración
+- **Super administrador**: `leonelguzman.tech@gmail.com` (definido en `backend/.env` → `ADMIN_USERS`)
+- **Jurisdicciones**: provincia de Tucumán, 19 municipios y 93 comunas (cargados con `npm run import` en `backend/`)
 - **Backend**: Puerto 5001
-- **MongoDB**: Conectado
+- **MongoDB**: MongoDB Atlas (si el cluster está pausado, reanudarlo desde el panel de Atlas)
 
 ---
 
@@ -16,7 +17,7 @@
 cd backend
 npm start
 ```
-✅ Deberías ver: `Server is running on port 5001`
+✅ Deberías ver: `Server is running on port 5001` y `Connected to MongoDB`
 
 **Terminal 2 - Frontend:**
 ```bash
@@ -24,166 +25,88 @@ npm start
 ```
 ✅ Deberías ver: `Compiled successfully!` y abrirse `http://localhost:3000`
 
----
-
-### **Paso 2: Probar como SUPER_ADMIN**
-
-1. **Iniciar sesión** con `leonelguzman.tech@gmail.com` en Firebase
-2. **Verificar que aparezca**:
-   - Botón "Panel Super Admin" (verde)
-   - Botón "Ver Mapa" (azul)
-3. **Hacer clic en "Panel Super Admin"**:
-   - Deberías ver estadísticas (Total Tenants, Activos, Casos, Negocios)
-   - Tabla de tenants (probablemente vacía al inicio)
-   - Botón "+ Nuevo Tenant"
+> Si la base no tiene las jurisdicciones cargadas, correr `cd backend && npm run import`.
 
 ---
 
-### **Paso 3: Crear un Tenant (Municipio)**
+### **Paso 2: Crear un caso (como ciudadano)**
 
-1. En el **Panel Super Admin**, hacer clic en **"+ Nuevo Tenant"**
-2. Llenar el formulario:
-   - **Nombre**: `Municipio de Prueba`
-   - **Slug**: `municipio-prueba` (sin espacios, minúsculas)
-   - **Tipo**: `Municipio`
-   - **Plan**: `Pro` (o el que quieras)
-   - **Email**: `admin@municipio.com`
-3. Hacer clic en **"Crear Tenant"**
-4. ✅ Deberías ver el nuevo tenant en la tabla
+1. Iniciar sesión con una cuenta que **no** sea administradora
+2. Hacer clic en el mapa
+3. Llenar el formulario (imagen, descripción, categoría, urgencia)
+4. Hacer clic en "Subir"
+5. ✅ El caso aparece en el mapa con estado "pendiente_aprobacion"
+6. ✅ Otros usuarios comunes **no** deberían verlo todavía
 
 ---
 
-### **Paso 4: Probar Panel de Comercios (como TENANT_ADMIN)**
+### **Paso 3: Aprobar y gestionar el caso (como administrador)**
 
-**Opción A: Desde el navegador (temporal)**
-1. Abrir **DevTools** (F12) → **Console**
-2. Ejecutar:
-   ```javascript
-   localStorage.setItem('userRole', 'TENANT_ADMIN');
-   ```
-3. Recargar la página
-4. Deberías ver los botones: "Panel de Comercios", "Panel de Casos", "Ver Mapa"
+1. Cerrar sesión e iniciar con `leonelguzman.tech@gmail.com`
+2. Abrir el panel de administración en el mapa
+3. Hacer clic en **"Aprobar"** → el caso pasa a "pendiente" y lo ven todos
+4. Cambiar el estado a "en proceso" y luego a "resuelto"
+5. Probar **"Eliminar"** y luego **"Deshacer"** dentro de los 10 segundos
 
-**Opción B: Crear variable de entorno (recomendado)**
-1. En la raíz del proyecto, crear/editar `.env`:
+---
+
+### **Paso 4: Reportar resolución (como ciudadano)**
+
+1. Con una cuenta común, abrir el popup de un caso aprobado
+2. Hacer clic en **"Reportar que resolví este caso"**
+3. ✅ Como administrador, el reporte de resolución aparece en el panel
+
+---
+
+### **Paso 5: Detección automática de municipio**
+
+1. Asignar un admin a cada municipio (desde `backend/`):
    ```bash
-   REACT_APP_DEFAULT_USER_ROLE=TENANT_ADMIN
-   REACT_APP_TENANT_ID=municipio-prueba
+   npm run admins -- add yerba-buena cuenta1@gmail.com
+   npm run admins -- add san-miguel-de-tucuman cuenta2@gmail.com
    ```
-2. Reiniciar el frontend (`npm start`)
+2. Con una cuenta común, crear un caso en Yerba Buena y otro en San Miguel de Tucumán
+3. ✅ El popup de cada caso muestra "📍 Yerba Buena" o "📍 San Miguel de Tucumán"
+4. Iniciar sesión con `cuenta1@gmail.com`
+5. ✅ El panel dice "Administrás: Yerba Buena" y solo lista el caso de Yerba Buena
+6. Iniciar sesión con `cuenta2@gmail.com`
+7. ✅ Solo ve y puede aprobar el caso de San Miguel de Tucumán
 
 ---
 
-### **Paso 5: Crear un Negocio (desde Panel de Comercios)**
+## 🔍 Checklist
 
-1. Ir a **"Panel de Comercios"**
-2. Hacer clic en **"+ Nuevo negocio"** (por ahora solo muestra en consola)
-3. O probar desde **Postman**:
-   ```bash
-   POST http://localhost:5001/api/businesses
-   Headers:
-     x-user-id: leonelguzman.tech@gmail.com
-     x-tenant-id: municipio-prueba
-     x-user-role: TENANT_ADMIN
-   Body (JSON):
-   {
-     "name": "Farmacia 24/7",
-     "category": "pharmacy",
-     "contact": {
-       "phone": "+54 381 1234567",
-       "email": "contacto@farmacia.com"
-     }
-   }
-   ```
-4. Volver al panel y deberías ver el negocio en la tabla
-
----
-
-### **Paso 6: Probar el Mapa**
-
-1. Hacer clic en **"Ver Mapa"**
-2. **Crear un caso**:
-   - Hacer clic en el mapa
-   - Llenar el formulario (imagen, descripción, categoría, urgencia)
-   - Hacer clic en "Subir"
-3. ✅ El caso debería aparecer en el mapa con estado "pendiente_aprobacion"
-4. **Aprobar el caso** (si sos admin):
-   - Abrir el panel de admin en el mapa
-   - Cambiar el estado a "pendiente"
-
----
-
-### **Paso 7: Probar "Locales Abiertos"**
-
-1. En el mapa, activar **"Mostrar locales abiertos"**
-2. Si creaste un negocio con ubicación, deberías ver:
-   - Marcadores verdes con animación
-   - Al hacer clic, popup con información del negocio
-3. Los casos municipales deberían ocultarse cuando está activo
-
----
-
-## 🔍 Verificar Funcionalidades
-
-### ✅ Checklist SUPER_ADMIN:
-- [ ] Ver Panel Super Admin
-- [ ] Crear nuevo tenant
-- [ ] Cambiar plan de suscripción (Free → Pro → Enterprise)
-- [ ] Activar/Desactivar tenant
-- [ ] Ver estadísticas globales
-
-### ✅ Checklist TENANT_ADMIN:
-- [ ] Ver Panel de Comercios
-- [ ] Ver Panel de Casos
-- [ ] Crear negocio (desde Postman o panel)
+### ✅ Administrador:
+- [ ] Ver todos los reportes (incluida la categoría "Familias")
 - [ ] Aprobar casos pendientes
 - [ ] Cambiar estados de casos
+- [ ] Eliminar casos (con opción de deshacer)
+- [ ] Ver reportes de resolución de ciudadanos
 
-### ✅ Checklist PUBLIC_USER:
+### ✅ Ciudadano:
 - [ ] Ver mapa
 - [ ] Crear reporte/caso
 - [ ] Ver su propio caso (aunque esté pendiente)
-- [ ] Ver locales abiertos (si hay)
+- [ ] Editar y eliminar sus propios casos
+- [ ] No ver casos de "Familias" de otros usuarios
+- [ ] Reportar que resolvió un caso
 
 ---
 
 ## 🐛 Solución de Problemas
 
-### **No veo el botón "Panel Super Admin"**
-- Verificar que tu correo esté en `backend/.env` → `ADMIN_USERS=tu_correo@gmail.com`
+### **`Error connecting to MongoDB ... ENOTFOUND`**
+- El cluster de MongoDB Atlas probablemente está pausado: reanudarlo desde el panel de Atlas
 - Reiniciar el backend
+
+### **No veo el panel de administración**
+- Super admin: verificar que tu correo esté en `backend/.env` → `ADMIN_USERS=tu_correo@gmail.com` y reiniciar el backend
+- Admin de municipio: verificar con `npm run admins -- list` que tu correo esté asignado
 - Verificar en DevTools → Network que `/api/auth/me` devuelva `isAdmin: true`
 
-### **Error 404 al crear tenant**
-- Verificar que el backend esté corriendo en puerto 5001
-- Verificar headers en Network tab
+### **Un caso dice "Fuera de las jurisdicciones registradas"**
+- El punto está fuera de Tucumán (por ahora solo está cargada esa provincia)
 
-### **No puedo crear negocios**
-- Verificar que el `tenantId` coincida con el slug del tenant creado
-- Verificar que el header `x-user-role: TENANT_ADMIN` esté presente
-
-### **No veo estadísticas**
-- Verificar que haya datos en MongoDB (tenants, markers, businesses)
-- Revisar consola del backend por errores
-
----
-
-## 📝 Notas
-
-- **Roles**: Por ahora, el rol se determina por:
-  - `ADMIN_USERS` → SUPER_ADMIN (automático)
-  - `x-user-role` header → TENANT_ADMIN/TENANT_STAFF (manual)
-  - Por defecto → PUBLIC_USER
-
-- **Tenant ID**: Se lee de `REACT_APP_TENANT_ID` o usa `demo-municipio` por defecto
-
-- **Próximos pasos**: Integrar Firebase Custom Claims para roles más robustos
-
-
-
-
-
-
-
-
-
+### **Los casos no aparecen**
+- Revisar los filtros aplicados en el mapa
+- Los casos pendientes de aprobación solo los ven su creador y los admins de esa jurisdicción

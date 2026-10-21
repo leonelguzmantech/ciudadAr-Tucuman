@@ -30,8 +30,10 @@ Los ciudadanos pueden:
 - ❌ **NO pueden ver** reportes pendientes de aprobación de otros usuarios
 
 ### 2. **Administradores Municipales**
+Cada administrador está asignado a un municipio, comuna o provincia, y solo gestiona los reportes de su territorio. Los super administradores (`ADMIN_USERS`) gestionan todos.
+
 Los administradores pueden:
-- ✅ Ver **todos** los reportes (incluyendo categoría "Familias")
+- ✅ Ver **todos** los reportes de su jurisdicción (incluyendo categoría "Familias")
 - ✅ Aprobar reportes pendientes de aprobación
 - ✅ Cambiar el estado de los casos:
   - Pendiente de aprobación → Pendiente
@@ -170,20 +172,20 @@ Mapa-main/
 ├── backend/
 │   ├── config/
 │   │   └── admins.js              # Configuración de administradores globales
-│   ├── middleware/
-│   │   └── tenant.js              # Middleware multi-tenant (x-tenant-id)
+│   ├── data/
+│   │   └── tucuman.geojson        # Límites oficiales de Tucumán, sus municipios y comunas
 │   ├── models/
 │   │   ├── marker.js              # Modelo de datos de marcadores
-│   │   ├── tenant.js              # Organizaciones (municipios/comercios)
-│   │   ├── business.js            # Cadena/comercio dentro de un tenant
-│   │   └── businessLocation.js    # Sucursales con geolocalización
+│   │   └── tenant.js              # Jurisdicciones (provincias, municipios, comunas)
 │   ├── routes/
 │   │   ├── markerRoutes.js        # Rutas privadas para marcadores
-│   │   ├── tenantRoutes.js        # Administración global de tenants
-│   │   ├── businessRoutes.js      # Panel para comercios por tenant
 │   │   └── publicRoutes.js        # Endpoints públicos (mapa ciudadano)
+│   ├── scripts/
+│   │   ├── importJurisdictions.js # Importa jurisdicciones y reasigna reportes
+│   │   └── manageAdmins.js        # Asigna administradores a cada jurisdicción
 │   ├── utils/
-│   │   └── users.js               # Utilidades de usuarios y permisos
+│   │   ├── jurisdictions.js       # Detección de jurisdicción por ubicación y permisos
+│   │   └── users.js               # Utilidades de usuarios
 │   ├── server.js                  # Servidor Express principal
 │   └── package.json
 ├── src/
@@ -221,26 +223,40 @@ Crear archivo `.env` en la carpeta `backend/`:
 ```env
 MONGODB_URI=mongodb+srv://usuario:password@cluster.mongodb.net/?retryWrites=true&w=majority
 ADMIN_USERS=admin1@municipio.gov.ar,admin2@municipio.gov.ar
-DEFAULT_TENANT_SLUG=municipalidad-san-miguel
 PORT=5001
 ```
 
 **Variables de entorno:**
 - `MONGODB_URI`: URL de conexión a MongoDB
-- `ADMIN_USERS`: Lista de emails de administradores globales separados por comas
-- `DEFAULT_TENANT_SLUG`: *Slug* del tenant que se usará por defecto cuando el frontend no envía `x-tenant-id`
+- `ADMIN_USERS`: Super administradores, separados por comas (ven y gestionan los casos de todas las jurisdicciones)
 - `PORT`: Puerto del servidor (por defecto 5001)
 
-> **Importante:** crea al menos un tenant cuyo `slug` coincida con `DEFAULT_TENANT_SLUG` (vía `POST /api/tenants`) antes de usar el mapa, para que todos los reportes queden asociados correctamente.
+### 3. Cargar las jurisdicciones:
 
-### 3. Instalación del Frontend:
+```bash
+cd backend
+npm run import
+```
+
+Importa la provincia de Tucumán con sus 19 municipios y 93 comunas rurales (límites oficiales del IGN y nombres de la API Georef) y asigna cada reporte existente a la jurisdicción donde está. Se puede volver a correr sin duplicar datos.
+
+Para asignar administradores a un municipio, comuna o provincia:
+
+```bash
+npm run admins -- find "yerba"                          # buscar el slug
+npm run admins -- add yerba-buena admin@yerbabuena.gob.ar
+npm run admins -- remove yerba-buena admin@yerbabuena.gob.ar
+npm run admins -- list                                  # ver quién administra qué
+```
+
+### 4. Instalación del Frontend:
 
 ```bash
 # Desde la raíz del proyecto
 npm install
 ```
 
-### 4. Configuración del Frontend:
+### 5. Configuración del Frontend:
 
 En `src/components/Home.js`, actualizar la clave de Google Maps:
 
@@ -248,13 +264,7 @@ En `src/components/Home.js`, actualizar la clave de Google Maps:
 const GOOGLE_MAPS_API_KEY = "TU_CLAVE_DE_GOOGLE_MAPS";
 ```
 
-Crear (o actualizar) el archivo `.env` en la raíz para indicar el tenant que consumirá el frontend:
-
-```env
-REACT_APP_TENANT_ID=municipalidad-san-miguel
-```
-
-### 5. Ejecutar el Proyecto:
+### 6. Ejecutar el Proyecto:
 
 **Terminal 1 - Backend:**
 ```bash
@@ -280,7 +290,8 @@ El backend estará disponible en `http://localhost:5001`
 {
   _id: ObjectId,                    // ID único de MongoDB
   caseId: Number,                    // ID único del caso (#1, #2, #3...)
-  tenant: ObjectId,                 // Referencia al tenant dueño del caso
+  tenant: ObjectId,                 // Municipio o comuna donde está el caso (o la provincia si no cae en ninguno)
+  province: ObjectId,               // Provincia donde está el caso
   lat: Number,                       // Latitud
   lng: Number,                       // Longitud
   imageUrl: String,                 // Ruta del endpoint `/api/markers/:id/image`
@@ -304,62 +315,19 @@ El backend estará disponible en `http://localhost:5001`
 }
 ```
 
-### Tenant:
+### Tenant (Jurisdicción):
 
 ```javascript
 {
   _id: ObjectId,
-  name: String,                     // Nombre comercial (Municipio, cadena, etc.)
-  slug: String,                     // Identificador único en minúsculas (usado en x-tenant-id)
-  type: 'municipality' | 'business' | 'hybrid',
+  name: String,                     // Nombre (ej: 'Yerba Buena')
+  slug: String,                     // Identificador único en minúsculas (ej: 'yerba-buena')
+  code: String,                     // Código oficial INDEC/IGN (ej: '900133')
+  type: 'province' | 'municipality' | 'commune',
+  parent: ObjectId,                 // Provincia a la que pertenece
+  boundary: GeoJSON,                // Límite geográfico (Polygon o MultiPolygon, índice 2dsphere)
+  admins: [String],                 // Emails de quienes administran sus reportes
   status: 'active' | 'inactive' | 'pending',
-  billingPlan: 'free' | 'pro' | 'enterprise',
-  contactEmail: String,
-  settings: Object,                 // Configuraciones específicas (features activados)
-  metadata: Object,                 // Campos personalizados
-  createdAt / updatedAt
-}
-```
-
-### Business:
-
-```javascript
-{
-  _id: ObjectId,
-  tenant: ObjectId,                 // Tenant al que pertenece
-  name: String,
-  description: String,
-  category: 'pharmacy' | 'drugstore' | 'store24' | 'health' | 'other',
-  status: 'active' | 'inactive',
-  contact: { phone, whatsapp, email, website },
-  settings: Object,
-  metadata: Object,
-  createdBy: String,
-  createdAt / updatedAt
-}
-```
-
-### BusinessLocation:
-
-```javascript
-{
-  _id: ObjectId,
-  business: ObjectId,
-  tenant: ObjectId,
-  name: String,
-  status: 'open' | 'closed' | 'on_call' | 'twenty_four',
-  visibility: 'public' | 'tenant_only' | 'private',
-  lat: Number,
-  lng: Number,
-  location: { type: 'Point', coordinates: [lng, lat] },  // Índice 2dsphere
-  address: String,
-  city: String,
-  province: String,
-  contactPhone: String,
-  notes: String,
-  hours: [{ day: 'mon', ranges: [{ open: '08:00', close: '13:00' }] }],
-  metadata: Object,
-  createdBy: String,
   createdAt / updatedAt
 }
 ```
@@ -369,43 +337,24 @@ El backend estará disponible en `http://localhost:5001`
 ## 🔌 API Endpoints
 
 ### Requerimientos comunes
-- `x-tenant-id`: slug u ObjectId del tenant destino (si no se envía, el backend usa `DEFAULT_TENANT_SLUG`)
 - `x-user-id`: email del usuario autenticado (normalizado a minúsculas)
-- `x-user-role` (opcional): `TENANT_ADMIN`, `TENANT_STAFF`, etc. para paneles comerciales
 
 ### Marcadores (panel municipal)
-- `GET /api/markers` – Lista los marcadores del tenant (aplica filtros de privacidad y estado)
-- `POST /api/markers` – Crea un nuevo marcador (las imágenes se guardan en MongoDB)
+- `GET /api/markers` – Lista los marcadores visibles para el usuario (aplica filtros de privacidad, estado y jurisdicción)
+- `POST /api/markers` – Crea un nuevo marcador y lo asigna a la jurisdicción según su ubicación (las imágenes se guardan en MongoDB)
 - `GET /api/markers/:id/image` – Devuelve la imagen asociada
 - `POST /api/markers/:id/report-resolved` – El ciudadano reporta que resolvió un caso
 - `PUT /api/markers/:id` – Actualiza un marcador (solo su creador)
-- `DELETE /api/markers/:id` – Elimina un marcador (creador o admin)
-- `GET /api/markers/admin` – Panel administrativo del tenant
+- `DELETE /api/markers/:id` – Elimina un marcador (creador o admin de su jurisdicción)
+- `GET /api/markers/admin` – Casos de las jurisdicciones que administra el usuario
 - `PATCH /api/markers/admin/:id/status` – Cambiar estado (pendiente, en_proceso, etc.)
 - `PATCH /api/markers/admin/:id/approve` – Aprobar marcadores nuevos
 
-### Administración global de tenants (solo `ADMIN_USERS`)
-- `POST /api/tenants` – Crea un nuevo tenant (municipio/cadena)
-- `GET /api/tenants` – Lista / filtra tenants existentes
-- `GET /api/tenants/:tenantId` – Obtiene detalle por ID o slug
-- `PATCH /api/tenants/:tenantId` – Actualiza datos, plan y settings
-
-### Comercios por tenant (`requireTenant`)
-- `POST /api/businesses` – Crea un negocio para el tenant actual
-- `GET /api/businesses` – Lista negocios del tenant (filtros por categoría/estado)
-- `GET /api/businesses/:businessId` – Obtiene un negocio específico
-- `PATCH /api/businesses/:businessId` – Edita datos (solo `TENANT_ADMIN`)
-- `DELETE /api/businesses/:businessId` – Elimina negocio + sucursales
-- `POST /api/businesses/:businessId/locations` – Agrega sucursal (lat/lng, horarios, notas)
-- `GET /api/businesses/:businessId/locations` – Lista sucursales del negocio
-- `PATCH /api/businesses/locations/:locationId` – Actualiza estado/horarios de una sucursal
-- `DELETE /api/businesses/locations/:locationId` – Elimina una sucursal
+### Autenticación
+- `GET /api/auth/me` – Indica si el usuario es administrador (según `ADMIN_USERS`)
 
 ### Endpoints públicos (sin headers)
 - `GET /api/public/markers` – Casos visibles por tenant/estado/categoría
-- `GET /api/public/businesses` – Busca locales abiertos (por tenant, categoría o cercanía)
-- `GET /api/public/businesses/:businessId` – Perfil básico de un negocio + sucursales públicas
-- `GET /api/public/locations/:locationId` – Detalle de una sucursal para compartir en enlaces/QR
 
 ---
 
@@ -446,15 +395,11 @@ El backend estará disponible en `http://localhost:5001`
 - Casos resueltos se eliminan automáticamente después de 10 días
 - Mantiene la base de datos limpia
 
-### 7. **Plataforma Multi-tenant**
-- Middleware `x-tenant-id` para aislar municipios o cadenas comerciales
-- Super administradores (definidos en `ADMIN_USERS`) pueden crear/editar tenants sin tocar la base
-- Cada tenant posee sus propios reportes, configuraciones y paneles
-
-### 8. **Directorio de Comercios Abiertos**
-- Modelo de negocios + sucursales con índices geoespaciales
-- Panel por tenant para cargar farmacias, drugstores, etc.
-- API pública `/api/public/businesses` para mostrar locales abiertos al ciudadano (filtros por categoría, radio y estado)
+### 7. **Detección Automática de Jurisdicción**
+- Una sola app y un solo mapa para todos los ciudadanos
+- Cada reporte se asigna automáticamente al municipio o comuna donde está, usando sus límites oficiales (consulta geoespacial `$geoIntersects` de MongoDB)
+- Jerarquía provincia → municipio/comuna: el admin de un municipio gestiona sus casos; el admin de una provincia, todos los de la provincia
+- Sumar una jurisdicción nueva es cargar sus límites y asignar sus admins, sin publicar otra app
 
 ---
 
@@ -466,8 +411,8 @@ El backend estará disponible en `http://localhost:5001`
 
 ### Autorización:
 - Verificación de permisos en backend
-- Headers `x-user-id` y `x-tenant-id` para identificar usuario + tenant
-- Lista de administradores en variable de entorno
+- Header `x-user-id` para identificar al usuario
+- Super administradores en variable de entorno; administradores de cada jurisdicción en la base de datos
 
 ### Privacidad:
 - Reportes de "Familias" solo visibles para creador y administradores

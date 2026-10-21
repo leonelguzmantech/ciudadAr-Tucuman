@@ -2,13 +2,15 @@
 const express = require('express');
 const multer = require('multer');
 const Marker = require('../models/marker');
-const { requireTenant } = require('../middleware/tenant');
+const { normalizeUserId, getRequestUser } = require('../utils/users');
 const {
-  normalizeUserId,
-  getRequestUser,
-  requireAdmin,
-  isAdminUser,
-} = require('../utils/users');
+  findJurisdictionForPoint,
+  getAdminScope,
+  isScopeAdmin,
+  canManageMarker,
+  buildManagedMarkersFilter,
+} = require('../utils/jurisdictions');
+const { removeExpiredMarkers } = require('../utils/markerExpiry');
 const router = express.Router();
 
 // Configuración de multer para almacenar los archivos en memoria
@@ -53,7 +55,21 @@ const getNextCaseId = async () => {
   return lastCaseId + 1;
 };
 
-const sanitizeMarkerResponse = (markerDoc) => {
+const JURISDICTION_FIELDS = 'name type';
+
+const RADIO_MISMO_CASO_METROS = 50;
+
+const distanciaMetros = (lat1, lng1, lat2, lng2) => {
+  const tierra = 6371000;
+  const aGrados = (grados) => (grados * Math.PI) / 180;
+  const dLat = aGrados(lat2 - lat1);
+  const dLng = aGrados(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(aGrados(lat1)) * Math.cos(aGrados(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * tierra * Math.asin(Math.min(1, Math.sqrt(a)));
+};
+
+const sanitizeMarkerResponse = (markerDoc, scope = null, requester = null) => {
   if (!markerDoc) {
     return null;
   }
@@ -64,77 +80,84 @@ const sanitizeMarkerResponse = (markerDoc) => {
   if (marker.image) {
     delete marker.image;
   }
+  if (marker.resolutionImage) {
+    delete marker.resolutionImage;
+  }
+  const confirmations = Array.isArray(marker.confirmations) ? marker.confirmations : [];
+  const puedeVerVecinos = scope && canManageMarker(scope, marker);
+  marker.neighborCount = 1 + confirmations.length;
+  marker.confirmedByMe = !!requester && confirmations.some(
+    (confirmacion) => normalizeUserId(confirmacion.userId) === requester
+  );
+  marker.confirmations = confirmations.map((confirmacion, index) => ({
+    description: confirmacion.description || '',
+    createdAt: confirmacion.createdAt,
+    imageUrl: confirmacion.imageUrl
+      || (confirmacion.image && confirmacion.image.data
+        ? `/api/markers/${marker._id}/confirmations/${index}/image`
+        : ''),
+    ...(puedeVerVecinos ? { userId: confirmacion.userId } : {}),
+  }));
+  const jurisdiction = marker.tenant && marker.tenant.name ? marker.tenant : null;
+  marker.jurisdictionName = jurisdiction ? jurisdiction.name : null;
+  marker.jurisdictionType = jurisdiction ? jurisdiction.type : null;
+  if (marker.tenant && marker.tenant._id) marker.tenant = marker.tenant._id;
+  if (marker.province && marker.province._id) marker.province = marker.province._id;
+  if (scope) {
+    marker.canManage = canManageMarker(scope, marker);
+  }
   return marker;
 };
 
-const allowsOrphanMarkers = (req) =>
-  !!req.tenant &&
-  !!process.env.DEFAULT_TENANT_SLUG &&
-  req.tenant.slug === process.env.DEFAULT_TENANT_SLUG;
-
-const buildMarkerLookupFilter = (markerId, req) => {
-  const tenantId = req.tenant ? req.tenant._id : null;
-  if (!tenantId) {
-    return { _id: markerId };
+const loadAdminScope = async (req, res, next) => {
+  try {
+    req.requester = getRequestUser(req);
+    req.adminScope = await getAdminScope(req.requester);
+    next();
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
-  if (allowsOrphanMarkers(req)) {
-    return {
-      _id: markerId,
-      $or: [{ tenant: tenantId }, { tenant: { $exists: false } }, { tenant: null }],
-    };
-  }
-  return { _id: markerId, tenant: tenantId };
 };
 
-router.use(requireTenant);
+const requireJurisdictionAdmin = (req, res, next) => {
+  if (!isScopeAdmin(req.adminScope)) {
+    return res.status(403).json({ message: 'Acceso de administrador requerido' });
+  }
+  next();
+};
+
+router.use(loadAdminScope);
 
 // Ruta para obtener todos los marcadores
 router.get('/', async (req, res) => {
   try {
-    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
-    await Marker.deleteMany({
-      status: 'resuelto',
-      resolvedAt: { $lte: tenDaysAgo },
+    await removeExpiredMarkers();
+
+    const { requester, adminScope } = req;
+
+    // Obtener todos los marcadores sin la información binaria de la imagen
+    const markers = await Marker.find()
+      .select('-image -resolutionImage -confirmations.image')
+      .populate('tenant', JURISDICTION_FIELDS);
+
+    // Los admins ven todo lo de su jurisdicción; el resto, solo lo aprobado y no privado
+    const visibleMarkers = markers.filter((marker) => {
+      if (canManageMarker(adminScope, marker)) {
+        return true;
+      }
+      const markerOwner = normalizeUserId(marker.createdBy);
+      // Marcadores pendientes de aprobación: solo el creador puede verlos
+      if (marker.status === 'pendiente_aprobacion') {
+        return markerOwner === requester;
+      }
+      // Familias y personas en situación de calle: solo el creador puede verlas
+      if (marker.category === 'familias' || marker.category === 'persona') {
+        return markerOwner === requester;
+      }
+      return true;
     });
 
-    const requester = getRequestUser(req);
-    const isAdmin = isAdminUser(requester);
-    const tenantId = req.tenant ? req.tenant._id : null;
-    const allowOrphans =
-      !!tenantId &&
-      !!process.env.DEFAULT_TENANT_SLUG &&
-      req.tenant.slug === process.env.DEFAULT_TENANT_SLUG;
-    const tenantCriteria = tenantId
-      ? allowOrphans
-        ? { $or: [{ tenant: tenantId }, { tenant: { $exists: false } }, { tenant: null }] }
-        : { tenant: tenantId }
-      : {};
-    
-    // Obtener todos los marcadores sin la información binaria de la imagen
-    let markers = await Marker.find(tenantCriteria).select('-image');
-    
-    // Filtrar marcadores según permisos del usuario
-    if (!isAdmin) {
-      markers = markers.filter(marker => {
-        if (marker.tenant && tenantId && String(marker.tenant) !== String(tenantId)) {
-          return false;
-        }
-        // Marcadores pendientes de aprobación: solo el creador puede verlos
-        if (marker.status === 'pendiente_aprobacion') {
-          const markerOwner = normalizeUserId(marker.createdBy);
-          return markerOwner === requester; // Solo ver sus propios marcadores pendientes
-        }
-        
-        // Filtrar marcadores de "familias": solo mostrar si el usuario es el creador
-        if (marker.category === 'familias') {
-          const markerOwner = normalizeUserId(marker.createdBy);
-          return markerOwner === requester;
-        }
-        return true; // Mostrar todos los demás marcadores aprobados (pendiente, en_proceso, resuelto)
-      });
-    }
-    
-    res.json(markers.map(sanitizeMarkerResponse));
+    res.json(visibleMarkers.map((marker) => sanitizeMarkerResponse(marker, adminScope, requester)));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -144,49 +167,49 @@ router.get('/', async (req, res) => {
 // Ruta para agregar un nuevo marcador
 router.post('/', upload.single('image'), async (req, res) => {
   const { lat, lng, date, time, description, urgency, status, category, visibility } = req.body;
-  const createdBy = getRequestUser(req);
-  const isAdmin = isAdminUser(createdBy);
+  const { requester: createdBy, adminScope } = req;
   const normalizedCategory = normalizeCategory(category);
-  const tenantId = req.tenant ? req.tenant._id : null;
-  
-  // Usuarios normales crean marcadores con "pendiente_aprobacion", admins pueden especificar el estado
-  let finalStatus;
-  if (isAdmin && status) {
-    finalStatus = normalizeStatus(status, 'pendiente');
-  } else {
-    finalStatus = 'pendiente_aprobacion'; // Usuarios normales siempre crean con este estado
-  }
-
-  // Generar caseId único tomando el último caseId existente
-  const caseId = await getNextCaseId();
-
-  const newMarker = new Marker({
-    tenant: tenantId,
-    lat,
-    lng,
-    date,
-    time,
-    description,
-    urgency,
-    status: finalStatus,
-    category: normalizedCategory,
-    visibility: visibility || 'public',
-    createdBy,
-    caseId,
-    resolvedAt: computeResolvedAt(finalStatus),
-  });
-
-  if (req.file) {
-    newMarker.image = {
-      data: req.file.buffer,
-      contentType: req.file.mimetype || 'application/octet-stream',
-    };
-    newMarker.imageUrl = `/api/markers/${newMarker._id}/image`;
-  }
 
   try {
+    const jurisdiction = await findJurisdictionForPoint(lat, lng);
+
+    // Solo quien administra esa jurisdicción puede crear con un estado distinto
+    let finalStatus = 'pendiente_aprobacion';
+    if (status && canManageMarker(adminScope, jurisdiction)) {
+      finalStatus = normalizeStatus(status, 'pendiente');
+    }
+
+    // Generar caseId único tomando el último caseId existente
+    const caseId = await getNextCaseId();
+
+    const newMarker = new Marker({
+      tenant: jurisdiction.tenant,
+      province: jurisdiction.province,
+      lat,
+      lng,
+      date,
+      time,
+      description,
+      urgency,
+      status: finalStatus,
+      category: normalizedCategory,
+      visibility: visibility || 'public',
+      createdBy,
+      caseId,
+      resolvedAt: computeResolvedAt(finalStatus),
+    });
+
+    if (req.file) {
+      newMarker.image = {
+        data: req.file.buffer,
+        contentType: req.file.mimetype || 'application/octet-stream',
+      };
+      newMarker.imageUrl = `/api/markers/${newMarker._id}/image`;
+    }
+
     const savedMarker = await newMarker.save();
-    res.status(201).json(sanitizeMarkerResponse(savedMarker));
+    await savedMarker.populate('tenant', JURISDICTION_FIELDS);
+    res.status(201).json(sanitizeMarkerResponse(savedMarker, adminScope, createdBy));
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -196,20 +219,12 @@ router.post('/', upload.single('image'), async (req, res) => {
 router.put('/:id', upload.single('image'), async (req, res) => {
   const { id } = req.params;
   const { lat, lng, date, time, description, urgency, status, category, visibility } = req.body;
-  const requester = getRequestUser(req);
-  const tenantId = req.tenant ? req.tenant._id : null;
+  const { requester, adminScope } = req;
 
   try {
     const existingMarker = await Marker.findById(id);
     if (!existingMarker) {
       return res.status(404).json({ message: 'Marker not found' });
-    }
-    if (
-      tenantId &&
-      existingMarker.tenant &&
-      String(existingMarker.tenant) !== String(tenantId)
-    ) {
-      return res.status(403).json({ message: 'No autorizado para editar este marcador' });
     }
     const markerOwner = normalizeUserId(existingMarker.createdBy);
     if (markerOwner !== requester) {
@@ -231,6 +246,14 @@ router.put('/:id', upload.single('image'), async (req, res) => {
       resolvedAt: computeResolvedAt(normalizedStatus, existingMarker.resolvedAt),
     };
 
+    const moved =
+      Number(lat) !== existingMarker.lat || Number(lng) !== existingMarker.lng;
+    if (moved) {
+      const jurisdiction = await findJurisdictionForPoint(lat, lng);
+      updateData.tenant = jurisdiction.tenant;
+      updateData.province = jurisdiction.province;
+    }
+
     if (req.file) {
       updateData.image = {
         data: req.file.buffer,
@@ -241,8 +264,8 @@ router.put('/:id', upload.single('image'), async (req, res) => {
 
     const updatedMarker = await Marker.findByIdAndUpdate(id, updateData, {
       new: true,
-    });
-    res.json(sanitizeMarkerResponse(updatedMarker));
+    }).populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(updatedMarker, adminScope, requester));
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -250,22 +273,14 @@ router.put('/:id', upload.single('image'), async (req, res) => {
 
 // Ruta para eliminar un marcador
 router.delete('/:id', async (req, res) => {
-  const requester = getRequestUser(req);
-  const tenantId = req.tenant ? req.tenant._id : null;
+  const { requester, adminScope } = req;
   try {
     const existingMarker = await Marker.findById(req.params.id);
     if (!existingMarker) {
       return res.status(404).json({ message: 'Marker not found' });
     }
-    if (
-      tenantId &&
-      existingMarker.tenant &&
-      String(existingMarker.tenant) !== String(tenantId)
-    ) {
-      return res.status(403).json({ message: 'No autorizado para eliminar este marcador' });
-    }
     const markerOwner = normalizeUserId(existingMarker.createdBy);
-    if (markerOwner !== requester && !isAdminUser(requester)) {
+    if (markerOwner !== requester && !canManageMarker(adminScope, existingMarker)) {
       return res.status(403).json({ message: 'No autorizado para eliminar este marcador' });
     }
 
@@ -277,64 +292,68 @@ router.delete('/:id', async (req, res) => {
 });
 
 // ----- Rutas de administrador -----
-router.get('/admin', requireAdmin, async (req, res) => {
+router.get('/admin', requireJurisdictionAdmin, async (req, res) => {
   try {
-    const tenantId = req.tenant ? req.tenant._id : null;
-    const criteria = tenantId ? { tenant: tenantId } : {};
-    const markers = await Marker.find(criteria).select('-image').sort({ createdAt: -1 });
-    res.json(markers.map(sanitizeMarkerResponse));
+    const markers = await Marker.find(buildManagedMarkersFilter(req.adminScope))
+      .select('-image -resolutionImage -confirmations.image')
+      .populate('tenant', JURISDICTION_FIELDS)
+      .sort({ createdAt: -1 });
+    res.json(markers.map((marker) => sanitizeMarkerResponse(marker, req.adminScope, req.requester)));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-router.patch('/admin/:id/status', requireAdmin, async (req, res) => {
+router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => {
   const { status } = req.body;
   if (!status) {
     return res.status(400).json({ message: 'Estado requerido' });
   }
   const normalizedStatus = normalizeStatus(status);
   try {
-    const tenantId = req.tenant ? req.tenant._id : null;
-    const filter = tenantId ? { _id: req.params.id, tenant: tenantId } : { _id: req.params.id };
-    const updatedMarker = await Marker.findOneAndUpdate(
-      filter,
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    const updatedMarker = await Marker.findByIdAndUpdate(
+      marker._id,
       {
         status: normalizedStatus,
         resolvedAt: computeResolvedAt(normalizedStatus),
       },
       { new: true }
-    );
-    if (!updatedMarker) {
-      return res.status(404).json({ message: 'Marker not found' });
-    }
-    res.json(sanitizeMarkerResponse(updatedMarker));
+    ).populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
 // Ruta para aprobar un marcador (cambiar de pendiente_aprobacion a pendiente)
-router.patch('/admin/:id/approve', requireAdmin, async (req, res) => {
+router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) => {
   try {
-    const tenantId = req.tenant ? req.tenant._id : null;
-    const filter = tenantId ? { _id: req.params.id, tenant: tenantId } : { _id: req.params.id };
-    const marker = await Marker.findOne(filter);
+    const marker = await Marker.findById(req.params.id);
     if (!marker) {
       return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
     if (marker.status !== 'pendiente_aprobacion') {
       return res.status(400).json({ message: 'El marcador no está pendiente de aprobación' });
     }
-    const updatedMarker = await Marker.findOneAndUpdate(
-      filter,
+    const updatedMarker = await Marker.findByIdAndUpdate(
+      marker._id,
       {
         status: 'pendiente',
         resolvedAt: null,
       },
       { new: true }
-    );
-    res.json(sanitizeMarkerResponse(updatedMarker));
+    ).populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -343,7 +362,7 @@ router.patch('/admin/:id/approve', requireAdmin, async (req, res) => {
 // Ruta para obtener la imagen asociada a un marcador
 router.get('/:id/image', async (req, res) => {
   try {
-    const marker = await Marker.findOne(buildMarkerLookupFilter(req.params.id, req)).select('image imageUrl');
+    const marker = await Marker.findById(req.params.id).select('image imageUrl');
     if (!marker || !marker.image || !marker.image.data) {
       return res.status(404).json({ message: 'Imagen no encontrada' });
     }
@@ -355,31 +374,133 @@ router.get('/:id/image', async (req, res) => {
   }
 });
 
-// Ruta para que usuarios reporten que resolvieron un caso
-router.post('/:id/report-resolved', async (req, res) => {
+// Ruta para obtener la foto con la que un vecino avisó que resolvió el caso
+router.get('/:id/resolution-image', async (req, res) => {
   try {
-    const tenantId = req.tenant ? req.tenant._id : null;
-    const filter = tenantId ? { _id: req.params.id, tenant: tenantId } : { _id: req.params.id };
-    const marker = await Marker.findOne(filter);
+    const marker = await Marker.findById(req.params.id).select('resolutionImage');
+    if (!marker || !marker.resolutionImage || !marker.resolutionImage.data) {
+      return res.status(404).json({ message: 'Imagen no encontrada' });
+    }
+    res.set('Content-Type', marker.resolutionImage.contentType || 'application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.send(marker.resolutionImage.data);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Ruta para que usuarios reporten que resolvieron un caso. La foto es obligatoria.
+router.post('/:id/report-resolved', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'Tenés que adjuntar una foto de cómo quedó' });
+    }
+    if (!String(req.file.mimetype || '').startsWith('image/')) {
+      return res.status(400).json({ message: 'El archivo tiene que ser una imagen' });
+    }
+
+    const marker = await Marker.findById(req.params.id);
     if (!marker) {
       return res.status(404).json({ message: 'Marker not found' });
     }
-    
+    if (marker.resolvedBy) {
+      return res.status(400).json({ message: 'Este caso ya tiene un aviso de resolución' });
+    }
+
     // Solo permitir reportar resolución para casos aprobados (pendiente o en_proceso)
     if (marker.status !== 'pendiente' && marker.status !== 'en_proceso') {
       return res.status(400).json({ message: 'Solo se pueden reportar casos pendientes o en proceso' });
     }
-    
-    const reporter = getRequestUser(req);
-    const updatedMarker = await Marker.findOneAndUpdate(
-      filter,
+
+    const updatedMarker = await Marker.findByIdAndUpdate(
+      marker._id,
       {
-        resolvedBy: reporter,
+        resolvedBy: req.requester,
         resolvedByReportedAt: new Date(),
+        resolutionImage: {
+          data: req.file.buffer,
+          contentType: req.file.mimetype || 'application/octet-stream',
+        },
+        resolutionImageUrl: `/api/markers/${marker._id}/resolution-image`,
       },
       { new: true }
+    ).populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.post('/:id/confirm', upload.single('image'), async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (marker.category !== 'reparaciones') {
+      return res.status(400).json({ message: 'Solo se pueden sumar denuncias a una reparación' });
+    }
+    if (marker.status !== 'pendiente' && marker.status !== 'en_proceso') {
+      return res.status(400).json({ message: 'Este caso todavía no está publicado o ya se resolvió' });
+    }
+    if (normalizeUserId(marker.createdBy) === req.requester) {
+      return res.status(400).json({ message: 'Este caso ya es tuyo' });
+    }
+    const yaConfirmo = (marker.confirmations || []).some(
+      (confirmacion) => normalizeUserId(confirmacion.userId) === req.requester
     );
-    res.json(sanitizeMarkerResponse(updatedMarker));
+    if (yaConfirmo) {
+      return res.status(409).json({ message: 'Ya sumaste tu denuncia a este caso' });
+    }
+
+    const lat = Number(req.body.lat);
+    const lng = Number(req.body.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ message: 'Falta la ubicación de la denuncia' });
+    }
+    if (distanciaMetros(lat, lng, marker.lat, marker.lng) > RADIO_MISMO_CASO_METROS) {
+      return res.status(400).json({ message: 'Ese caso está a más de 50 metros' });
+    }
+    if (req.file && !String(req.file.mimetype || '').startsWith('image/')) {
+      return res.status(400).json({ message: 'El archivo tiene que ser una imagen' });
+    }
+
+    marker.confirmations.push({
+      userId: req.requester,
+      description: String(req.body.description || '').slice(0, 500),
+      createdAt: new Date(),
+      ...(req.file ? {
+        image: {
+          data: req.file.buffer,
+          contentType: req.file.mimetype || 'application/octet-stream',
+        },
+      } : {}),
+    });
+    await marker.save();
+    if (req.file) {
+      const indice = marker.confirmations.length - 1;
+      marker.confirmations[indice].imageUrl = `/api/markers/${marker._id}/confirmations/${indice}/image`;
+      marker.markModified('confirmations');
+      await marker.save();
+    }
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.get('/:id/confirmations/:index/image', async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id).select('confirmations');
+    const indice = Number(req.params.index);
+    const confirmacion = marker && marker.confirmations && marker.confirmations[indice];
+    if (!confirmacion || !confirmacion.image || !confirmacion.image.data) {
+      return res.status(404).json({ message: 'Imagen no encontrada' });
+    }
+    res.set('Content-Type', confirmacion.image.contentType || 'application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.send(confirmacion.image.data);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

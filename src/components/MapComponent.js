@@ -1,13 +1,38 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { GoogleMap, useJsApiLoader, Marker, Circle } from '@react-google-maps/api'; // Marker + círculos para ubicación
+import { GoogleMap, useJsApiLoader, Marker, OverlayView } from '@react-google-maps/api';
 import { useDropzone } from 'react-dropzone';
 import axios from 'axios';
 
 // const libraries = ['marker']; // Eliminado
+const mapLibraries = ['visualization'];
+const RADIO_MISMO_CASO_METROS = 50;
+
+const distanciaMetros = (lat1, lng1, lat2, lng2) => {
+  const tierra = 6371000;
+  const aGrados = (grados) => (grados * Math.PI) / 180;
+  const dLat = aGrados(lat2 - lat1);
+  const dLng = aGrados(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(aGrados(lat1)) * Math.cos(aGrados(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * tierra * Math.asin(Math.min(1, Math.sqrt(a)));
+};
+
+const buscarReparacionesCercanas = (lista, lat, lng) => lista
+  .filter((marker) => {
+    if (marker.category !== 'reparaciones') return false;
+    if (marker.status !== 'pendiente' && marker.status !== 'en_proceso') return false;
+    if (!Number.isFinite(Number(marker.lat)) || !Number.isFinite(Number(marker.lng))) return false;
+    return distanciaMetros(lat, lng, Number(marker.lat), Number(marker.lng)) <= RADIO_MISMO_CASO_METROS;
+  })
+  .map((marker) => ({
+    ...marker,
+    metros: Math.round(distanciaMetros(lat, lng, Number(marker.lat), Number(marker.lng))),
+  }))
+  .sort((a, b) => a.metros - b.metros)
+  .slice(0, 3);
 
 function MapComponent({ googleMapsApiKey, currentUser }) {
   const userId = currentUser ? String(currentUser).trim().toLowerCase() : 'anonimo';
-  const tenantId = process.env.REACT_APP_TENANT_ID || 'default';
   const [markers, setMarkers] = useState([]);
   const [selectedImage, setSelectedImage] = useState(null);
   const [formData, setFormData] = useState({
@@ -32,6 +57,8 @@ function MapComponent({ googleMapsApiKey, currentUser }) {
   const [canEdit, setCanEdit] = useState(true);
   const [showDeleteOnly, setShowDeleteOnly] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [adminRole, setAdminRole] = useState(null);
+  const [adminJurisdictions, setAdminJurisdictions] = useState([]);
   const statusOptions = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto'];
   const categoryOptions = [
     { value: 'familias', label: 'Familias' },
@@ -42,6 +69,19 @@ function MapComponent({ googleMapsApiKey, currentUser }) {
   const [highlightedMarkerId, setHighlightedMarkerId] = useState(null);
   const [deletedMarker, setDeletedMarker] = useState(null); // Caso eliminado temporalmente para poder deshacer
   const [deleteCountdown, setDeleteCountdown] = useState(10); // Contador de segundos para eliminar
+  const [resolutionPhoto, setResolutionPhoto] = useState(null);
+  const [resolutionPreview, setResolutionPreview] = useState(null);
+  const [mostrarResolucion, setMostrarResolucion] = useState(false);
+  const [busquedaAdmin, setBusquedaAdmin] = useState('');
+  const [soloPorAprobar, setSoloPorAprobar] = useState(false);
+  const [soloUrgentes, setSoloUrgentes] = useState(false);
+  const [mostrarCercanos, setMostrarCercanos] = useState(false);
+  const [casosCercanos, setCasosCercanos] = useState([]);
+  const [sumandoCaso, setSumandoCaso] = useState(null);
+  const [avisoVecino, setAvisoVecino] = useState('');
+  const ignorarCercanosRef = useRef(false);
+  const [estadosPendientes, setEstadosPendientes] = useState({});
+  const [guardandoEstado, setGuardandoEstado] = useState(null);
   const deleteTimeoutRef = useRef(null); // Referencia al timeout de eliminación
   const countdownIntervalRef = useRef(null); // Referencia al intervalo del contador
   const statusLabels = {
@@ -66,6 +106,7 @@ function MapComponent({ googleMapsApiKey, currentUser }) {
     []
   );
 const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
 const getStatusBadgeStyle = (status) => ({
   background: statusBadgeColors[status] || '#e5e7eb',
@@ -77,12 +118,16 @@ const getStatusBadgeStyle = (status) => ({
   display: 'inline-block',
 });
 
-const getDaysUntilRemoval = (dateString) => {
+const getDaysUntil = (dateString, limitMs) => {
   if (!dateString) return null;
-  const diff = TEN_DAYS_MS - (Date.now() - new Date(dateString).getTime());
+  const diff = limitMs - (Date.now() - new Date(dateString).getTime());
   if (diff <= 0) return 0;
   return Math.ceil(diff / (1000 * 60 * 60 * 24));
 };
+
+const getDaysUntilRemoval = (dateString) => getDaysUntil(dateString, TEN_DAYS_MS);
+
+const getDaysUntilPetExpiry = (dateString) => getDaysUntil(dateString, THIRTY_DAYS_MS);
   const normalizeCategoryValue = useCallback(
     (value) => {
       if (!value) return 'persona';
@@ -117,16 +162,11 @@ const stopTouchPropagation = (event) => {
       if (!path) return null;
       if (path.startsWith('data:')) return path;
       if (path.startsWith('http://') || path.startsWith('https://')) {
-        if (!path.includes('tenantId=')) {
-          const separator = path.includes('?') ? '&' : '?';
-          return `${path}${separator}tenantId=${tenantId}`;
-        }
         return path;
       }
-      const separator = path.includes('?') ? '&' : '?';
-      return `http://localhost:5001${path}${separator}tenantId=${tenantId}`;
+      return `http://localhost:5001${path}`;
     },
-    [tenantId]
+    []
   );
 
   const handleImageError = useCallback(() => {
@@ -193,10 +233,11 @@ const stopTouchPropagation = (event) => {
         const response = await axios.get('http://localhost:5001/api/auth/me', {
           headers: {
             'x-user-id': userId,
-            'x-tenant-id': tenantId,
           },
         });
         setIsAdmin(response.data.isAdmin);
+        setAdminRole(response.data.role);
+        setAdminJurisdictions(response.data.jurisdictions || []);
       } catch (error) {
         setIsAdmin(false);
         console.error('Error verificando rol de administrador:', error);
@@ -204,7 +245,7 @@ const stopTouchPropagation = (event) => {
     };
 
     fetchRole();
-  }, [userId, tenantId]);
+  }, [userId]);
 
   // Cargar marcadores existentes al inicio
   useEffect(() => {
@@ -213,7 +254,6 @@ const stopTouchPropagation = (event) => {
         const response = await axios.get('http://localhost:5001/api/markers', {
           headers: {
             'x-user-id': userId,
-            'x-tenant-id': tenantId,
           },
         });
         const savedMarkers = response.data.map(marker => ({
@@ -236,10 +276,8 @@ const stopTouchPropagation = (event) => {
       }
     };
 
-    if (tenantId && tenantId !== 'default') {
-      fetchMarkers();
-    }
-  }, [normalizeCategoryValue, tenantId, userId]);
+    fetchMarkers();
+  }, [normalizeCategoryValue, userId]);
 
   // Verificar si el usuario tiene marcadores de "familias" y ajustar el filtro si es necesario
   useEffect(() => {
@@ -322,13 +360,13 @@ const stopTouchPropagation = (event) => {
     googleMapsApiKey,
     language: 'es',
     region: 'ES',
-    // libraries: libraries, // Eliminado
+    libraries: mapLibraries,
     // mapIds: ['7f9f71bb3b378371fcb70fd1'], // ID de mapa eliminado
   });
 
   const mapRef = useRef(null);
   const zoomListenerRef = useRef(null);
-  
+
   const onMapLoad = useCallback((map) => {
     mapRef.current = map;
     
@@ -385,6 +423,8 @@ const stopTouchPropagation = (event) => {
     setShowPopup(true);
     setEditMode(null); // Asegurar que estamos en modo de creación al hacer clic en el mapa
     setCanEdit(true);
+    setMostrarCercanos(false);
+    setCasosCercanos([]);
   }, []);
 
   const handleMarkerClick = useCallback((marker, forceAdmin = false) => {
@@ -403,7 +443,14 @@ const stopTouchPropagation = (event) => {
       caseId: marker.caseId || null,
       resolvedBy: marker.resolvedBy || null,
       resolvedByReportedAt: marker.resolvedByReportedAt || null,
+      jurisdictionName: marker.jurisdictionName || null,
+      resolutionImageUrl: marker.resolutionImageUrl || null,
+      createdAt: marker.createdAt || null,
+      neighborCount: marker.neighborCount || 1,
     });
+    setResolutionPhoto(null);
+    setResolutionPreview(null);
+    setMostrarResolucion(false);
     setSelectedImage(marker.imageUrl ? buildImageUrl(marker.imageUrl) : null); // Mostrar imagen existente
     setIsImageZoomed(false);
     setShowPopup(true);
@@ -417,13 +464,27 @@ const stopTouchPropagation = (event) => {
       mapRef.current.setZoom(18);
     }
     setHighlightedMarkerId(marker._id);
-  }, [userId, normalizeCategoryValue]);
+  }, [userId, normalizeCategoryValue, buildImageUrl]);
 
   // Función para enviar los datos del formulario al servidor
   const handleSubmit = async (e) => {
     e.preventDefault();
 
     const { lat, lng, image, date, time, description, urgency, category, status } = formData;
+    if (category === 'reparaciones' && !ignorarCercanosRef.current) {
+      const cercanos = buscarReparacionesCercanas(markers, Number(lat), Number(lng))
+        .filter((marker) => {
+          if (marker.confirmedByMe) return false;
+          const dueno = marker.createdBy ? String(marker.createdBy).trim().toLowerCase() : '';
+          return dueno !== userId;
+        });
+      if (cercanos.length) {
+        setCasosCercanos(cercanos);
+        setMostrarCercanos(true);
+        return;
+      }
+    }
+    ignorarCercanosRef.current = false;
     const formDataToSend = new FormData();
     formDataToSend.append('lat', lat);
     formDataToSend.append('lng', lng);
@@ -440,7 +501,6 @@ const stopTouchPropagation = (event) => {
         headers: {
           'Content-Type': 'multipart/form-data',
           'x-user-id': userId,
-          'x-tenant-id': tenantId,
         },
       });
       const newMarker = {
@@ -472,6 +532,8 @@ const stopTouchPropagation = (event) => {
         caseId: newMarker.caseId || null,
         resolvedBy: newMarker.resolvedBy || null,
         resolvedByReportedAt: newMarker.resolvedByReportedAt || null,
+        jurisdictionName: newMarker.jurisdictionName || null,
+        createdAt: newMarker.createdAt || null,
       });
       setSelectedImage(newMarker.imageUrl ? buildImageUrl(newMarker.imageUrl) : null);
       setIsImageZoomed(false);
@@ -480,7 +542,57 @@ const stopTouchPropagation = (event) => {
       // El popup permanece abierto para mostrar el estado "pendiente_aprobacion"
     } catch (error) {
       console.error('Error uploading marker:', error);
+      setAvisoVecino('No se pudo publicar la denuncia. Intentá de nuevo.');
     }
+  };
+
+  const confirmarMismoCaso = async (marker) => {
+    const dueno = marker.createdBy ? String(marker.createdBy).trim().toLowerCase() : '';
+    if (dueno === userId) {
+      setMostrarCercanos(false);
+      setCasosCercanos([]);
+      setShowPopup(false);
+      setAvisoVecino(`Ese problema ya es el caso #${marker.caseId}. No se creó otro.`);
+      return;
+    }
+    setSumandoCaso(marker._id);
+    const datos = new FormData();
+    datos.append('lat', formData.lat);
+    datos.append('lng', formData.lng);
+    datos.append('description', formData.description || '');
+    if (formData.image) datos.append('image', formData.image);
+    try {
+      const response = await axios.post(`http://localhost:5001/api/markers/${marker._id}/confirm`, datos, {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+          'x-user-id': userId,
+        },
+      });
+      const actualizado = {
+        ...response.data,
+        category: normalizeCategoryValue(response.data.category),
+      };
+      setMarkers((prev) => prev.map((item) => (item._id === marker._id ? actualizado : item)));
+      setMostrarCercanos(false);
+      setCasosCercanos([]);
+      setShowPopup(false);
+      setAvisoVecino(
+        `Tu denuncia se sumó al caso #${actualizado.caseId}. Lo reportaron ${actualizado.neighborCount} vecinos.`
+      );
+    } catch (error) {
+      const mensaje = error.response && error.response.data && error.response.data.message
+        ? error.response.data.message
+        : 'No se pudo sumar la denuncia a ese caso.';
+      setAvisoVecino(mensaje);
+    } finally {
+      setSumandoCaso(null);
+    }
+  };
+
+  const publicarComoCasoNuevo = () => {
+    ignorarCercanosRef.current = true;
+    setMostrarCercanos(false);
+    handleSubmit({ preventDefault() {} });
   };
 
   // Función para manejar la actualización del marcador
@@ -521,7 +633,6 @@ const stopTouchPropagation = (event) => {
         headers: {
           'Content-Type': 'multipart/form-data',
           'x-user-id': userId,
-          'x-tenant-id': tenantId,
         },
       });
       // Actualizar los marcadores en el estado local
@@ -584,7 +695,6 @@ const stopTouchPropagation = (event) => {
         await axios.delete(`http://localhost:5001/api/markers/${marker._id}`, {
           headers: {
             'x-user-id': userId,
-            'x-tenant-id': tenantId,
           },
         });
         setDeletedMarker(null);
@@ -648,7 +758,6 @@ const stopTouchPropagation = (event) => {
       await axios.delete(`http://localhost:5001/api/markers/${markerId}`, {
         headers: {
           'x-user-id': userId,
-          'x-tenant-id': tenantId,
         },
       });
     } catch (error) {
@@ -669,7 +778,6 @@ const stopTouchPropagation = (event) => {
           headers: {
             'Content-Type': 'application/json',
             'x-user-id': userId,
-            'x-tenant-id': tenantId,
           },
         }
       );
@@ -705,7 +813,6 @@ const stopTouchPropagation = (event) => {
           headers: {
             'Content-Type': 'application/json',
             'x-user-id': userId,
-            'x-tenant-id': tenantId,
           },
         }
       );
@@ -727,9 +834,39 @@ const stopTouchPropagation = (event) => {
           resolvedAt: response.data.resolvedAt || null,
         }));
       }
+      return true;
     } catch (error) {
       console.error('Error actualizando estado del marcador:', error);
+      alert('No se pudo guardar el estado. Intentá de nuevo.');
+      return false;
     }
+  };
+
+  const elegirEstado = (markerId, estadoActual, nuevoEstado) => {
+    setEstadosPendientes((prev) => {
+      const next = { ...prev };
+      if (nuevoEstado === estadoActual) {
+        delete next[markerId];
+      } else {
+        next[markerId] = nuevoEstado;
+      }
+      return next;
+    });
+  };
+
+  const guardarEstado = async (markerId) => {
+    const nuevoEstado = estadosPendientes[markerId];
+    if (!nuevoEstado || guardandoEstado) return;
+    setGuardandoEstado(markerId);
+    const guardado = await handleAdminStatusChange(markerId, nuevoEstado);
+    if (guardado) {
+      setEstadosPendientes((prev) => {
+        const next = { ...prev };
+        delete next[markerId];
+        return next;
+      });
+    }
+    setGuardandoEstado(null);
   };
 
   // Función para manejar la cancelación del formulario
@@ -746,6 +883,11 @@ const stopTouchPropagation = (event) => {
       resolvedAt: null,
     });
     setSelectedImage(null);
+    setResolutionPhoto(null);
+    setResolutionPreview(null);
+    setMostrarResolucion(false);
+    setMostrarCercanos(false);
+    setCasosCercanos([]);
     setIsImageZoomed(false);
     setShowPopup(false);
     setEditMode(null); // Salir del modo de edición
@@ -824,8 +966,8 @@ const stopTouchPropagation = (event) => {
         // Si es el creador, permitir que vea su marcador pendiente en el mapa
       }
       
-      // Filtro de privacidad: usuarios normales solo ven sus propios marcadores de "familias"
-      if (!isAdmin && marker.category === 'familias') {
+      // Familias y personas en situación de calle: solo el creador las ve en el mapa
+      if (!isAdmin && (marker.category === 'familias' || marker.category === 'persona')) {
         const markerOwner = marker.createdBy
           ? String(marker.createdBy).trim().toLowerCase()
           : 'anonimo';
@@ -838,14 +980,35 @@ const stopTouchPropagation = (event) => {
       const matchesCategory = categoryFilter === 'todas' || (marker.category || 'persona') === categoryFilter;
       return matchesUrgency && matchesCategory;
     });
+    const textoBusqueda = busquedaAdmin.trim().toLowerCase().replace(/^#/, '');
+    const casosPorAprobar = markers.filter(
+      (marker) => marker.canManage && marker.status === 'pendiente_aprobacion'
+    ).length;
+    const casoEsUrgente = (marker) => (
+      marker.canManage
+      && marker.category === 'reparaciones'
+      && (marker.status === 'pendiente' || marker.status === 'en_proceso')
+      && (marker.neighborCount || 1) >= 2
+    );
+    const casosUrgentes = markers.filter(casoEsUrgente).length;
+    const casosAdmin = markers.filter((marker) => {
+      if (!marker.canManage) return false;
+      if (soloPorAprobar && marker.status !== 'pendiente_aprobacion') return false;
+      if (soloUrgentes && !casoEsUrgente(marker)) return false;
+      if (!textoBusqueda) return true;
+      return String(marker.caseId || '').toLowerCase().includes(textoBusqueda);
+    }).sort((a, b) => Number(casoEsUrgente(b)) - Number(casoEsUrgente(a)));
     const currentStatus = formData.status || 'pendiente';
     const statusBadgeStyle = getStatusBadgeStyle(currentStatus);
     const statusLabel = statusLabels[currentStatus] || currentStatus;
     const renderStatusInfo = (withLabel = true) => {
+      const petStillOpen = formData.category === 'perros_gatos' && currentStatus !== 'resuelto';
       const daysLeft =
         currentStatus === 'resuelto' && formData.resolvedAt
           ? getDaysUntilRemoval(formData.resolvedAt)
-          : null;
+          : petStillOpen
+            ? getDaysUntilPetExpiry(formData.createdAt)
+            : null;
       const isPendingApproval = currentStatus === 'pendiente_aprobacion';
     return (
         <div style={{ marginTop: '4px' }}>
@@ -855,7 +1018,9 @@ const stopTouchPropagation = (event) => {
               <span style={statusBadgeStyle}>{statusLabel}</span>
               {daysLeft !== null && (
                 <small style={{ color: '#2563eb' }}>
-                  Se eliminará en {daysLeft} {daysLeft === 1 ? 'día' : 'días'}.
+                  {petStillOpen
+                    ? `Si sigue abierto, se elimina en ${daysLeft} ${daysLeft === 1 ? 'día' : 'días'}.`
+                    : `Se eliminará en ${daysLeft} ${daysLeft === 1 ? 'día' : 'días'}.`}
                 </small>
               )}
             </div>
@@ -864,28 +1029,44 @@ const stopTouchPropagation = (event) => {
                 ⏳ Tu reporte está esperando la aprobación de un administrador. Aparecerá en el mapa una vez aprobado.
               </small>
             )}
+            {formData.category === 'reparaciones' && formData.neighborCount > 1 && (
+              <small className="aviso-vecinos-caso">
+                Lo reportaron {formData.neighborCount} vecinos
+              </small>
+            )}
           </div>
         </div>
       );
     };
-    const userIcon =
-      window.google && window.google.maps
-        ? {
-            url: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="10" fill="%234285F4" stroke="%23FFFFFF" stroke-width="3"/></svg>',
-            scaledSize: new window.google.maps.Size(32, 32),
-            anchor: new window.google.maps.Point(16, 16), // Centrar el icono en el punto
-          }
-        : 'http://maps.google.com/mapfiles/ms/icons/blue-dot.png';
+    const handleResolutionPhoto = (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) {
+        setResolutionPhoto(null);
+        setResolutionPreview(null);
+        return;
+      }
+      if (!file.type.startsWith('image/')) {
+        alert('La foto tiene que ser una imagen.');
+        event.target.value = '';
+        return;
+      }
+      setResolutionPhoto(file);
+      setResolutionPreview(URL.createObjectURL(file));
+    };
     const handleReportResolved = async (markerId) => {
+      if (!resolutionPhoto) {
+        alert('Tenés que adjuntar una foto de cómo quedó.');
+        return;
+      }
+      const body = new FormData();
+      body.append('image', resolutionPhoto);
       try {
         const response = await axios.post(
           `http://localhost:5001/api/markers/${markerId}/report-resolved`,
-          {},
+          body,
           {
             headers: {
-              'Content-Type': 'application/json',
               'x-user-id': userId,
-              'x-tenant-id': tenantId,
             },
           }
         );
@@ -896,6 +1077,7 @@ const stopTouchPropagation = (event) => {
                   ...marker,
                   resolvedBy: response.data.resolvedBy,
                   resolvedByReportedAt: response.data.resolvedByReportedAt,
+                  resolutionImageUrl: response.data.resolutionImageUrl,
                 }
               : marker
           )
@@ -905,49 +1087,110 @@ const stopTouchPropagation = (event) => {
             ...prev,
             resolvedBy: response.data.resolvedBy,
             resolvedByReportedAt: response.data.resolvedByReportedAt,
+            resolutionImageUrl: response.data.resolutionImageUrl,
           }));
         }
-        alert('✅ Has reportado que resolviste este caso. El administrador será notificado.');
+        setResolutionPhoto(null);
+        setResolutionPreview(null);
+        setMostrarResolucion(false);
+        alert('✅ Has reportado que resolviste este caso. El administrador va a revisar la foto.');
       } catch (error) {
         console.error('Error reporting resolved:', error);
-        alert('Error al reportar la resolución. Por favor, intenta nuevamente.');
+        const serverMessage = error.response && error.response.data && error.response.data.message;
+        alert(serverMessage || 'Error al reportar la resolución. Por favor, intenta nuevamente.');
       }
+    };
+    const renderResolucionVecino = () => {
+      if (isAdmin) return null;
+      if (formData.resolvedBy) {
+        return (
+          <div style={{ marginTop: '8px', padding: '8px', background: '#dcfce7', borderRadius: '6px' }}>
+            <small style={{ color: '#166534' }}>
+              ✅ Este caso ya fue reportado como resuelto por: {formData.resolvedBy}
+              {formData.resolvedByReportedAt && (
+                <span> el {new Date(formData.resolvedByReportedAt).toLocaleDateString()}</span>
+              )}
+            </small>
+            {formData.resolutionImageUrl && (
+              <img
+                src={buildImageUrl(formData.resolutionImageUrl)}
+                alt="Foto de la resolución"
+                style={{ width: '100%', maxHeight: '160px', objectFit: 'cover', borderRadius: '6px', marginTop: '8px' }}
+              />
+            )}
+          </div>
+        );
+      }
+      const casoAbierto = formData.status === 'pendiente' || formData.status === 'en_proceso';
+      if (!casoAbierto || formData.category === 'familias') return null;
+      return (
+        <>
+          <button
+            type="button"
+            className="btn-reportar-resuelto"
+            onClick={() => {
+              setResolutionPhoto(null);
+              setResolutionPreview(null);
+              setMostrarResolucion(true);
+            }}
+          >
+            ✅ Reportar que resolví este caso
+          </button>
+          {mostrarResolucion && (
+            <div
+              className="resolucion-fondo"
+              onMouseDown={(event) => {
+                event.stopPropagation();
+                setMostrarResolucion(false);
+              }}
+            >
+              <div
+                className="resolucion-ventana"
+                onMouseDown={(event) => event.stopPropagation()}
+              >
+                <h3 className="resolucion-titulo">Reportar que resolví este caso</h3>
+                <label className="resolucion-foto">
+                  Foto de cómo quedó (obligatoria)
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleResolutionPhoto}
+                  />
+                </label>
+                {resolutionPreview && (
+                  <img
+                    src={resolutionPreview}
+                    alt="Vista previa de la resolución"
+                    className="resolucion-vista"
+                  />
+                )}
+                <button
+                  type="button"
+                  className={`btn-resolucion-enviar${resolutionPhoto ? ' listo' : ''}`}
+                  onClick={() => handleReportResolved(editMode)}
+                  disabled={!resolutionPhoto}
+                >
+                  Enviar
+                </button>
+                <p className="resolucion-nota">
+                  El caso sigue abierto hasta que el administrador revise la foto y lo marque como resuelto.
+                </p>
+                <button
+                  type="button"
+                  className="resolucion-cerrar"
+                  onClick={() => setMostrarResolucion(false)}
+                >
+                  Cerrar
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      );
     };
 
     return (
       <div>
-        {/* Número de WhatsApp para reportar casos resueltos */}
-        <div style={{ 
-          marginBottom: '12px', 
-          padding: '10px', 
-          background: '#25D366', 
-          borderRadius: '8px',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          flexWrap: 'wrap',
-          gap: '8px'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ color: '#fff', fontWeight: 'bold' }}>📱 WhatsApp para reportar casos resueltos:</span>
-            <a 
-              href={`https://wa.me/543816865617?text=Hola,%20quiero%20reportar%20un%20caso%20resuelto.%20Por%20favor%20indica%20el%20ID%20del%20caso%20(se%20muestra%20en%20el%20popup).`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ 
-                color: '#fff', 
-                fontWeight: 'bold',
-                textDecoration: 'none',
-                fontSize: '16px'
-              }}
-            >
-              3816865617
-            </a>
-          </div>
-          <small style={{ color: '#fff', opacity: 0.9 }}>
-            Al abrir un caso, verás su ID. Inclúyelo en tu mensaje de WhatsApp para facilitar la ubicación del caso.
-          </small>
-        </div>
         <div style={{ marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
           <div>
             <label>Filtrar por urgencia: </label>
@@ -996,8 +1239,15 @@ const stopTouchPropagation = (event) => {
             Volver a mi ubicación
           </button>
         </div>
+        {avisoVecino && (
+          <div className="aviso-vecino" role="status">
+            <span>{avisoVecino}</span>
+            <button type="button" onClick={() => setAvisoVecino('')}>Cerrar</button>
+          </div>
+        )}
       <GoogleMap
-        mapContainerStyle={{ height: '80vh', width: '100%' }}
+        mapContainerClassName="mapa-ciudad"
+        mapContainerStyle={{ width: '100%' }}
         center={defaultCenter}
           // Zoom más cercano cuando tenemos ubicación del usuario
           zoom={userLocation ? 18 : 15}
@@ -1008,31 +1258,15 @@ const stopTouchPropagation = (event) => {
           }}
         >
           {userLocation && (
-            <>
-              <Marker
-                position={userLocation}
-                options={{
-                  icon: userIcon,
-                  clickable: false,
-                }}
-              />
-              {/* Círculo externo: halo azul translúcido */}
-              <Circle
-                center={userLocation}
-                radius={25} // metros
-                options={{
-                  strokeColor: '#4285F4',
-                  strokeOpacity: 0.7,
-                  strokeWeight: 1,
-                  fillColor: '#4285F4',
-                  fillOpacity: 0.2,
-                  clickable: false,
-                  draggable: false,
-                  editable: false,
-                  visible: true,
-                }}
-              />
-            </>
+            <OverlayView
+              position={userLocation}
+              mapPaneName={OverlayView.OVERLAY_LAYER}
+            >
+              <div className="ubicacion-actual">
+                <span className="ubicacion-halo" />
+                <span className="ubicacion-punto" />
+              </div>
+            </OverlayView>
           )}
           {visibleMarkers.map((marker, index) => (
           <Marker
@@ -1196,9 +1430,9 @@ const stopTouchPropagation = (event) => {
                           <p style={{ margin: '2px 0', fontWeight: 'bold', color: '#1e40af', fontSize: '20px' }}>
                             #{formData.caseId}
                           </p>
-                          <small style={{ color: '#6b7280', display: 'block', marginTop: '2px', fontSize: '11px' }}>
-                            Incluye este ID al reportar por WhatsApp
-                          </small>
+                          <p style={{ margin: '2px 0', color: '#1e40af', fontSize: '13px' }}>
+                            📍 {formData.jurisdictionName || 'Fuera de las jurisdicciones registradas'}
+                          </p>
                         </div>
                       )}
                       <label style={{ fontSize: '14px', marginTop: '4px' }}>Fecha:</label>
@@ -1222,6 +1456,7 @@ const stopTouchPropagation = (event) => {
                         ))}
                       </select>
                       {renderStatusInfo(true)}
+                      {renderResolucionVecino()}
                       <div style={{ marginTop: '6px', display: 'flex', gap: '6px' }}>
                       <button type="submit">Guardar</button>
                       <button type="button" onClick={handleCancel}>Cancelar</button>
@@ -1252,9 +1487,9 @@ const stopTouchPropagation = (event) => {
                           <p style={{ margin: '2px 0', fontWeight: 'bold', color: '#1e40af', fontSize: '20px' }}>
                             #{formData.caseId}
                           </p>
-                          <small style={{ color: '#6b7280', display: 'block', marginTop: '2px', fontSize: '11px' }}>
-                            Incluye este ID al reportar por WhatsApp
-                          </small>
+                          <p style={{ margin: '2px 0', color: '#1e40af', fontSize: '13px' }}>
+                            📍 {formData.jurisdictionName || 'Fuera de las jurisdicciones registradas'}
+                          </p>
                         </div>
                       )}
                       <p><strong>Fecha:</strong> {formData.date || 'N/D'}</p>
@@ -1263,54 +1498,6 @@ const stopTouchPropagation = (event) => {
                       <p><strong>Urgencia:</strong> {formData.urgency}</p>
                       <p><strong>Categoría:</strong> {categoryLabels[formData.category] || formData.category}</p>
                       {renderStatusInfo(true)}
-                      {/* Botón para reportar resolución - solo para casos pendientes o en proceso, y que no hayan sido reportados ya */}
-                      {!isAdmin && 
-                       (formData.status === 'pendiente' || formData.status === 'en_proceso') && 
-                       !formData.resolvedBy && (
-                        <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                          <button
-                            type="button"
-                            onClick={() => handleReportResolved(editMode)}
-                            style={{
-                              background: '#10b981',
-                              color: '#fff',
-                              border: 'none',
-                              padding: '8px 16px',
-                              borderRadius: '6px',
-                              cursor: 'pointer',
-                              fontWeight: 'bold',
-                              width: '100%',
-                            }}
-                          >
-                            ✅ Reportar que resolví este caso
-                          </button>
-                          {formData.caseId && (
-                            <a
-                              href={`https://wa.me/543816865617?text=Hola,%20he%20resuelto%20el%20caso%20%23${formData.caseId}%20del%20mapa.%20Descripción:%20${encodeURIComponent(formData.description || 'N/A')}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              style={{
-                                background: '#25D366',
-                                color: '#fff',
-                                border: 'none',
-                                padding: '8px 16px',
-                                borderRadius: '6px',
-                                cursor: 'pointer',
-                                fontWeight: 'bold',
-                                width: '100%',
-                                textDecoration: 'none',
-                                textAlign: 'center',
-                                display: 'block',
-                              }}
-                            >
-                              📱 Contactar por WhatsApp (incluye ID #{formData.caseId})
-                            </a>
-                          )}
-                          <small style={{ display: 'block', marginTop: '4px', color: '#6b7280' }}>
-                            El administrador será notificado y actualizará el estado
-                          </small>
-                        </div>
-                      )}
                       {formData.resolvedBy && (
                         <div style={{ marginTop: '8px', padding: '8px', background: '#dcfce7', borderRadius: '6px' }}>
                           <small style={{ color: '#166534' }}>
@@ -1319,6 +1506,13 @@ const stopTouchPropagation = (event) => {
                               <span> el {new Date(formData.resolvedByReportedAt).toLocaleDateString()}</span>
                             )}
                           </small>
+                          {formData.resolutionImageUrl && (
+                            <img
+                              src={buildImageUrl(formData.resolutionImageUrl)}
+                              alt="Foto de la resolución"
+                              style={{ width: '100%', maxHeight: '160px', objectFit: 'cover', borderRadius: '6px', marginTop: '8px' }}
+                            />
+                          )}
                         </div>
                       )}
                       <div style={{ marginTop: '6px', display: 'flex', gap: '6px' }}>
@@ -1340,12 +1534,14 @@ const stopTouchPropagation = (event) => {
                       <p style={{ color: '#c0392b' }}>
                         Esta publicación anónima solo puede ser editada por su creador.
                       </p>
+                      <p><strong>Municipio:</strong> {formData.jurisdictionName || 'Fuera de las jurisdicciones registradas'}</p>
                       <p><strong>Fecha:</strong> {formData.date || 'N/D'}</p>
                       <p><strong>Hora:</strong> {formData.time || 'N/D'}</p>
                       <p><strong>Descripción:</strong> {formData.description || 'N/D'}</p>
                       <p><strong>Urgencia:</strong> {formData.urgency}</p>
                       <p><strong>Categoría:</strong> {categoryLabels[formData.category] || formData.category}</p>
                       {renderStatusInfo(true)}
+                      {renderResolucionVecino()}
                       <div style={{ marginTop: '6px' }}>
                         <button type="button" onClick={handleCancel}>Cerrar</button>
                       </div>
@@ -1439,6 +1635,42 @@ const stopTouchPropagation = (event) => {
           </div>
         )}
 
+        {mostrarCercanos && (
+          <div className="cercanos-fondo">
+            <div className="cercanos-ventana" onClick={stopPropagation} onTouchStart={stopTouchPropagation}>
+              <h3>¿Es alguno de estos?</h3>
+              <p>Hay reparaciones ya publicadas de otro vecino, a menos de 50 metros. Si es la misma, tu denuncia se suma. Si no, se crea un caso nuevo.</p>
+              {casosCercanos.map((caso) => (
+                <article className="cercanos-caso" key={caso._id}>
+                  <div>
+                    <strong>Caso #{caso.caseId || 'sin número'}</strong>
+                    <span>A {caso.metros} metros</span>
+                    <p>{caso.description || 'Sin descripción'}</p>
+                  </div>
+                  {caso.imageUrl && (
+                    <img src={buildImageUrl(caso.imageUrl)} alt="Foto del caso cercano" />
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => confirmarMismoCaso(caso)}
+                    disabled={sumandoCaso === caso._id}
+                  >
+                    {sumandoCaso === caso._id ? 'Sumando...' : 'Es este'}
+                  </button>
+                </article>
+              ))}
+              <div className="cercanos-acciones">
+                <button type="button" className="cercanos-otro" onClick={publicarComoCasoNuevo} disabled={!!sumandoCaso}>
+                  Ninguno, es otro problema
+                </button>
+                <button type="button" className="cercanos-volver" onClick={() => setMostrarCercanos(false)}>
+                  Volver
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {geoError && (
           <div
             style={{
@@ -1456,177 +1688,204 @@ const stopTouchPropagation = (event) => {
         )}
       </GoogleMap>
         {isAdmin && (
-          <div style={{ marginTop: '20px', background: '#fff', padding: '16px', borderRadius: '12px', boxShadow: '0 2px 12px rgba(0,0,0,0.15)' }}>
-            <h3>Panel de administración</h3>
-            {/* Mensaje de deshacer eliminación */}
+          <div className="panel-admin">
+            <div className="panel-admin-encabezado">
+              <div>
+                <h3>Panel de administración</h3>
+                <p>
+                  {adminRole === 'SUPER_ADMIN'
+                    ? 'Super administrador: ves los casos de todas las jurisdicciones.'
+                    : `Administrás: ${adminJurisdictions.map((j) => j.name).join(', ')}`}
+                </p>
+              </div>
+              <label className="panel-admin-buscar">
+                Buscar por número de caso
+                <input
+                  type="search"
+                  value={busquedaAdmin}
+                  onChange={(event) => setBusquedaAdmin(event.target.value)}
+                  placeholder="Ejemplo: 12"
+                />
+              </label>
+            </div>
+            {casosPorAprobar > 0 && (
+              <button
+                type="button"
+                className={`panel-admin-aviso${soloPorAprobar ? ' panel-admin-aviso-activo' : ''}`}
+                onClick={() => {
+                  setSoloPorAprobar((activo) => !activo);
+                  setSoloUrgentes(false);
+                }}
+              >
+                <span>
+                  {soloPorAprobar
+                    ? 'Volver a ver todos los casos'
+                    : casosPorAprobar === 1
+                      ? 'Tenés 1 caso para aprobar'
+                      : `Tenés ${casosPorAprobar} casos para aprobar`}
+                </span>
+                {!soloPorAprobar && <span className="panel-admin-aviso-ver">Ver</span>}
+              </button>
+            )}
+            {casosUrgentes > 0 && (
+              <button
+                type="button"
+                className={`panel-admin-aviso panel-admin-urgente${soloUrgentes ? ' panel-admin-aviso-activo' : ''}`}
+                onClick={() => {
+                  setSoloUrgentes((activo) => !activo);
+                  setSoloPorAprobar(false);
+                }}
+              >
+                <span>
+                  {soloUrgentes
+                    ? 'Volver a ver todos los casos'
+                    : casosUrgentes === 1
+                      ? 'Tenés 1 caso urgente: varios vecinos reportaron el mismo problema'
+                      : `Tenés ${casosUrgentes} casos urgentes: varios vecinos reportaron el mismo problema`}
+                </span>
+                {!soloUrgentes && <span className="panel-admin-aviso-ver">Ver</span>}
+              </button>
+            )}
             {deletedMarker && (
-              <div style={{
-                marginBottom: '16px',
-                padding: '12px',
-                background: '#fef3c7',
-                border: '2px solid #f59e0b',
-                borderRadius: '8px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: '12px',
-                flexWrap: 'wrap',
-              }}>
-                <div style={{ flex: 1 }}>
-                  <strong style={{ color: '#92400e' }}>
-                    ⚠️ Caso #{deletedMarker.caseId || deletedMarker._id?.slice(-6)} eliminado
+              <div className="panel-admin-deshacer">
+                <div>
+                  <strong>
+                    Caso #{deletedMarker.caseId || deletedMarker._id?.slice(-6)} eliminado
                   </strong>
-                  <p style={{ margin: '4px 0 0 0', color: '#78350f', fontSize: '14px' }}>
-                    El caso "{deletedMarker.description || 'Sin descripción'}" ha sido eliminado. 
-                    Se eliminará permanentemente en <strong style={{ fontSize: '16px', color: '#dc2626' }}>{deleteCountdown}</strong> segundo{deleteCountdown !== 1 ? 's' : ''}.
+                  <p>
+                    El caso "{deletedMarker.description || 'Sin descripción'}" ha sido eliminado.
+                    Se eliminará permanentemente en <strong>{deleteCountdown}</strong> segundo{deleteCountdown !== 1 ? 's' : ''}.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleUndoDelete}
-                  style={{
-                    padding: '8px 16px',
-                    borderRadius: '6px',
-                    border: 'none',
-                    background: '#10b981',
-                    color: '#fff',
-                    cursor: 'pointer',
-                    fontWeight: 'bold',
-                    fontSize: '14px',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  ↶ Deshacer
+                <button type="button" onClick={handleUndoDelete}>
+                  Deshacer
                 </button>
               </div>
             )}
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>ID Caso</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Descripción</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Urgencia</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Estado</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Categoría</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Usuario</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Creado</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Expira</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Reporte Resolución</th>
-                    <th style={{ textAlign: 'left', padding: '6px' }}>Acciones</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {markers.map((marker) => {
-                    const daysLeft =
-                      marker.status === 'resuelto' && marker.resolvedAt
-                        ? getDaysUntilRemoval(marker.resolvedAt)
-                        : null;
-                    return (
-                      <tr key={marker._id || marker.description} style={{ borderTop: '1px solid #eee' }}>
-                        <td style={{ padding: '6px', fontWeight: 'bold' }}>
-                          {marker.caseId ? `#${marker.caseId}` : '-'}
-                        </td>
-                        <td style={{ padding: '6px' }}>{marker.description || 'Sin descripción'}</td>
-                        <td style={{ padding: '6px', textTransform: 'capitalize' }}>{marker.urgency}</td>
-                      <td style={{ padding: '6px' }}>
-                          <select
-                            value={marker.status || 'pendiente'}
-                            onChange={(e) => handleAdminStatusChange(marker._id, e.target.value)}
-                          >
-                            {statusOptions.map(status => (
-                              <option key={status} value={status}>
-                                {statusLabels[status] || status.replace('_', ' ')}
-                              </option>
-                            ))}
-                          </select>
-                        </td>
-                      <td style={{ padding: '6px' }}>
-                        {categoryLabels[marker.category] || marker.category || 'N/D'}
-                      </td>
-                        <td style={{ padding: '6px' }}>{marker.createdBy || 'anonimo'}</td>
-                        <td style={{ padding: '6px' }}>
-                          {marker.createdAt ? new Date(marker.createdAt).toLocaleString() : 'N/D'}
-                        </td>
-                        <td style={{ padding: '6px' }}>
-                          {daysLeft !== null ? `${daysLeft} ${daysLeft === 1 ? 'día' : 'días'}` : '-'}
-                        </td>
-                        <td style={{ padding: '6px' }}>
-                          {marker.resolvedBy ? (
-                            <div style={{ 
-                              padding: '4px 8px', 
-                              background: '#dcfce7', 
-                              borderRadius: '4px',
-                              fontSize: '12px'
-                            }}>
-                              <strong>✅ Reportado por:</strong> {marker.resolvedBy}
-                              <br />
-                              <small>
-                                {marker.resolvedByReportedAt 
-                                  ? new Date(marker.resolvedByReportedAt).toLocaleString()
-                                  : 'Fecha no disponible'}
-                              </small>
-                            </div>
-                          ) : (
-                            <span style={{ color: '#9ca3af' }}>-</span>
-                          )}
-                        </td>
-                        <td style={{ padding: '6px' }}>
-                          <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                            <button 
-                              type="button" 
-                              onClick={() => handleMarkerClick(marker, true)}
-                              style={{
-                                padding: '4px 8px',
-                                borderRadius: '4px',
-                                border: '1px solid #4285F4',
-                                background: '#4285F4',
-                                color: '#fff',
-                                cursor: 'pointer',
-                                fontSize: '12px',
-                              }}
-                            >
-                              Ver
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleAdminDeleteMarker(marker)}
-                              style={{
-                                padding: '4px 8px',
-                                borderRadius: '4px',
-                                border: '1px solid #ef4444',
-                                background: '#ef4444',
-                                color: '#fff',
-                                cursor: 'pointer',
-                                fontSize: '12px',
-                              }}
-                            >
-                              Eliminar
-                            </button>
-                            {marker.status === 'pendiente_aprobacion' && (
-                              <button
-                                type="button"
-                                onClick={() => handleApproveMarker(marker._id)}
-                                style={{
-                                  background: '#10b981',
-                                  color: 'white',
-                                  border: 'none',
-                                  padding: '4px 8px',
-                                  borderRadius: '4px',
-                                  cursor: 'pointer',
-                                  fontSize: '12px',
-                                }}
-                              >
-                                Aprobar
-                              </button>
-                            )}
+            {casosAdmin.length === 0 && (
+              <p className="panel-admin-vacio">
+                {textoBusqueda
+                  ? 'No hay un caso con ese número.'
+                  : soloPorAprobar
+                    ? 'No hay casos para aprobar.'
+                    : soloUrgentes
+                      ? 'No hay casos urgentes.'
+                      : 'No hay casos para administrar.'}
+              </p>
+            )}
+            <div className="panel-admin-lista">
+              {casosAdmin.map((marker) => {
+                const daysLeft =
+                  marker.status === 'resuelto' && marker.resolvedAt
+                    ? getDaysUntilRemoval(marker.resolvedAt)
+                    : marker.category === 'perros_gatos'
+                      ? getDaysUntilPetExpiry(marker.createdAt)
+                      : null;
+                const creado = marker.createdAt
+                  ? new Date(marker.createdAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })
+                  : 'N/D';
+                const vecinos = marker.neighborCount || 1;
+                const urgente = casoEsUrgente(marker);
+                return (
+                  <article className={`caso-admin${urgente ? ' caso-admin-marcado' : ''}`} key={marker._id || marker.description}>
+                    <div className="caso-admin-cabeza">
+                      <strong className="caso-admin-id">{marker.caseId ? `#${marker.caseId}` : 'Sin número'}</strong>
+                      <span className="caso-admin-municipio">{marker.jurisdictionName || 'Sin jurisdicción'}</span>
+                      <select
+                        className="caso-admin-estado"
+                        value={estadosPendientes[marker._id] || marker.status || 'pendiente'}
+                        aria-label="Estado del caso"
+                        onChange={(e) => elegirEstado(marker._id, marker.status || 'pendiente', e.target.value)}
+                      >
+                        {statusOptions.map(status => (
+                          <option key={status} value={status}>
+                            {statusLabels[status] || status.replace('_', ' ')}
+                          </option>
+                        ))}
+                      </select>
+                      {estadosPendientes[marker._id] && (
+                        <button
+                          type="button"
+                          className="caso-admin-guardar"
+                          disabled={guardandoEstado === marker._id}
+                          onClick={() => guardarEstado(marker._id)}
+                        >
+                          {guardandoEstado === marker._id ? 'Guardando...' : 'Guardar'}
+                        </button>
+                      )}
+                    </div>
+                    <p className="caso-admin-descripcion">{marker.description || 'Sin descripción'}</p>
+                    {marker.category === 'reparaciones' && (
+                      <p className={`caso-admin-vecinos${urgente ? ' urgente' : ''}`}>
+                        {vecinos === 1 ? '1 vecino lo reportó' : `${vecinos} vecinos lo reportaron`}
+                        {urgente ? ' · Urgente' : ''}
+                      </p>
+                    )}
+                    {(marker.confirmations || []).length > 0 && (
+                      <ul className="caso-admin-confirmaciones">
+                        {marker.confirmations.map((confirmacion, indice) => (
+                          <li key={`${marker._id}-confirma-${indice}`}>
+                            {confirmacion.userId || 'Vecino'}: {confirmacion.description || 'Sin descripción'}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    <dl className="caso-admin-datos">
+                      <div>
+                        <dt>Urgencia</dt>
+                        <dd className="caso-admin-urgencia">{marker.urgency || 'N/D'}</dd>
+                      </div>
+                      <div>
+                        <dt>Categoría</dt>
+                        <dd>{categoryLabels[marker.category] || marker.category || 'N/D'}</dd>
+                      </div>
+                      <div>
+                        <dt>Usuario</dt>
+                        <dd>{marker.createdBy || 'anonimo'}</dd>
+                      </div>
+                      <div>
+                        <dt>Creado</dt>
+                        <dd>{creado}</dd>
+                      </div>
+                      <div>
+                        <dt>Expira</dt>
+                        <dd>{daysLeft !== null ? `${daysLeft} ${daysLeft === 1 ? 'día' : 'días'}` : '-'}</dd>
+                      </div>
+                    </dl>
+                    {marker.resolvedBy && (
+                      <div className="caso-admin-resolucion">
+                        <strong>Reportado por:</strong> {marker.resolvedBy}
+                        <br />
+                        <small>
+                          {marker.resolvedByReportedAt
+                            ? new Date(marker.resolvedByReportedAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })
+                            : 'Fecha no disponible'}
+                        </small>
+                        {marker.resolutionImageUrl && (
+                          <div>
+                            <a href={buildImageUrl(marker.resolutionImageUrl)} target="_blank" rel="noopener noreferrer">
+                              Ver foto
+                            </a>
                           </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                        )}
+                      </div>
+                    )}
+                    <div className="caso-admin-acciones">
+                      <button type="button" className="caso-admin-ver" onClick={() => handleMarkerClick(marker, true)}>
+                        Ver
+                      </button>
+                      <button type="button" className="caso-admin-eliminar" onClick={() => handleAdminDeleteMarker(marker)}>
+                        Eliminar
+                      </button>
+                      {marker.status === 'pendiente_aprobacion' && (
+                        <button type="button" className="caso-admin-aprobar" onClick={() => handleApproveMarker(marker._id)}>
+                          Aprobar
+                        </button>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           </div>
         )}

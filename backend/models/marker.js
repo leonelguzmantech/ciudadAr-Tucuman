@@ -2,7 +2,14 @@
 const mongoose = require('mongoose');
 
 const markerSchema = new mongoose.Schema({
+  // Municipio o comuna donde cae el reporte (o la provincia si no cae en ninguno)
   tenant: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Tenant',
+    index: true,
+    default: null,
+  },
+  province: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Tenant',
     index: true,
@@ -43,7 +50,22 @@ const markerSchema = new mongoose.Schema({
   caseId: { type: Number, unique: true }, // ID único del caso
   resolvedBy: { type: String, default: null }, // Usuario que reportó la resolución
   resolvedByReportedAt: { type: Date, default: null }, // Fecha del reporte de resolución
+  resolutionImage: {
+    data: Buffer,
+    contentType: String,
+  },
+  resolutionImageUrl: { type: String, default: '' },
   sensed: { type: Boolean, default: false }, // Campo adicional opcional
+  confirmations: [{
+    userId: { type: String, required: true },
+    description: { type: String, default: '' },
+    createdAt: { type: Date, default: Date.now },
+    image: {
+      data: Buffer,
+      contentType: String,
+    },
+    imageUrl: { type: String, default: '' },
+  }],
 }, { timestamps: true });
 
 module.exports = mongoose.model('Marker', markerSchema);
