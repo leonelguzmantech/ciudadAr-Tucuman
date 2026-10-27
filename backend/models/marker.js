@@ -25,11 +25,7 @@ const markerSchema = new mongoose.Schema({
   date: { type: String },        // Fecha del marcador
   time: { type: String },        // Hora del marcador
   description: { type: String }, // Descripción del marcador
-  urgency: {                     // Nivel de urgencia (baja, media, alta)
-    type: String,
-    enum: ['baja', 'media', 'alta'],
-    default: 'media',
-  },
+  direccion: { type: String, default: '' }, // Dirección del punto (auto o manual)
   status: {
     type: String,
     enum: ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto'],
@@ -50,12 +46,24 @@ const markerSchema = new mongoose.Schema({
   caseId: { type: Number, unique: true }, // ID único del caso
   resolvedBy: { type: String, default: null }, // Usuario que reportó la resolución
   resolvedByReportedAt: { type: Date, default: null }, // Fecha del reporte de resolución
+  resolutionDescription: { type: String, default: '' }, // Qué hizo el vecino para resolverlo
   resolutionImage: {
     data: Buffer,
     contentType: String,
   },
   resolutionImageUrl: { type: String, default: '' },
-  sensed: { type: Boolean, default: false }, // Campo adicional opcional
+  sensed: { type: Boolean, default: false },
+  familiasTipo: {
+    type: String,
+    enum: ['violencia', 'hijos', 'calle', null],
+    default: null,
+  },
+  animalTipo: {
+    type: String,
+    enum: ['abandonado', 'perdido', 'adopcion', null],
+    default: null,
+  },
+  avisadoAt: { type: Date, default: null },
   confirmations: [{
     userId: { type: String, required: true },
     description: { type: String, default: '' },

@@ -6,6 +6,9 @@ require('dotenv').config();
 
 const markerRoutes = require('./routes/markerRoutes');
 const publicRoutes = require('./routes/publicRoutes');
+const usuarioRoutes = require('./routes/usuarioRoutes');
+const notificacionRoutes = require('./routes/notificacionRoutes');
+const geocodeRoutes = require('./routes/geocodeRoutes');
 const { normalizeUserId } = require('./utils/users');
 const { getAdminScope, isScopeAdmin } = require('./utils/jurisdictions');
 
@@ -48,6 +51,9 @@ app.get('/api/auth/me', async (req, res) => {
 
 app.use('/api/markers', markerRoutes);
 app.use('/api/public', publicRoutes);
+app.use('/api/usuarios', usuarioRoutes);
+app.use('/api/notificaciones', notificacionRoutes);
+app.use('/api/geocode', geocodeRoutes);
 
 const PORT = process.env.PORT || 5001;
 

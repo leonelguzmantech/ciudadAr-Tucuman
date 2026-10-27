@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { getAuth, sendEmailVerification, signOut } from 'firebase/auth';
 import appFirebase from './credenciales';
-import imagenLogin from '../assets/banner-ciudad-celu.jpg';
+import logoCiudad from '../assets/ciudadar-logo-circulo-estilo.jpg';
 
 const auth = getAuth(appFirebase);
 
@@ -56,12 +56,10 @@ const VerificarEmail = ({ onConfirmado }) => {
   };
 
   return (
-    <div className="container">
-      <div className="row">
-        <div className="col-md-4">
-          <div className="padre">
+    <div className="pantalla-acceso">
+      <div className="pantalla-acceso-tarjeta">
             <div className="card card-body shadow-lg">
-              <img src={imagenLogin} alt="Ciudad con vecinos, un perro y un pin de mapa" className="imagen-login" />
+              <img src={logoCiudad} alt="CiudadAr" className="logo-acceso" />
               <h2 className="verificacion-titulo">Confirmá tu correo</h2>
               <p className="verificacion-texto">
                 Para usar el mapa, {usuario?.email || 'tu correo'} tiene que estar confirmado.
@@ -82,8 +80,6 @@ const VerificarEmail = ({ onConfirmado }) => {
                 Cerrar sesión
               </button>
             </div>
-          </div>
-        </div>
       </div>
     </div>
   );

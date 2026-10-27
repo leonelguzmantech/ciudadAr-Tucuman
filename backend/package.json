@@ -7,6 +7,10 @@
     "start": "node server.js",
     "import": "node scripts/importJurisdictions.js",
     "admins": "node scripts/manageAdmins.js",
+    "seed": "node scripts/seedPruebas.js",
+    "seed:limpiar": "node scripts/seedPruebas.js limpiar",
+    "probar:limite": "node scripts/probarLimiteReportes.js",
+    "probar:limite:limpiar": "node scripts/probarLimiteReportes.js limpiar",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

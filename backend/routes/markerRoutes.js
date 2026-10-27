@@ -11,6 +11,7 @@ const {
   buildManagedMarkersFilter,
 } = require('../utils/jurisdictions');
 const { removeExpiredMarkers } = require('../utils/markerExpiry');
+const { avisarCambioEstado, avisarOficina } = require('../utils/notificaciones');
 const router = express.Router();
 
 // Configuración de multer para almacenar los archivos en memoria
@@ -19,6 +20,22 @@ const upload = multer({ storage });
 
 const STATUS_VALUES = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto'];
 const CATEGORY_VALUES = ['familias', 'persona', 'perros_gatos', 'reparaciones'];
+const FAMILIAS_TIPOS = ['violencia', 'hijos', 'calle'];
+const ANIMAL_TIPOS = ['abandonado', 'perdido', 'adopcion'];
+const LIMITE_REPORTES_POR_DIA = 5;
+const MS_UN_DIA = 24 * 60 * 60 * 1000;
+
+const normalizeFamiliasTipo = (category, value) => {
+  if (category !== 'familias') return null;
+  const normalized = String(value || '').trim().toLowerCase();
+  return FAMILIAS_TIPOS.includes(normalized) ? normalized : null;
+};
+
+const normalizeAnimalTipo = (category, value) => {
+  if (category !== 'perros_gatos') return null;
+  const normalized = String(value || '').trim().toLowerCase();
+  return ANIMAL_TIPOS.includes(normalized) ? normalized : null;
+};
 
 const normalizeStatus = (value, fallback = 'pendiente_aprobacion') => {
   if (!value) return fallback;
@@ -166,17 +183,37 @@ router.get('/', async (req, res) => {
 
 // Ruta para agregar un nuevo marcador
 router.post('/', upload.single('image'), async (req, res) => {
-  const { lat, lng, date, time, description, urgency, status, category, visibility } = req.body;
+  const { lat, lng, date, time, description, direccion, status, category, visibility, familiasTipo, animalTipo } = req.body;
   const { requester: createdBy, adminScope } = req;
   const normalizedCategory = normalizeCategory(category);
 
   try {
+    // Los vecinos tienen un tope diario. Los admins no, para poder gestionar.
+    if (!isScopeAdmin(adminScope) && createdBy && createdBy !== 'anonimo') {
+      const desde = new Date(Date.now() - MS_UN_DIA);
+      const creadosHoy = await Marker.countDocuments({
+        createdBy,
+        createdAt: { $gte: desde },
+      });
+      if (creadosHoy >= LIMITE_REPORTES_POR_DIA) {
+        return res.status(429).json({
+          message: `Llegaste al límite de ${LIMITE_REPORTES_POR_DIA} reportes en 24 horas. Probá mañana.`,
+          limite: LIMITE_REPORTES_POR_DIA,
+          creadosHoy,
+        });
+      }
+    }
+
     const jurisdiction = await findJurisdictionForPoint(lat, lng);
 
     // Solo quien administra esa jurisdicción puede crear con un estado distinto
     let finalStatus = 'pendiente_aprobacion';
     if (status && canManageMarker(adminScope, jurisdiction)) {
       finalStatus = normalizeStatus(status, 'pendiente');
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'La foto del reporte es obligatoria.' });
     }
 
     // Generar caseId único tomando el último caseId existente
@@ -190,22 +227,22 @@ router.post('/', upload.single('image'), async (req, res) => {
       date,
       time,
       description,
-      urgency,
+      direccion: String(direccion || '').trim(),
       status: finalStatus,
       category: normalizedCategory,
+      familiasTipo: normalizeFamiliasTipo(normalizedCategory, familiasTipo),
+      animalTipo: normalizeAnimalTipo(normalizedCategory, animalTipo),
       visibility: visibility || 'public',
       createdBy,
       caseId,
       resolvedAt: computeResolvedAt(finalStatus),
     });
 
-    if (req.file) {
-      newMarker.image = {
-        data: req.file.buffer,
-        contentType: req.file.mimetype || 'application/octet-stream',
-      };
-      newMarker.imageUrl = `/api/markers/${newMarker._id}/image`;
-    }
+    newMarker.image = {
+      data: req.file.buffer,
+      contentType: req.file.mimetype || 'application/octet-stream',
+    };
+    newMarker.imageUrl = `/api/markers/${newMarker._id}/image`;
 
     const savedMarker = await newMarker.save();
     await savedMarker.populate('tenant', JURISDICTION_FIELDS);
@@ -218,7 +255,7 @@ router.post('/', upload.single('image'), async (req, res) => {
 // Ruta para actualizar un marcador existente
 router.put('/:id', upload.single('image'), async (req, res) => {
   const { id } = req.params;
-  const { lat, lng, date, time, description, urgency, status, category, visibility } = req.body;
+  const { lat, lng, date, time, description, direccion, status, category, visibility, familiasTipo, animalTipo } = req.body;
   const { requester, adminScope } = req;
 
   try {
@@ -230,6 +267,14 @@ router.put('/:id', upload.single('image'), async (req, res) => {
     if (markerOwner !== requester) {
       return res.status(403).json({ message: 'No autorizado para editar este marcador' });
     }
+    const adminYaActuo =
+      Boolean(existingMarker.avisadoAt)
+      || (existingMarker.status && existingMarker.status !== 'pendiente_aprobacion');
+    if (adminYaActuo && !canManageMarker(adminScope, existingMarker)) {
+      return res.status(403).json({
+        message: 'Este caso ya fue tomado por un administrador y no se puede editar.',
+      });
+    }
 
     const normalizedStatus = normalizeStatus(status, existingMarker.status);
     const normalizedCategory = normalizeCategory(category, existingMarker.category);
@@ -239,9 +284,11 @@ router.put('/:id', upload.single('image'), async (req, res) => {
       date,
       time,
       description,
-      urgency,
+      direccion: String(direccion || '').trim(),
       status: normalizedStatus,
       category: normalizedCategory,
+      familiasTipo: normalizeFamiliasTipo(normalizedCategory, familiasTipo),
+      animalTipo: normalizeAnimalTipo(normalizedCategory, animalTipo),
       visibility: visibility || existingMarker.visibility || 'public',
       resolvedAt: computeResolvedAt(normalizedStatus, existingMarker.resolvedAt),
     };
@@ -280,8 +327,17 @@ router.delete('/:id', async (req, res) => {
       return res.status(404).json({ message: 'Marker not found' });
     }
     const markerOwner = normalizeUserId(existingMarker.createdBy);
-    if (markerOwner !== requester && !canManageMarker(adminScope, existingMarker)) {
+    const esAdminDelCaso = canManageMarker(adminScope, existingMarker);
+    if (markerOwner !== requester && !esAdminDelCaso) {
       return res.status(403).json({ message: 'No autorizado para eliminar este marcador' });
+    }
+    const adminYaActuo =
+      Boolean(existingMarker.avisadoAt)
+      || (existingMarker.status && existingMarker.status !== 'pendiente_aprobacion');
+    if (markerOwner === requester && adminYaActuo && !esAdminDelCaso) {
+      return res.status(403).json({
+        message: 'Este caso ya fue tomado por un administrador y no se puede eliminar.',
+      });
     }
 
     await existingMarker.deleteOne();
@@ -318,6 +374,7 @@ router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => 
     if (!canManageMarker(req.adminScope, marker)) {
       return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
+    const estadoAnterior = marker.status;
     const updatedMarker = await Marker.findByIdAndUpdate(
       marker._id,
       {
@@ -326,6 +383,11 @@ router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => 
       },
       { new: true }
     ).populate('tenant', JURISDICTION_FIELDS);
+    try {
+      await avisarCambioEstado(updatedMarker, estadoAnterior, normalizedStatus);
+    } catch (errorNotif) {
+      console.error('No se pudo crear la notificación de estado:', errorNotif.message);
+    }
     res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -333,6 +395,36 @@ router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => 
 });
 
 // Ruta para aprobar un marcador (cambiar de pendiente_aprobacion a pendiente)
+router.patch('/admin/:id/avisar', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    const puedeAvisar = marker.category === 'familias'
+      || marker.category === 'persona'
+      || (marker.category === 'perros_gatos' && marker.animalTipo === 'abandonado');
+    if (!puedeAvisar) {
+      return res.status(400).json({ message: 'Este aviso es solo para familias o animales abandonados' });
+    }
+    const eraNuevoAviso = !marker.avisadoAt;
+    if (!marker.avisadoAt) {
+      marker.avisadoAt = new Date();
+      await marker.save();
+    }
+    if (eraNuevoAviso) {
+      await avisarOficina(marker).catch(() => {});
+    }
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) => {
   try {
     const marker = await Marker.findById(req.params.id);
@@ -345,6 +437,7 @@ router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) =>
     if (marker.status !== 'pendiente_aprobacion') {
       return res.status(400).json({ message: 'El marcador no está pendiente de aprobación' });
     }
+    const estadoAnterior = marker.status;
     const updatedMarker = await Marker.findByIdAndUpdate(
       marker._id,
       {
@@ -353,6 +446,11 @@ router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) =>
       },
       { new: true }
     ).populate('tenant', JURISDICTION_FIELDS);
+    try {
+      await avisarCambioEstado(updatedMarker, estadoAnterior, 'pendiente');
+    } catch (errorNotif) {
+      console.error('No se pudo crear la notificación de aprobación:', errorNotif.message);
+    }
     res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -392,10 +490,11 @@ router.get('/:id/resolution-image', async (req, res) => {
 // Ruta para que usuarios reporten que resolvieron un caso. La foto es obligatoria.
 router.post('/:id/report-resolved', upload.single('image'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'Tenés que adjuntar una foto de cómo quedó' });
+    const resolutionDescription = String(req.body.description || '').trim();
+    if (!resolutionDescription) {
+      return res.status(400).json({ message: 'Contá qué hiciste para resolver el caso' });
     }
-    if (!String(req.file.mimetype || '').startsWith('image/')) {
+    if (req.file && !String(req.file.mimetype || '').startsWith('image/')) {
       return res.status(400).json({ message: 'El archivo tiene que ser una imagen' });
     }
 
@@ -403,26 +502,36 @@ router.post('/:id/report-resolved', upload.single('image'), async (req, res) => 
     if (!marker) {
       return res.status(404).json({ message: 'Marker not found' });
     }
-    if (marker.resolvedBy) {
+
+    const yaReporto = normalizeUserId(marker.resolvedBy) === req.requester;
+    if (marker.resolvedBy && !yaReporto) {
       return res.status(400).json({ message: 'Este caso ya tiene un aviso de resolución' });
     }
+    if (!yaReporto && !req.file) {
+      return res.status(400).json({ message: 'Tenés que adjuntar una foto de cómo quedó' });
+    }
 
-    // Solo permitir reportar resolución para casos aprobados (pendiente o en_proceso)
+    // Solo permitir reportar o editar mientras el caso sigue abierto
     if (marker.status !== 'pendiente' && marker.status !== 'en_proceso') {
       return res.status(400).json({ message: 'Solo se pueden reportar casos pendientes o en proceso' });
     }
 
+    const cambios = {
+      resolvedBy: req.requester,
+      resolvedByReportedAt: new Date(),
+      resolutionDescription,
+    };
+    if (req.file) {
+      cambios.resolutionImage = {
+        data: req.file.buffer,
+        contentType: req.file.mimetype || 'application/octet-stream',
+      };
+      cambios.resolutionImageUrl = `/api/markers/${marker._id}/resolution-image`;
+    }
+
     const updatedMarker = await Marker.findByIdAndUpdate(
       marker._id,
-      {
-        resolvedBy: req.requester,
-        resolvedByReportedAt: new Date(),
-        resolutionImage: {
-          data: req.file.buffer,
-          contentType: req.file.mimetype || 'application/octet-stream',
-        },
-        resolutionImageUrl: `/api/markers/${marker._id}/resolution-image`,
-      },
+      cambios,
       { new: true }
     ).populate('tenant', JURISDICTION_FIELDS);
     res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
