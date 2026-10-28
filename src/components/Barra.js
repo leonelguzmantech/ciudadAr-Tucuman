@@ -19,7 +19,16 @@ const IconoReportes = () => (
   <svg className="sidebar-icono" viewBox="0 0 24 24" aria-hidden="true">
     <path
       fill="currentColor"
-      d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z"
+      d="M6 2h9l5 5v15H6V2zm8 1.5V8h4.5L14 3.5zM8 12h8v2H8v-2zm0 4h8v2H8v-2z"
+    />
+  </svg>
+);
+
+const IconoDashboard = () => (
+  <svg className="sidebar-icono" viewBox="0 0 24 24" aria-hidden="true">
+    <path
+      fill="currentColor"
+      d="M3 3h8v8H3V3zm10 0h8v5h-8V3zM3 13h8v8H3v-8zm10 7v-8h8v8h-8z"
     />
   </svg>
 );
@@ -55,9 +64,11 @@ const Barra = ({
   usuario,
   noLeidas = 0,
   conSidebar = false,
+  esAdmin = false,
   onMisReportes,
   onFiltros,
   onNotificaciones,
+  onDashboardAdmin,
   onPerfilActualizado,
 }) => {
   const [menuMovilAbierto, setMenuMovilAbierto] = useState(false);
@@ -88,8 +99,7 @@ const Barra = ({
     return (
       <header className="barra">
         <span className="barra-marca">
-          <img src={logoCiudad} alt="" className="barra-logo" />
-          CiudadAr
+          <img src={logoCiudad} alt="CiudadAr" className="barra-logo" />
         </span>
       </header>
     );
@@ -99,11 +109,8 @@ const Barra = ({
     <>
       <aside className={`sidebar${menuMovilAbierto ? ' abierta' : ''}`}>
         <div className="sidebar-marca">
-          <img src={logoCiudad} alt="" className="barra-logo" />
-          <div>
-            <strong>CiudadAr</strong>
-            <small>Reportes Tucumán</small>
-          </div>
+          <img src={logoCiudad} alt="CiudadAr" className="barra-logo sidebar-logo-grande" />
+          <small className="sidebar-marca-sub">Reportes Tucumán</small>
         </div>
 
         <nav className="sidebar-nav" aria-label="Menú principal">
@@ -152,6 +159,21 @@ const Barra = ({
         </nav>
 
         <div className="sidebar-pie">
+          {esAdmin && onDashboardAdmin && (
+            <button
+              type="button"
+              className="sidebar-item sidebar-item-admin sidebar-item-dashboard"
+              onClick={() => {
+                setMenuMovilAbierto(false);
+                onDashboardAdmin();
+              }}
+            >
+              <span className="sidebar-item-contenido">
+                <IconoDashboard />
+                Dashboard admin
+              </span>
+            </button>
+          )}
           <p className="barra-usuario">{nombre}</p>
           {usuario.displayName && usuario.email && (
             <p className="barra-correo">{usuario.email}</p>

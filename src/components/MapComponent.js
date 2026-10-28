@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { GoogleMap, useJsApiLoader, Marker, OverlayView } from '@react-google-maps/api';
-import { useDropzone } from 'react-dropzone';
 import axios from 'axios';
 import marcadorCiudad from '../assets/marcador-ciudadar.svg';
 import marcadorCiudadLuz from '../assets/marcador-ciudadar-luz.svg';
 import BuscadorDireccion from './BuscadorDireccion';
+import ChatReclamo from './ChatReclamo';
+import EditorImagen from './EditorImagen';
+import CamaraEnVivo from './CamaraEnVivo';
 
 const ANCHO_PIN = 30;
 const ALTO_PIN = ANCHO_PIN * (88 / 64);
@@ -23,6 +25,24 @@ const iconoReporte = () => ({
 // const libraries = ['marker']; // Eliminado
 const mapLibraries = ['visualization', 'places'];
 const RADIO_MISMO_CASO_METROS = 50;
+
+const digitosContacto = (valor) => String(valor || '').replace(/\D/g, '');
+const contactoValido = (valor) => {
+  const d = digitosContacto(valor);
+  return d.length >= 8 && d.length <= 15;
+};
+// wa.me espera país + número (AR móvil: 549 + área sin 0 + número)
+const whatsappUrl = (contacto, texto = '') => {
+  let d = digitosContacto(contacto);
+  if (!d) return null;
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('0')) d = d.slice(1);
+  if (!d.startsWith('54')) {
+    d = d.startsWith('9') ? `54${d}` : `549${d}`;
+  }
+  const base = `https://wa.me/${d}`;
+  return texto ? `${base}?text=${encodeURIComponent(texto)}` : base;
+};
 
 const componenteDireccion = (components, tipo) =>
   (components || []).find((item) => item.types?.includes(tipo))?.long_name || '';
@@ -463,6 +483,10 @@ function MapComponent({
   panelVecino = null,
   onPanelVecinoVisto,
   onNoLeidasChange,
+  focoCasoMapa = null,
+  onFocoCasoVisto,
+  modoSoloCaso = false,
+  onCerrarSoloCaso,
 }) {
   const userId = currentUser ? String(currentUser).trim().toLowerCase() : 'anonimo';
   const [markers, setMarkers] = useState([]);
@@ -479,8 +503,14 @@ function MapComponent({
     category: 'reparaciones',
     familiasTipo: '',
     animalTipo: '',
+    perdidaTipo: '',
+    objeto: '',
+    contacto: '',
     resolvedAt: null,
   });
+  const [telefonoUsuario, setTelefonoUsuario] = useState('');
+  const [mostrarChatReclamo, setMostrarChatReclamo] = useState(false);
+  const [reclamando, setReclamando] = useState(false);
   const [showPopup, setShowPopup] = useState(false);
   const [editMode, setEditMode] = useState(null); // Estado para el modo de edición
   const [userLocation, setUserLocation] = useState(null); // Punto azul: dónde está la persona
@@ -506,11 +536,12 @@ function MapComponent({
   const [isAdmin, setIsAdmin] = useState(false);
   const [adminRole, setAdminRole] = useState(null);
   const [adminJurisdictions, setAdminJurisdictions] = useState([]);
-  const statusOptions = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto'];
+  const statusOptions = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto', 'rechazado'];
   const categoryOptions = [
+    { value: 'reparaciones', label: 'Reparaciones' },
     { value: 'familias', label: 'Familias' },
     { value: 'perros_gatos', label: 'Perros y gatos' },
-    { value: 'reparaciones', label: 'Reparaciones' },
+    { value: 'cosas_perdidas', label: 'Cosas perdidas' },
   ];
   const [highlightedMarkerId, setHighlightedMarkerId] = useState(null);
   const [deletedMarker, setDeletedMarker] = useState(null); // Caso eliminado temporalmente para poder deshacer
@@ -520,6 +551,14 @@ function MapComponent({
   const [resolutionDescription, setResolutionDescription] = useState('');
   const [mostrarResolucion, setMostrarResolucion] = useState(false);
   const [editandoResolucion, setEditandoResolucion] = useState(false);
+  const [verDetalleResolucion, setVerDetalleResolucion] = useState(false);
+  const [confirmarRecupero, setConfirmarRecupero] = useState(false);
+  const [confirmandoRecupero, setConfirmandoRecupero] = useState(false);
+  const [respuestaDatos, setRespuestaDatos] = useState('');
+  const [fotoRespuestaDatos, setFotoRespuestaDatos] = useState(null);
+  const [previewRespuestaDatos, setPreviewRespuestaDatos] = useState(null);
+  const [enviandoRespuestaDatos, setEnviandoRespuestaDatos] = useState(false);
+  const [mostrarOpcionesFotoRespuesta, setMostrarOpcionesFotoRespuesta] = useState(false);
   const [busquedaAdmin, setBusquedaAdmin] = useState('');
   const [filtroCategoriaAdmin, setFiltroCategoriaAdmin] = useState('todas');
   const [filtroEstadoAdmin, setFiltroEstadoAdmin] = useState('todos');
@@ -531,8 +570,28 @@ function MapComponent({
   const [sumandoCaso, setSumandoCaso] = useState(null);
   const [avisoVecino, setAvisoVecino] = useState('');
   const [avisoEsAlerta, setAvisoEsAlerta] = useState(false);
+  const [recienPublicado, setRecienPublicado] = useState(false);
+  const [editorImagenSrc, setEditorImagenSrc] = useState(null);
+  const [editorDestino, setEditorDestino] = useState('aviso'); // aviso | resolucion | respuesta
+  const [mostrarCamara, setMostrarCamara] = useState(false);
+  const [mostrarOpcionesFoto, setMostrarOpcionesFoto] = useState(false);
+  const inputGaleriaRef = useRef(null);
+  const inputCamaraRef = useRef(null);
+  const inputGaleriaResolucionRef = useRef(null);
+  const inputCamaraResolucionRef = useRef(null);
+  const inputGaleriaRespuestaRef = useRef(null);
+  const inputCamaraRespuestaRef = useRef(null);
   const [soloMisReportes, setSoloMisReportes] = useState(false);
+  const [soloMiJurisdiccion, setSoloMiJurisdiccion] = useState(false);
   const [mostrarMisReportes, setMostrarMisReportes] = useState(false);
+  const [misReportesSeccion, setMisReportesSeccion] = useState('activos'); // activos | registro
+  const [misReportesActivos, setMisReportesActivos] = useState([]);
+  const [misReportesRegistro, setMisReportesRegistro] = useState([]);
+  const [misPage, setMisPage] = useState(1);
+  const [misMeta, setMisMeta] = useState({ total: 0, hasMore: false, limit: 8 });
+  const [cargandoMisLista, setCargandoMisLista] = useState(false);
+  const [renovandoId, setRenovandoId] = useState(null);
+  const MIS_PAGE_SIZE = 8;
   const [mostrarFiltros, setMostrarFiltros] = useState(false);
   const [mostrarNotificaciones, setMostrarNotificaciones] = useState(false);
   const [notificaciones, setNotificaciones] = useState([]);
@@ -557,17 +616,21 @@ function MapComponent({
   const deleteTimeoutRef = useRef(null); // Referencia al timeout de eliminación
   const countdownIntervalRef = useRef(null); // Referencia al intervalo del contador
   const idsEnBorradoRef = useRef(new Set());
+  // Casos traídos desde el dashboard admin que pueden no estar en el listado público
+  const casosAdminForzadosRef = useRef(new Map());
   const statusLabels = {
     pendiente_aprobacion: 'Por aprobar',
     pendiente: 'Publicado',
     en_proceso: 'En proceso',
     resuelto: 'Resuelto',
+    rechazado: 'Rechazado',
   };
   const statusBadgeColors = {
     pendiente_aprobacion: { bg: '#fef3c7', color: '#92400e' },
     pendiente: { bg: '#dbeafe', color: '#1e40af' },
     en_proceso: { bg: '#bfdbfe', color: '#1e3a8a' },
     resuelto: { bg: '#dcfce7', color: '#166534' },
+    rechazado: { bg: '#fee2e2', color: '#991b1b' },
   };
   const categoryLabels = useMemo(
     () => ({
@@ -575,11 +638,16 @@ function MapComponent({
       persona: 'Persona en situación de calle',
       perros_gatos: 'Perros y gatos',
       reparaciones: 'Reparaciones',
+      cosas_perdidas: 'Cosas perdidas',
     }),
     []
   );
+  const perdidaLabels = {
+    perdi: 'Perdí algo',
+    encontre: 'Encontré algo',
+  };
 const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
-const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const FIFTEEN_DAYS_MS = 15 * 24 * 60 * 60 * 1000;
 
 const getStatusBadgeStyle = (status) => {
   const paleta = statusBadgeColors[status] || { bg: '#e5e7eb', color: '#1f2937' };
@@ -604,7 +672,12 @@ const getDaysUntil = (dateString, limitMs) => {
 
 const getDaysUntilRemoval = (dateString) => getDaysUntil(dateString, TEN_DAYS_MS);
 
-const getDaysUntilPetExpiry = (dateString) => getDaysUntil(dateString, THIRTY_DAYS_MS);
+const getDaysUntilAvisoExpiry = (dateString) => getDaysUntil(dateString, FIFTEEN_DAYS_MS);
+
+const esPublicacionVencida = (marker) => (
+  Boolean(marker?.eliminadoAt)
+  && String(marker?.motivoEliminacion || '').toLowerCase().includes('vencimiento')
+);
   const normalizeCategoryValue = useCallback(
     (value) => {
       if (!value) return 'persona';
@@ -613,6 +686,7 @@ const getDaysUntilPetExpiry = (dateString) => getDaysUntil(dateString, THIRTY_DA
       if (normalized.includes('familia')) return 'familias';
       if (normalized.includes('perro') || normalized.includes('gato')) return 'perros_gatos';
       if (normalized.includes('repar')) return 'reparaciones';
+      if (normalized.includes('perdid') || normalized.includes('encontr')) return 'cosas_perdidas';
       if (normalized.includes('persona')) return 'persona';
       return 'persona';
     },
@@ -628,9 +702,17 @@ const stopTouchPropagation = (event) => {
 };
 
   const handleCategoryChange = (e) => {
-        setFormData({
-          ...formData,
-      category: normalizeCategoryValue(e.target.value),
+    const category = normalizeCategoryValue(e.target.value);
+    setFormData({
+      ...formData,
+      category,
+      familiasTipo: category === 'familias' ? formData.familiasTipo : '',
+      animalTipo: category === 'perros_gatos' ? formData.animalTipo : '',
+      perdidaTipo: category === 'cosas_perdidas' ? formData.perdidaTipo : '',
+      objeto: category === 'cosas_perdidas' ? formData.objeto : '',
+      contacto: category === 'perros_gatos'
+        ? (formData.contacto || telefonoUsuario || '')
+        : '',
     });
   };
 
@@ -656,12 +738,16 @@ const stopTouchPropagation = (event) => {
       setGeoError('Geolocalización no soportada por el navegador.');
       return;
     }
+    // En "ver un solo caso" el centro lo marca el pin, no la ubicación del admin
+    if (modoSoloCaso) {
+      yaCentroUsuario.current = true;
+    }
 
     const handleSuccess = (position) => {
       const { latitude, longitude } = position.coords;
       const current = { lat: latitude, lng: longitude };
       setUserLocation(current);
-      if (!yaCentroUsuario.current) {
+      if (!modoSoloCaso && !yaCentroUsuario.current) {
         yaCentroUsuario.current = true;
         setMapCenter(current);
       }
@@ -697,7 +783,7 @@ const stopTouchPropagation = (event) => {
     return () => {
       navigator.geolocation.clearWatch(watchId);
     };
-  }, []);
+  }, [modoSoloCaso]);
 
   const cargarNotificaciones = useCallback(async () => {
     if (!userId || userId === 'anonimo') {
@@ -719,12 +805,68 @@ const stopTouchPropagation = (event) => {
     }
   }, [userId, onNoLeidasChange]);
 
+  const normalizarMisItem = useCallback((marker) => ({
+    ...marker,
+    category: normalizeCategoryValue(marker.category),
+    createdBy: marker.createdBy
+      ? String(marker.createdBy).trim().toLowerCase()
+      : 'anonimo',
+  }), [normalizeCategoryValue]);
+
+  const cargarMisLista = useCallback(async (seccion = misReportesSeccion, page = 1) => {
+    if (!userId || userId === 'anonimo') {
+      setMisReportesActivos([]);
+      setMisReportesRegistro([]);
+      setMisMeta({ total: 0, hasMore: false, limit: MIS_PAGE_SIZE });
+      return;
+    }
+    setCargandoMisLista(true);
+    try {
+      const params = {
+        mine: '1',
+        limit: MIS_PAGE_SIZE,
+        page,
+      };
+      if (seccion === 'registro') params.eliminados = '1';
+      const { data } = await axios.get('http://localhost:5001/api/markers', {
+        headers: { 'x-user-id': userId },
+        params,
+      });
+      const lista = (Array.isArray(data) ? data : (data.items || [])).map(normalizarMisItem);
+      const total = Array.isArray(data) ? lista.length : (data.total || lista.length);
+      const limit = Array.isArray(data) ? MIS_PAGE_SIZE : (data.limit || MIS_PAGE_SIZE);
+      const hasMore = Array.isArray(data)
+        ? false
+        : Boolean(data.hasMore ?? (page * limit < total));
+      if (seccion === 'registro') {
+        setMisReportesRegistro(lista);
+      } else {
+        // Refuerzo: no mezclar bajas si el servidor devolvió alguna
+        setMisReportesActivos(lista.filter((m) => (
+          !m.eliminadoAt && m.status !== 'resuelto' && m.status !== 'rechazado'
+        )));
+      }
+      setMisPage(page);
+      setMisMeta({ total, hasMore, limit });
+    } catch (error) {
+      console.error('Error cargando mis reportes:', error);
+      if (seccion === 'registro') setMisReportesRegistro([]);
+      else setMisReportesActivos([]);
+      setMisMeta({ total: 0, hasMore: false, limit: MIS_PAGE_SIZE });
+    } finally {
+      setCargandoMisLista(false);
+    }
+  }, [userId, misReportesSeccion, normalizarMisItem]);
+
   useEffect(() => {
     if (!panelVecino) return;
     if (panelVecino === 'mis-reportes') {
       setMostrarNotificaciones(false);
       setMostrarFiltros(false);
       setMostrarMisReportes(true);
+      setMisReportesSeccion('activos');
+      setMisPage(1);
+      cargarMisLista('activos', 1);
     }
     if (panelVecino === 'filtros') {
       setMostrarNotificaciones(false);
@@ -738,7 +880,7 @@ const stopTouchPropagation = (event) => {
       cargarNotificaciones();
     }
     if (onPanelVecinoVisto) onPanelVecinoVisto();
-  }, [panelVecino, onPanelVecinoVisto, cargarNotificaciones]);
+  }, [panelVecino, onPanelVecinoVisto, cargarNotificaciones, cargarMisLista]);
 
   useEffect(() => {
     cargarNotificaciones();
@@ -746,6 +888,23 @@ const stopTouchPropagation = (event) => {
     const timer = setInterval(cargarNotificaciones, 15000);
     return () => clearInterval(timer);
   }, [cargarNotificaciones, userId]);
+
+  useEffect(() => {
+    if (!userId || userId === 'anonimo') {
+      setTelefonoUsuario('');
+      return undefined;
+    }
+    let cancelado = false;
+    axios.get('http://localhost:5001/api/usuarios/me', {
+      headers: { 'x-user-id': userId },
+    }).then((res) => {
+      if (cancelado) return;
+      setTelefonoUsuario(String(res.data?.telefono || '').trim());
+    }).catch(() => {
+      if (!cancelado) setTelefonoUsuario('');
+    });
+    return () => { cancelado = true; };
+  }, [userId]);
 
   useEffect(() => {
     const fetchRole = async () => {
@@ -771,34 +930,83 @@ const stopTouchPropagation = (event) => {
     fetchRole();
   }, [userId]);
 
-  // Cargar marcadores al inicio y refrescar para que el vecino vea cuando ya avisaron
+  const [markersMeta, setMarkersMeta] = useState({ total: 0, hasMore: false, limit: 60 });
+
+  // Carga filtrada + paginada en el servidor (no trae todo el dataset)
   useEffect(() => {
+    if (modoSoloCaso) return undefined;
     let cancelado = false;
     const fetchMarkers = async () => {
       try {
+        const params = {
+          limit: 60,
+          page: 1,
+        };
+        if (categoryFilter && categoryFilter !== 'todas') {
+          params.category = categoryFilter;
+        }
+        if (categoryFilter === 'perros_gatos' && animalFilter && animalFilter !== 'todos') {
+          params.animalTipo = animalFilter;
+        }
+        if (soloMisReportes) {
+          params.mine = '1';
+        }
+        if (soloMiJurisdiccion) {
+          params.myJurisdiction = '1';
+        }
         const response = await axios.get('http://localhost:5001/api/markers', {
-          headers: {
-            'x-user-id': userId,
-          },
+          headers: { 'x-user-id': userId },
+          params,
         });
         if (cancelado) return;
+        const payload = response.data;
+        const lista = Array.isArray(payload) ? payload : (payload.items || []);
         const ocultos = idsEnBorradoRef.current;
-        const savedMarkers = response.data
-        .filter((marker) => !ocultos.has(String(marker._id)))
-        .map(marker => ({
-          ...marker,
-          isSaved: true,
-          category: normalizeCategoryValue(marker.category),
-          status: marker.status || 'pendiente',
-          resolvedAt: marker.resolvedAt || null,
-          caseId: marker.caseId || null,
-          resolvedBy: marker.resolvedBy || null,
-          resolvedByReportedAt: marker.resolvedByReportedAt || null,
-          createdBy: marker.createdBy
-            ? String(marker.createdBy).trim().toLowerCase()
-            : 'anonimo',
-        }));
-        setMarkers(savedMarkers);
+        const savedMarkers = lista
+          .filter((marker) => !ocultos.has(String(marker._id)))
+          .map((marker) => ({
+            ...marker,
+            isSaved: true,
+            category: normalizeCategoryValue(marker.category),
+            status: marker.status || 'pendiente',
+            resolvedAt: marker.resolvedAt || null,
+            caseId: marker.caseId || null,
+            resolvedBy: marker.resolvedBy || null,
+            resolvedByReportedAt: marker.resolvedByReportedAt || null,
+            perdidaTipo: marker.perdidaTipo || '',
+            objeto: marker.objeto || '',
+            contacto: marker.contacto || '',
+            claimedByMe: !!marker.claimedByMe,
+            canChat: !!marker.canChat,
+            claimCount: marker.claimCount || 0,
+            chatAbiertoPorMi: !!marker.chatAbiertoPorMi,
+            confirmacionPerdidaMia: marker.confirmacionPerdidaMia || null,
+            perdidaEsperaOtraParte: !!marker.perdidaEsperaOtraParte,
+            canManage: !!marker.canManage,
+            pideDatosAt: marker.pideDatosAt || null,
+            pideDatosMensaje: marker.pideDatosMensaje || '',
+            respuestaDatosAt: marker.respuestaDatosAt || null,
+            ultimaRespuestaDatosAt: marker.ultimaRespuestaDatosAt || null,
+            eliminadoAt: marker.eliminadoAt || null,
+            motivoEliminacion: marker.motivoEliminacion || '',
+            aprobadoAt: marker.aprobadoAt || null,
+            createdBy: marker.createdBy
+              ? String(marker.createdBy).trim().toLowerCase()
+              : 'anonimo',
+          }));
+        const idsVisibles = new Set(savedMarkers.map((m) => String(m._id)));
+        const extrasAdmin = [...casosAdminForzadosRef.current.values()]
+          .filter((m) => !idsVisibles.has(String(m._id)) && !ocultos.has(String(m._id)));
+        setMarkers([...savedMarkers, ...extrasAdmin]);
+        if (!Array.isArray(payload)) {
+          setMarkersMeta({
+            total: payload.total || savedMarkers.length,
+            hasMore: !!payload.hasMore,
+            limit: payload.limit || 60,
+          });
+        } else {
+          setMarkersMeta({ total: savedMarkers.length, hasMore: false, limit: 60 });
+        }
       } catch (error) {
         console.error('Error fetching markers:', error);
       }
@@ -810,7 +1018,7 @@ const stopTouchPropagation = (event) => {
       cancelado = true;
       clearInterval(timer);
     };
-  }, [normalizeCategoryValue, userId]);
+  }, [normalizeCategoryValue, userId, categoryFilter, animalFilter, soloMisReportes, soloMiJurisdiccion, modoSoloCaso]);
 
   useEffect(() => {
     if (!showPopup || !editMode) return;
@@ -839,27 +1047,99 @@ const stopTouchPropagation = (event) => {
     }
   }, [markers, categoryFilter, isAdmin, userId]);
 
-  // Función para manejar la carga de imágenes y datos adicionales
-  const onDrop = async (acceptedFiles) => {
-    const file = acceptedFiles[0];
+  const abrirEditorConSrc = useCallback((src, destino = 'aviso') => {
+    if (!src) return;
+    setEditorDestino(destino);
+    setEditorImagenSrc(src);
+    setMostrarCamara(false);
+  }, []);
+
+  const abrirEditorDesdeArchivo = useCallback((file, destino = 'aviso') => {
+    if (!file || !file.type?.startsWith('image/')) {
+      mostrarAviso('La foto tiene que ser una imagen.', true);
+      return;
+    }
     const reader = new FileReader();
-
-    reader.onload = function () {
-      setSelectedImage(reader.result);
-    };
-
+    reader.onload = () => abrirEditorConSrc(reader.result, destino);
     reader.readAsDataURL(file);
+  }, [abrirEditorConSrc]);
 
-    setFormData({
-      ...formData,
-      image: file,
-    });
-    setIsImageZoomed(false);
+  const onElegirArchivoAviso = (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (file) abrirEditorDesdeArchivo(file, 'aviso');
+  };
+
+  const onElegirArchivoResolucion = (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (file) abrirEditorDesdeArchivo(file, 'resolucion');
+  };
+
+  const abrirCamaraAviso = () => {
+    setEditorDestino('aviso');
+    // En móviles el input capture abre la cámara nativa; en desktop usamos getUserMedia
+    const esMovil = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+    if (esMovil && inputCamaraRef.current) {
+      inputCamaraRef.current.click();
+      return;
+    }
+    setMostrarCamara(true);
+  };
+
+  const abrirCamaraResolucion = () => {
+    setEditorDestino('resolucion');
+    const esMovil = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+    if (esMovil && inputCamaraResolucionRef.current) {
+      inputCamaraResolucionRef.current.click();
+      return;
+    }
+    setMostrarCamara(true);
+  };
+
+  const confirmarFotoEditada = ({ dataUrl, file }) => {
+    if (editorDestino === 'resolucion') {
+      setResolutionPhoto(file);
+      setResolutionPreview(dataUrl);
+    } else if (editorDestino === 'respuesta') {
+      setFotoRespuestaDatos(file);
+      setPreviewRespuestaDatos(dataUrl);
+      setMostrarOpcionesFotoRespuesta(false);
+    } else {
+      setSelectedImage(dataUrl);
+      setFormData((prev) => ({ ...prev, image: file }));
+      setIsImageZoomed(false);
+      setMostrarOpcionesFoto(false);
+    }
+    setEditorImagenSrc(null);
+  };
+
+  const onElegirArchivoRespuesta = (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (file) abrirEditorDesdeArchivo(file, 'respuesta');
+  };
+
+  const abrirCamaraRespuesta = () => {
+    setEditorDestino('respuesta');
+    const esMovil = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+    if (esMovil && inputCamaraRespuestaRef.current) {
+      inputCamaraRespuestaRef.current.click();
+      return;
+    }
+    setMostrarCamara(true);
+  };
+
+  const quitarFotoRespuesta = () => {
+    setFotoRespuestaDatos(null);
+    setPreviewRespuestaDatos(null);
+    setMostrarOpcionesFotoRespuesta(false);
   };
 
   const quitarImagen = () => {
     setSelectedImage(null);
     setIsImageZoomed(false);
+    setMostrarOpcionesFoto(false);
     setFormData((prev) => ({ ...prev, image: null }));
   };
 
@@ -893,13 +1173,6 @@ const stopTouchPropagation = (event) => {
       description: e.target.value,
     });
   };
-
-  // Configuración del Dropzone
-  const { getRootProps, getInputProps, open } = useDropzone({
-    onDrop,
-    noClick: true,
-    noKeyboard: true,
-  });
 
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey,
@@ -949,6 +1222,21 @@ const stopTouchPropagation = (event) => {
     if (dragEndListenerRef.current) {
       window.google.maps.event.removeListener(dragEndListenerRef.current);
     }
+    if (modoSoloCaso && window.google?.maps?.event) {
+      const recentrarCaso = () => {
+        window.google.maps.event.trigger(map, 'resize');
+        const lat = Number(focoCasoMapa?.lat);
+        const lng = Number(focoCasoMapa?.lng);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+          const centro = { lat, lng };
+          map.setCenter(centro);
+          map.setZoom(18);
+          setMapCenter(centro);
+        }
+      };
+      window.setTimeout(recentrarCaso, 80);
+      window.setTimeout(recentrarCaso, 300);
+    }
     dragStartListenerRef.current = map.addListener('dragstart', () => {
       bloquearAutoDireccionRef.current = false;
       if (!showPopupRef.current) setPinMoviendo(true);
@@ -966,8 +1254,10 @@ const stopTouchPropagation = (event) => {
         actualizarDireccionDelPin(true);
       }, 500);
     });
-    setTimeout(() => actualizarDireccionDelPin(true), 600);
-  }, [actualizarDireccionDelPin]);
+    if (!modoSoloCaso) {
+      setTimeout(() => actualizarDireccionDelPin(true), 600);
+    }
+  }, [actualizarDireccionDelPin, modoSoloCaso, focoCasoMapa]);
 
   useEffect(() => {
     return () => {
@@ -999,13 +1289,25 @@ const stopTouchPropagation = (event) => {
       category: 'reparaciones',
       familiasTipo: '',
       animalTipo: '',
+      perdidaTipo: '',
+      objeto: '',
+      contacto: '',
       resolvedAt: null,
+      claimedByMe: false,
+      canChat: false,
+      claimCount: 0,
+      chatAbiertoPorMi: false,
+      confirmacionPerdidaMia: null,
+      perdidaEsperaOtraParte: false,
     });
     setSelectedImage(null);
     setIsImageZoomed(false);
     setShowPopup(true);
     setEditMode(null);
     setCanEdit(true);
+    setRecienPublicado(false);
+    setMostrarOpcionesFoto(false);
+    setMostrarChatReclamo(false);
     setMostrarCercanos(false);
     setCasosCercanos([]);
     // Completar / refrescar dirección del pin si falta
@@ -1081,6 +1383,9 @@ const stopTouchPropagation = (event) => {
       category: marker.category === 'persona' ? 'familias' : normalizeCategoryValue(marker.category),
       familiasTipo: marker.category === 'persona' ? 'calle' : (marker.familiasTipo || ''),
       animalTipo: marker.animalTipo || '',
+      perdidaTipo: marker.perdidaTipo || '',
+      objeto: marker.objeto || '',
+      contacto: marker.contacto || '',
       status: marker.status || 'pendiente',
       resolvedAt: marker.resolvedAt || null,
       caseId: marker.caseId || null,
@@ -1090,17 +1395,39 @@ const stopTouchPropagation = (event) => {
       resolutionDescription: marker.resolutionDescription || '',
       resolutionImageUrl: marker.resolutionImageUrl || null,
       createdAt: marker.createdAt || null,
+      aprobadoAt: marker.aprobadoAt || null,
       neighborCount: marker.neighborCount || 1,
       avisadoAt: marker.avisadoAt || null,
+      createdBy: marker.createdBy || '',
+      claimedByMe: !!marker.claimedByMe,
+      canChat: !!marker.canChat,
+      claimCount: marker.claimCount || 0,
+      chatAbiertoPorMi: !!marker.chatAbiertoPorMi,
+      confirmacionPerdidaMia: marker.confirmacionPerdidaMia || null,
+      perdidaEsperaOtraParte: !!marker.perdidaEsperaOtraParte,
+      canManage: !!marker.canManage,
+      pideDatosAt: marker.pideDatosAt || null,
+      pideDatosMensaje: marker.pideDatosMensaje || '',
+      respuestaDatosAt: marker.respuestaDatosAt || null,
+      ultimaRespuestaDatosAt: marker.ultimaRespuestaDatosAt || null,
+      eliminadoAt: marker.eliminadoAt || null,
+      motivoEliminacion: marker.motivoEliminacion || '',
     });
+    setMostrarChatReclamo(false);
     setResolutionPhoto(null);
     setResolutionPreview(null);
     setResolutionDescription('');
     setEditandoResolucion(false);
     setMostrarResolucion(false);
+    setRespuestaDatos(marker.description || '');
+    setFotoRespuestaDatos(null);
+    setPreviewRespuestaDatos(null);
+    setMostrarOpcionesFotoRespuesta(false);
+    setVerDetalleResolucion(false);
     setSelectedImage(marker.imageUrl ? buildImageUrl(marker.imageUrl) : null); // Mostrar imagen existente
     setIsImageZoomed(false);
     setShowPopup(true);
+    setRecienPublicado(false);
     const markerOwner = marker.createdBy
       ? String(marker.createdBy).trim().toLowerCase()
       : 'anonimo';
@@ -1127,15 +1454,114 @@ const stopTouchPropagation = (event) => {
     setHighlightedMarkerId(marker._id);
   }, [userId, normalizeCategoryValue, buildImageUrl]);
 
+  // Admin / foco: abrir el mismo popup del proyecto en un caso concreto
+  useEffect(() => {
+    if (!focoCasoMapa || !focoCasoMapa._id) return undefined;
+    if (!isLoaded) return undefined;
+
+    const markerNormalizado = {
+      ...focoCasoMapa,
+      isSaved: true,
+      category: normalizeCategoryValue(focoCasoMapa.category),
+      status: focoCasoMapa.status || 'pendiente',
+      contacto: focoCasoMapa.contacto || '',
+      createdBy: focoCasoMapa.createdBy
+        ? String(focoCasoMapa.createdBy).trim().toLowerCase()
+        : 'anonimo',
+      claimedByMe: !!focoCasoMapa.claimedByMe,
+      canChat: !!focoCasoMapa.canChat,
+      claimCount: focoCasoMapa.claimCount || 0,
+      chatAbiertoPorMi: !!focoCasoMapa.chatAbiertoPorMi,
+      confirmacionPerdidaMia: focoCasoMapa.confirmacionPerdidaMia || null,
+      perdidaEsperaOtraParte: !!focoCasoMapa.perdidaEsperaOtraParte,
+      canManage: true,
+    };
+
+    casosAdminForzadosRef.current.set(String(markerNormalizado._id), markerNormalizado);
+    if (modoSoloCaso) {
+      setMarkers([markerNormalizado]);
+      setMarkersMeta({ total: 1, hasMore: false, limit: 1 });
+      setMapCenter({
+        lat: Number(markerNormalizado.lat) || -26.8084602,
+        lng: Number(markerNormalizado.lng) || -65.2175701,
+      });
+    } else {
+      setMarkers((prev) => (
+        prev.some((m) => String(m._id) === String(markerNormalizado._id))
+          ? prev.map((m) => (
+            String(m._id) === String(markerNormalizado._id) ? { ...m, ...markerNormalizado } : m
+          ))
+          : [...prev, markerNormalizado]
+      ));
+    }
+
+    let cancelado = false;
+    const enfocar = () => {
+      if (cancelado) return;
+      const lat = Number(markerNormalizado.lat);
+      const lng = Number(markerNormalizado.lng);
+      const centro = { lat, lng };
+      if (mapRef.current && Number.isFinite(lat) && Number.isFinite(lng)) {
+        if (window.google?.maps?.event) {
+          window.google.maps.event.trigger(mapRef.current, 'resize');
+        }
+        mapRef.current.setCenter(centro);
+        mapRef.current.setZoom(18);
+        mapRef.current.panTo(centro);
+        setMapCenter(centro);
+      }
+      if (modoSoloCaso) {
+        // Solo centrar con el pin brillando; el popup se abre al tocar el marcador
+        yaCentroUsuario.current = true;
+        setHighlightedMarkerId(markerNormalizado._id);
+        setShowPopup(false);
+        setEditMode(markerNormalizado._id);
+      } else {
+        handleMarkerClick(markerNormalizado, true);
+      }
+      if (onFocoCasoVisto) onFocoCasoVisto();
+    };
+
+    const t = window.setTimeout(enfocar, 120);
+    const t2 = window.setTimeout(enfocar, 350);
+    const t3 = window.setTimeout(enfocar, 700);
+    return () => {
+      cancelado = true;
+      window.clearTimeout(t);
+      window.clearTimeout(t2);
+      window.clearTimeout(t3);
+    };
+  }, [focoCasoMapa, isLoaded, normalizeCategoryValue, handleMarkerClick, onFocoCasoVisto, modoSoloCaso]);
+
   // Función para enviar los datos del formulario al servidor
   const handleSubmit = async (e) => {
     e.preventDefault();
 
-    const { image, date, time, description, category, status, familiasTipo, animalTipo } = formData;
+    const {
+      image, date, time, description, category, status, familiasTipo, animalTipo, perdidaTipo, objeto, contacto,
+    } = formData;
     if (!image) {
       mostrarAviso('Para subir el reporte tenés que agregar una foto.', true);
       return;
     }
+    if (category === 'cosas_perdidas' && !perdidaTipo) {
+      mostrarAviso('Elegí si perdiste o encontraste algo.', true);
+      return;
+    }
+    if (category === 'perros_gatos' && !animalTipo) {
+      mostrarAviso('Elegí de qué se trata el aviso de animales.', true);
+      return;
+    }
+    if (category === 'perros_gatos' && !contactoValido(contacto)) {
+      mostrarAviso('En avisos de animales el celular de contacto es obligatorio.', true);
+      return;
+    }
+    const ahora = new Date();
+    const dateFinal = date || ahora.toISOString().slice(0, 10);
+    const timeFinal = time || ahora.toTimeString().slice(0, 5);
+    const objetoFinal = category === 'cosas_perdidas'
+      ? String(objeto || description || '').trim().slice(0, 120)
+      : '';
     const lat = puntoElegidoRef.current ? puntoElegidoRef.current.lat : formData.lat;
     const lng = puntoElegidoRef.current ? puntoElegidoRef.current.lng : formData.lng;
     let direccion = String(formData.direccion || direccionPreview || '').trim();
@@ -1163,13 +1589,19 @@ const stopTouchPropagation = (event) => {
     formDataToSend.append('lat', lat);
     formDataToSend.append('lng', lng);
     formDataToSend.append('image', image);
-    formDataToSend.append('date', date);
-    formDataToSend.append('time', time);
+    formDataToSend.append('date', dateFinal);
+    formDataToSend.append('time', timeFinal);
     formDataToSend.append('description', description);
     formDataToSend.append('direccion', String(direccion || '').trim());
     formDataToSend.append('category', category);
     formDataToSend.append('familiasTipo', category === 'familias' ? familiasTipo : '');
     formDataToSend.append('animalTipo', category === 'perros_gatos' ? animalTipo : '');
+    formDataToSend.append('perdidaTipo', category === 'cosas_perdidas' ? perdidaTipo : '');
+    formDataToSend.append('objeto', objetoFinal);
+    formDataToSend.append(
+      'contacto',
+      category === 'perros_gatos' ? digitosContacto(contacto) : ''
+    );
     formDataToSend.append('status', status || 'pendiente');
 
     try {
@@ -1203,6 +1635,11 @@ const stopTouchPropagation = (event) => {
         description: newMarker.description || '',
         direccion: newMarker.direccion || '',
         category: normalizeCategoryValue(newMarker.category),
+        familiasTipo: newMarker.familiasTipo || '',
+        animalTipo: newMarker.animalTipo || '',
+        perdidaTipo: newMarker.perdidaTipo || '',
+        objeto: newMarker.objeto || '',
+        contacto: newMarker.contacto || '',
         status: newMarker.status || 'pendiente_aprobacion',
         resolvedAt: newMarker.resolvedAt || null,
         caseId: newMarker.caseId || null,
@@ -1210,12 +1647,20 @@ const stopTouchPropagation = (event) => {
         resolvedByReportedAt: newMarker.resolvedByReportedAt || null,
         jurisdictionName: newMarker.jurisdictionName || null,
         createdAt: newMarker.createdAt || null,
+        claimedByMe: false,
+        canChat: true,
+        claimCount: 0,
+        chatAbiertoPorMi: false,
+        confirmacionPerdidaMia: null,
+        perdidaEsperaOtraParte: false,
+        createdBy: userId,
       });
       setSelectedImage(newMarker.imageUrl ? buildImageUrl(newMarker.imageUrl) : null);
       setIsImageZoomed(false);
-      setCanEdit(true); // El creador puede editar su propio marcador
-      setShowDeleteOnly(false);
-      // El popup permanece abierto para mostrar el estado "pendiente_aprobacion"
+      setCanEdit(false);
+      setShowDeleteOnly(true);
+      setRecienPublicado(true);
+      // El popup permanece abierto con el mismo estilo de publicar
     } catch (error) {
       console.error('Error uploading marker:', error);
       if (error.response?.status === 429) {
@@ -1298,7 +1743,22 @@ const stopTouchPropagation = (event) => {
       return;
     }
 
-    const { lat, lng, image, date, time, description, direccion, category, status, familiasTipo, animalTipo } = formData;
+    const {
+      lat, lng, image, date, time, description, direccion, category, status,
+      familiasTipo, animalTipo, perdidaTipo, objeto, contacto,
+    } = formData;
+    if (category === 'cosas_perdidas' && !perdidaTipo) {
+      mostrarAviso('Elegí si perdiste o encontraste algo.', true);
+      return;
+    }
+    if (category === 'perros_gatos' && !animalTipo) {
+      mostrarAviso('Elegí de qué se trata el aviso de animales.', true);
+      return;
+    }
+    if (category === 'perros_gatos' && !contactoValido(contacto)) {
+      mostrarAviso('En avisos de animales el celular de contacto es obligatorio.', true);
+      return;
+    }
     const formDataToUpdate = new FormData();
     formDataToUpdate.append('lat', lat);
     formDataToUpdate.append('lng', lng);
@@ -1310,6 +1770,12 @@ const stopTouchPropagation = (event) => {
     formDataToUpdate.append('category', category);
     formDataToUpdate.append('familiasTipo', category === 'familias' ? familiasTipo : '');
     formDataToUpdate.append('animalTipo', category === 'perros_gatos' ? animalTipo : '');
+    formDataToUpdate.append('perdidaTipo', category === 'cosas_perdidas' ? perdidaTipo : '');
+    formDataToUpdate.append('objeto', category === 'cosas_perdidas' ? String(objeto || '').trim() : '');
+    formDataToUpdate.append(
+      'contacto',
+      category === 'perros_gatos' ? digitosContacto(contacto) : ''
+    );
     formDataToUpdate.append('status', status || 'pendiente');
 
     try {
@@ -1476,6 +1942,54 @@ const stopTouchPropagation = (event) => {
     setMostrarMisReportes(false);
     setSoloMisReportes(true);
   };
+
+  const renovarPublicacion = useCallback(async (marker) => {
+    if (!marker?._id || renovandoId) return;
+    setRenovandoId(marker._id);
+    try {
+      const { data } = await axios.patch(
+        `http://localhost:5001/api/markers/${marker._id}/renovar`,
+        {},
+        { headers: { 'x-user-id': userId } }
+      );
+      const renovado = {
+        ...data,
+        isSaved: true,
+        category: normalizeCategoryValue(data.category),
+        createdBy: data.createdBy
+          ? String(data.createdBy).trim().toLowerCase()
+          : 'anonimo',
+        eliminadoAt: null,
+        motivoEliminacion: '',
+        aprobadoAt: data.aprobadoAt || new Date().toISOString(),
+      };
+      setMisReportesRegistro((prev) => prev.filter((m) => m._id !== marker._id));
+      setMisReportesActivos((prev) => [renovado, ...prev.filter((m) => m._id !== marker._id)]);
+      setMarkers((prev) => {
+        const sin = prev.filter((m) => m._id !== marker._id);
+        return [...sin, renovado];
+      });
+      if (editMode === marker._id) {
+        setFormData((prev) => ({
+          ...prev,
+          status: renovado.status,
+          eliminadoAt: null,
+          motivoEliminacion: '',
+          aprobadoAt: renovado.aprobadoAt,
+        }));
+      }
+      setMostrarMisReportes(false);
+      mostrarAviso('Publicación renovada. Vuelve a estar visible 15 días más.');
+      irAMiReporte(renovado);
+    } catch (error) {
+      mostrarAviso(
+        error.response?.data?.message || 'No se pudo renovar la publicación.',
+        true
+      );
+    } finally {
+      setRenovandoId(null);
+    }
+  }, [renovandoId, userId, normalizeCategoryValue, editMode, irAMiReporte]);
 
   const abrirDesdeNotificacion = useCallback(async (aviso) => {
     try {
@@ -1699,23 +2213,247 @@ const renderOficinas = (tipo, jurisdiccion) => {
     if (formData.category !== 'perros_gatos') return null;
     return (
       <>
-        <label>De qué se trata</label>
-        <select
-          value={formData.animalTipo || ''}
-          onChange={(event) => setFormData((prev) => ({ ...prev, animalTipo: event.target.value }))}
-          required
-        >
-          <option value="">Elegí una opción</option>
-          <option value="abandonado">Abandonado en la calle</option>
-          <option value="perdido">Perdido</option>
-          <option value="adopcion">En adopción</option>
-        </select>
-        {formData.animalTipo === 'abandonado' && !formData.avisadoAt && (
-          <small className="familias-nota">
-            Si corresponde, el administrador puede avisar al área de animales.
+        <div className="popup-campo">
+          <label>De qué se trata</label>
+          <select
+            value={formData.animalTipo || ''}
+            onChange={(event) => setFormData((prev) => ({ ...prev, animalTipo: event.target.value }))}
+            required
+          >
+            <option value="">Elegí una opción</option>
+            <option value="abandonado">Abandonado en la calle</option>
+            <option value="perdido">Perdido</option>
+            <option value="adopcion">En adopción</option>
+          </select>
+          {formData.animalTipo === 'abandonado' && !formData.avisadoAt && (
+            <small className="familias-nota">
+              Si corresponde, el administrador puede avisar al área de animales.
+            </small>
+          )}
+        </div>
+        <div className="popup-campo">
+          <label>Celular de contacto (WhatsApp)</label>
+          <input
+            type="tel"
+            inputMode="numeric"
+            value={formData.contacto || ''}
+            onChange={(event) => setFormData((prev) => ({ ...prev, contacto: event.target.value }))}
+            placeholder="Ej.: 3815551234"
+            required
+          />
+          <small className="popup-nota popup-nota-suave">
+            Obligatorio. Otros vecinos van a poder escribirte por WhatsApp.
           </small>
-        )}
+        </div>
       </>
+    );
+  };
+
+  const renderBotonWhatsApp = () => {
+    if (formData.category !== 'perros_gatos' || !contactoValido(formData.contacto)) return null;
+    const tipo = ANIMAL_TIPOS[formData.animalTipo] || 'animal';
+    const caso = formData.caseId ? ` #${formData.caseId}` : '';
+    const url = whatsappUrl(
+      formData.contacto,
+      `Hola, vi tu aviso de ${tipo}${caso} en CiudadAr y quiero ayudarte.`
+    );
+    if (!url) return null;
+    return (
+      <a
+        className="btn-whatsapp"
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        Contactar por WhatsApp
+      </a>
+    );
+  };
+
+  const renderPerdidaTipo = () => {
+    if (formData.category !== 'cosas_perdidas') return null;
+    return (
+      <div className="popup-campo">
+        <label>Tipo de aviso</label>
+        <div className="perdida-tipo-opciones">
+          <button
+            type="button"
+            className={`perdida-tipo-btn perdi${formData.perdidaTipo === 'perdi' ? ' activo' : ''}`}
+            onClick={() => setFormData((prev) => ({ ...prev, perdidaTipo: 'perdi' }))}
+          >
+            <span className="perdida-tipo-icono" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.8"/><circle cx="9" cy="10" r="1.1" fill="currentColor"/><circle cx="15" cy="10" r="1.1" fill="currentColor"/><path d="M8.5 15.5c1.2-1.4 5.8-1.4 7 0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>
+            </span>
+            <span>Perdí algo</span>
+            <span className="perdida-tipo-check" aria-hidden="true">✓</span>
+          </button>
+          <button
+            type="button"
+            className={`perdida-tipo-btn encontre${formData.perdidaTipo === 'encontre' ? ' activo' : ''}`}
+            onClick={() => setFormData((prev) => ({ ...prev, perdidaTipo: 'encontre' }))}
+          >
+            <span className="perdida-tipo-icono" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.8"/><circle cx="9" cy="10" r="1.1" fill="currentColor"/><circle cx="15" cy="10" r="1.1" fill="currentColor"/><path d="M8.5 14.5c1.2 1.5 5.8 1.5 7 0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>
+            </span>
+            <span>Encontré algo</span>
+            <span className="perdida-tipo-check" aria-hidden="true">✓</span>
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  const handleReclamar = async () => {
+    if (!editMode || reclamando) return;
+    setReclamando(true);
+    try {
+      const { data } = await axios.post(
+        `http://localhost:5001/api/markers/${editMode}/reclamar`,
+        {},
+        { headers: { 'x-user-id': userId } }
+      );
+      setMarkers((prev) => prev.map((m) => (m._id === editMode ? { ...m, ...data } : m)));
+      setFormData((prev) => ({
+        ...prev,
+        claimedByMe: true,
+        canChat: true,
+        claimCount: data.claimCount || prev.claimCount,
+      }));
+      setMostrarChatReclamo(true);
+      mostrarAviso('Ya podés chatear con quien publicó el aviso.');
+    } catch (error) {
+      mostrarAviso(error.response?.data?.message || 'No se pudo iniciar el reclamo.', true);
+    } finally {
+      setReclamando(false);
+    }
+  };
+
+  const soyQuienPerdioObjeto = () => {
+    const esDueno = formData.createdBy && String(formData.createdBy).toLowerCase() === userId;
+    // "Perdí" → dueño del aviso; "Encontré" → quien reclamó (dueño del objeto)
+    return formData.perdidaTipo === 'perdi' ? esDueno : !!formData.claimedByMe;
+  };
+
+  const pedirConfirmarRecupero = () => {
+    if (!editMode || formData.category !== 'cosas_perdidas') return;
+    if (!soyQuienPerdioObjeto() || confirmandoRecupero) return;
+    setConfirmarRecupero(true);
+  };
+
+  const handleResolverPerdida = async () => {
+    if (!editMode || formData.category !== 'cosas_perdidas') return;
+    if (!soyQuienPerdioObjeto() || confirmandoRecupero) return;
+    setConfirmandoRecupero(true);
+    try {
+      const { data } = await axios.patch(
+        `http://localhost:5001/api/markers/${editMode}/resolver-perdida`,
+        { accion: 'recupere' },
+        { headers: { 'x-user-id': userId } }
+      );
+      setMarkers((prev) => prev.map((m) => (m._id === editMode ? { ...m, ...data } : m)));
+      setFormData((prev) => ({
+        ...prev,
+        status: data.status || prev.status,
+        resolvedAt: data.resolvedAt || prev.resolvedAt,
+        resolvedBy: data.resolvedBy || prev.resolvedBy,
+        resolvedByReportedAt: data.resolvedByReportedAt || prev.resolvedByReportedAt,
+        eliminadoAt: data.eliminadoAt || prev.eliminadoAt,
+        chatAbiertoPorMi: !!data.chatAbiertoPorMi || prev.chatAbiertoPorMi,
+        confirmacionPerdidaMia: data.confirmacionPerdidaMia || { accion: 'recupere' },
+        perdidaEsperaOtraParte: false,
+      }));
+      setConfirmarRecupero(false);
+      mostrarAviso('Caso cerrado: confirmaste que recuperaste el objeto. Pasó al registro.');
+    } catch (error) {
+      mostrarAviso(error.response?.data?.message || 'No se pudo confirmar.', true);
+    } finally {
+      setConfirmandoRecupero(false);
+    }
+  };
+
+  const renderAccionesCosasPerdidas = () => {
+    if (formData.category !== 'cosas_perdidas' || !editMode) return null;
+    const esDueno = formData.createdBy && String(formData.createdBy).toLowerCase() === userId;
+    const publicado = formData.status === 'pendiente' || formData.status === 'en_proceso';
+    if (!publicado && formData.status !== 'resuelto') return null;
+    const puedeAbrirChat = formData.canManage
+      || formData.claimedByMe
+      || (esDueno && formData.claimCount > 0);
+    const soyParte = esDueno || formData.claimedByMe;
+    const abrioChat = !!formData.chatAbiertoPorMi;
+    const quienPerdio = soyQuienPerdioObjeto();
+    const puedeResolver = publicado && quienPerdio && abrioChat
+      && formData.status !== 'resuelto'
+      && !formData.eliminadoAt;
+
+    // Si el aviso es "Perdí", el otro vecino encontró; si es "Encontré", el otro cree que es suyo
+    const textoReclamar = formData.perdidaTipo === 'perdi'
+      ? 'Creo que lo encontré'
+      : 'Creo que es mío';
+    const textoEsperaDueno = formData.perdidaTipo === 'perdi'
+      ? 'Cuando alguien diga que lo encontró, van a poder chatear. Si nadie responde, el aviso vence a los 15 días desde la aprobación.'
+      : 'Cuando el dueño diga “Creo que es mío”, van a poder chatear. Si nadie reclama, el aviso vence a los 15 días desde la aprobación.';
+
+    return (
+      <div className="perdida-acciones">
+        {!esDueno && !formData.claimedByMe && !formData.canManage && publicado && (
+          <button
+            type="button"
+            className="perdida-btn-reclamar"
+            onClick={handleReclamar}
+            disabled={reclamando}
+          >
+            {textoReclamar}
+          </button>
+        )}
+        {esDueno && !formData.claimCount && !formData.canManage && (
+          <p className="perdida-espera">
+            {textoEsperaDueno}
+          </p>
+        )}
+        {puedeAbrirChat && (
+          <button
+            type="button"
+            className="perdida-btn-chat"
+            onClick={() => setMostrarChatReclamo(true)}
+          >
+            {formData.status === 'resuelto' ? 'Ver historial del chat' : 'Abrir chat del reclamo'}
+          </button>
+        )}
+        {publicado && soyParte && !abrioChat && (
+          <p className="perdida-espera">
+            Primero abrí el chat para coordinar.
+            {quienPerdio
+              ? ' Cuando recuperes el objeto, marcá “Ya lo recuperé”.'
+              : ' Cuando quien lo había perdido confirme que lo recuperó, el caso se cierra.'}
+          </p>
+        )}
+        {puedeResolver && (
+          <div className="perdida-cierre">
+            <p className="perdida-cierre-titulo">¿Ya lo recuperaste?</p>
+            <p className="perdida-espera">
+              Si el objeto ya volvió con vos, confirmá acá y el caso se cierra.
+            </p>
+            <button
+              type="button"
+              className="perdida-btn-resolver"
+              onClick={pedirConfirmarRecupero}
+            >
+              Ya lo recuperé
+            </button>
+          </div>
+        )}
+        {publicado && soyParte && !quienPerdio && abrioChat && formData.status !== 'resuelto' && (
+          <p className="perdida-espera">
+            Cuando quien había perdido el objeto marque “Ya lo recuperé”, el caso se cierra.
+          </p>
+        )}
+        {(formData.status === 'resuelto' || formData.eliminadoAt) && (
+          <p className="perdida-espera">
+            Caso cerrado. Ya no está en el mapa.
+          </p>
+        )}
+      </div>
     );
   };
 
@@ -1730,20 +2468,33 @@ const renderOficinas = (tipo, jurisdiccion) => {
       description: '',
       direccion: '',
       status: 'pendiente_aprobacion',
+      category: 'reparaciones',
       familiasTipo: '',
       animalTipo: '',
+      perdidaTipo: '',
+      objeto: '',
+      contacto: '',
       resolvedAt: null,
     });
     setSelectedImage(null);
     setResolutionPhoto(null);
     setResolutionPreview(null);
     setMostrarResolucion(false);
+    setMostrarChatReclamo(false);
     setMostrarCercanos(false);
     setCasosCercanos([]);
     setIsImageZoomed(false);
     setShowPopup(false);
     setEditMode(null); // Salir del modo de edición
     setShowDeleteOnly(false);
+    setRecienPublicado(false);
+    setMostrarOpcionesFoto(false);
+    // En modo solo-caso el × cierra el popup y deja el pin brillando;
+    // "Volver a la ficha" del admin sale del mapa (onCerrarSoloCaso).
+    if (modoSoloCaso && focoCasoMapa?._id) {
+      setHighlightedMarkerId(focoCasoMapa._id);
+      setEditMode(focoCasoMapa._id);
+    }
   };
 
   const handleImageClick = () => {
@@ -1752,18 +2503,19 @@ const renderOficinas = (tipo, jurisdiccion) => {
   };
 
   const handleViewOnMap = () => {
-    if (mapRef.current && formData.lat && formData.lng && editMode) {
-      const target = { lat: formData.lat, lng: formData.lng };
-      mapRef.current.panTo(target);
-      mapRef.current.setZoom(18);
-      setHighlightedMarkerId(editMode);
-      setIsImageZoomed(false);
-      setShowPopup(false);
-      window.scrollTo({
-        top: 0,
-        behavior: 'smooth',
-      });
-    }
+    const lat = Number(formData.lat);
+    const lng = Number(formData.lng);
+    if (!mapRef.current || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    const target = { lat, lng };
+    mapRef.current.panTo(target);
+    mapRef.current.setZoom(18);
+    if (editMode) setHighlightedMarkerId(editMode);
+    setIsImageZoomed(false);
+    setShowPopup(false);
+    setMostrarMisReportes(false);
+    setMostrarNotificaciones(false);
+    setMostrarFiltros(false);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   // Deshabilitar gestos del mapa cuando la imagen está en zoom para evitar que el mapa se agrande
@@ -1804,51 +2556,17 @@ const renderOficinas = (tipo, jurisdiccion) => {
       return true; // Mostrar siempre: persona, perros_gatos, reparaciones
     });
     
-    const visibleMarkers = markers.filter(marker => {
-      // Filtro de aprobación: usuarios normales solo ven sus propios marcadores pendientes de aprobación
-      if (!isAdmin && marker.status === 'pendiente_aprobacion') {
-        const markerOwner = marker.createdBy
-          ? String(marker.createdBy).trim().toLowerCase()
-          : 'anonimo';
-        // Solo mostrar si el usuario es el creador del marcador pendiente
-        if (markerOwner !== userId) {
-          return false; // Ocultar marcadores pendientes de aprobación de otros usuarios
-        }
-        // Si es el creador, permitir que vea su marcador pendiente en el mapa
-      }
-      
-      // Familias y personas en situación de calle: solo el creador las ve en el mapa
-      if (!isAdmin && (marker.category === 'familias' || marker.category === 'persona')) {
-        const markerOwner = marker.createdBy
-          ? String(marker.createdBy).trim().toLowerCase()
-          : 'anonimo';
-        if (markerOwner !== userId) {
-          return false; // Ocultar marcadores de "familias" de otros usuarios
-        }
-      }
-      
-      const markerOwner = marker.createdBy
-        ? String(marker.createdBy).trim().toLowerCase()
-        : 'anonimo';
-      if (soloMisReportes && markerOwner !== userId) {
-        return false;
-      }
-
-      const categoria = esCasoFamilia(marker.category) ? 'familias' : (marker.category || 'reparaciones');
-      const matchesCategory = categoryFilter === 'todas' || categoria === categoryFilter;
-      const matchesAnimal = categoryFilter !== 'perros_gatos'
-        || animalFilter === 'todos'
-        || marker.animalTipo === animalFilter;
-      return matchesCategory && matchesAnimal;
-    });
-    const misReportes = markers
-      .filter((marker) => {
-        const markerOwner = marker.createdBy
-          ? String(marker.createdBy).trim().toLowerCase()
-          : 'anonimo';
-        return markerOwner === userId;
-      })
-      .sort((a, b) => Number(b.caseId || 0) - Number(a.caseId || 0));
+    // Los filtros ya se aplican en el servidor; acá solo se muestran los ítems recibidos
+    // Refuerzo: "Mi jurisdicción" = solo casos que este admin puede gestionar
+    const visibleMarkers = modoSoloCaso && focoCasoMapa?._id
+      ? markers.filter((m) => String(m._id) === String(focoCasoMapa._id))
+      : (soloMiJurisdiccion
+        ? markers.filter((m) => m.canManage)
+        : markers);
+    const misReportes = misReportesSeccion === 'registro'
+      ? misReportesRegistro
+      : misReportesActivos;
+    const misTotalPaginas = Math.max(1, Math.ceil((misMeta.total || 0) / (misMeta.limit || MIS_PAGE_SIZE)));
     const textoBusqueda = busquedaAdmin.trim().toLowerCase().replace(/^#/, '');
     const casosPorAprobar = markers.filter(
       (marker) => marker.canManage
@@ -1901,34 +2619,35 @@ const renderOficinas = (tipo, jurisdiccion) => {
           </div>
         );
       }
-      const petStillOpen = formData.category === 'perros_gatos' && currentStatus !== 'resuelto';
-      const daysLeft =
-        currentStatus === 'resuelto' && formData.resolvedAt
-          ? getDaysUntilRemoval(formData.resolvedAt)
-          : petStillOpen
-            ? getDaysUntilPetExpiry(formData.createdAt)
-            : null;
+      // Vencimiento: solo tras aprobación (pendiente / en proceso), 15 días desde aprobadoAt
+      const casoPublicadoAbierto = !formData.eliminadoAt
+        && (currentStatus === 'pendiente' || currentStatus === 'en_proceso');
+      const avisoConVencimiento = (
+        formData.category === 'perros_gatos' || formData.category === 'cosas_perdidas'
+      ) && casoPublicadoAbierto;
+      const fechaVencimiento = formData.aprobadoAt || formData.createdAt;
+      const daysLeft = avisoConVencimiento
+        ? getDaysUntilAvisoExpiry(fechaVencimiento)
+        : null;
       // Solo después de subir: en el formulario nuevo todavía no hay reporte.
       if (!editMode) return null;
       const isPendingApproval = currentStatus === 'pendiente_aprobacion';
-    return (
-        <div style={{ marginTop: '4px' }}>
-          {withLabel && <label>Estado:</label>}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+      return (
+        <div className="popup-estado-bloque">
+          {withLabel && <label>Estado</label>}
+          <div className="popup-estado-contenido">
+            <div className="popup-estado-fila">
               <span style={statusBadgeStyle}>{statusLabel}</span>
               {daysLeft !== null && (
-                <small style={{ color: '#2563eb' }}>
-                  {petStillOpen
-                    ? `Si sigue abierto, se elimina en ${daysLeft} ${daysLeft === 1 ? 'día' : 'días'}.`
-                    : `Se eliminará en ${daysLeft} ${daysLeft === 1 ? 'día' : 'días'}.`}
+                <small className="popup-estado-extra">
+                  {`Si sigue abierto, se elimina en ${daysLeft} ${daysLeft === 1 ? 'día' : 'días'} (desde la aprobación).`}
                 </small>
               )}
             </div>
-            {isPendingApproval && !isAdmin && !esCasoFamilia(formData.category) && (
-              <small style={{ color: '#f59e0b', fontStyle: 'italic' }}>
-                Tu reporte está esperando la aprobación de un administrador. Aparecerá en el mapa una vez aprobado.
-              </small>
+            {isPendingApproval && !esCasoFamilia(formData.category) && (
+              <div className="popup-aviso-pendiente">
+                Tu aviso está por aprobar. Un administrador lo va a revisar y, cuando lo apruebe, va a aparecer en el mapa.
+              </div>
             )}
             {formData.category === 'perros_gatos' && formData.animalTipo === 'abandonado' && !isAdmin && editMode && (
               <small className={formData.avisadoAt ? 'familias-aviso-vecino listo' : 'familias-nota'}>
@@ -1948,18 +2667,9 @@ const renderOficinas = (tipo, jurisdiccion) => {
     };
     const handleResolutionPhoto = (event) => {
       const file = event.target.files && event.target.files[0];
-      if (!file) {
-        setResolutionPhoto(null);
-        setResolutionPreview(null);
-        return;
-      }
-      if (!file.type.startsWith('image/')) {
-        alert('La foto tiene que ser una imagen.');
-        event.target.value = '';
-        return;
-      }
-      setResolutionPhoto(file);
-      setResolutionPreview(URL.createObjectURL(file));
+      event.target.value = '';
+      if (!file) return;
+      abrirEditorDesdeArchivo(file, 'resolucion');
     };
     const cerrarVentanaResolucion = () => {
       setMostrarResolucion(false);
@@ -2038,8 +2748,161 @@ const renderOficinas = (tipo, jurisdiccion) => {
         );
       }
     };
+    const enviarRespuestaDatos = async () => {
+      if (!editMode || enviandoRespuestaDatos) return;
+      const texto = String(respuestaDatos || '').trim();
+      if (texto.length < 5 && !fotoRespuestaDatos) {
+        mostrarAviso('Escribí una descripción o agregá una foto.', true);
+        return;
+      }
+      setEnviandoRespuestaDatos(true);
+      try {
+        const body = new FormData();
+        if (texto) body.append('description', texto);
+        if (fotoRespuestaDatos) body.append('image', fotoRespuestaDatos);
+        const { data } = await axios.patch(
+          `http://localhost:5001/api/markers/${editMode}/responder-datos`,
+          body,
+          { headers: { 'x-user-id': userId } }
+        );
+        const imagen = data.imageUrl
+          ? `${data.imageUrl}${data.imageUrl.includes('?') ? '&' : '?'}t=${Date.now()}`
+          : data.imageUrl;
+        const actualizado = {
+          description: data.description,
+          imageUrl: imagen || data.imageUrl,
+          pideDatosAt: null,
+          pideDatosMensaje: '',
+          respuestaDatosAt: data.respuestaDatosAt || new Date().toISOString(),
+          ultimaRespuestaDatosAt: data.ultimaRespuestaDatosAt || new Date().toISOString(),
+        };
+        setMarkers((prev) =>
+          prev.map((m) => (m._id === editMode ? { ...m, ...actualizado } : m))
+        );
+        setFormData((prev) => ({ ...prev, ...actualizado }));
+        if (imagen) setSelectedImage(buildImageUrl(imagen));
+        setFotoRespuestaDatos(null);
+        setPreviewRespuestaDatos(null);
+        setMostrarOpcionesFotoRespuesta(false);
+        mostrarAviso('Respuesta enviada. El administrador va a revisarla.');
+      } catch (error) {
+        mostrarAviso(
+          error.response?.data?.message || 'No se pudo enviar la respuesta.',
+          true
+        );
+      } finally {
+        setEnviandoRespuestaDatos(false);
+      }
+    };
+
+    const renderPedidoDatosVecino = () => {
+      const esDueno = formData.createdBy && String(formData.createdBy).toLowerCase() === userId;
+      if (!esDueno || !formData.pideDatosAt || isAdmin) return null;
+      return (
+        <div className="popup-pedido-datos">
+          <p className="popup-pedido-datos-titulo">El administrador pide más datos</p>
+          <p className="popup-pedido-datos-msg">
+            {formData.pideDatosMensaje || 'Actualizá la descripción o la foto del caso.'}
+          </p>
+          <label className="popup-campo">
+            <span>Tu respuesta</span>
+            <textarea
+              value={respuestaDatos}
+              onChange={(e) => setRespuestaDatos(e.target.value)}
+              rows={3}
+              placeholder="Completá o aclará lo que te pidieron…"
+            />
+          </label>
+          <div className="popup-pedido-datos-foto">
+            <span>Foto (opcional)</span>
+            <input
+              ref={inputGaleriaRespuestaRef}
+              type="file"
+              accept="image/*"
+              className="sr-only-file"
+              onChange={onElegirArchivoRespuesta}
+            />
+            <input
+              ref={inputCamaraRespuestaRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="sr-only-file"
+              onChange={onElegirArchivoRespuesta}
+            />
+            {previewRespuestaDatos ? (
+              <div className="popup-pedido-datos-preview">
+                <img src={previewRespuestaDatos} alt="Vista previa de la respuesta" />
+                <div className="popup-pedido-datos-preview-acciones">
+                  <button
+                    type="button"
+                    className="popup-foto-opcion"
+                    onClick={() => abrirEditorConSrc(previewRespuestaDatos, 'respuesta')}
+                  >
+                    Editar
+                  </button>
+                  <button
+                    type="button"
+                    className="popup-foto-opcion"
+                    onClick={quitarFotoRespuesta}
+                  >
+                    Quitar
+                  </button>
+                </div>
+              </div>
+            ) : !mostrarOpcionesFotoRespuesta ? (
+              <button
+                type="button"
+                className="popup-pedido-datos-agregar-foto"
+                onClick={() => setMostrarOpcionesFotoRespuesta(true)}
+              >
+                Agregar o cambiar foto
+              </button>
+            ) : (
+              <div className="popup-pedido-datos-opciones">
+                <p>¿Cómo querés cargar la foto?</p>
+                <div className="popup-foto-botones">
+                  <button
+                    type="button"
+                    className="popup-foto-opcion"
+                    onClick={() => inputGaleriaRespuestaRef.current?.click()}
+                  >
+                    Galería
+                  </button>
+                  <button
+                    type="button"
+                    className="popup-foto-opcion"
+                    onClick={abrirCamaraRespuesta}
+                  >
+                    Cámara
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  className="popup-foto-volver-opciones"
+                  onClick={() => setMostrarOpcionesFotoRespuesta(false)}
+                >
+                  Volver
+                </button>
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className="popup-btn-publicar"
+            onClick={enviarRespuestaDatos}
+            disabled={enviandoRespuestaDatos}
+          >
+            {enviandoRespuestaDatos ? 'Enviando…' : 'Enviar respuesta'}
+          </button>
+        </div>
+      );
+    };
+
     const renderResolucionVecino = () => {
       if (isAdmin) return null;
+      // Cosas perdidas se cierra entre las partes con "Ya se resolvió"
+      if (formData.category === 'cosas_perdidas') return null;
       const soyQuienResolvio = () => {
         const dueno = formData.resolvedBy ? String(formData.resolvedBy).trim().toLowerCase() : '';
         return dueno === userId;
@@ -2074,14 +2937,51 @@ const renderOficinas = (tipo, jurisdiccion) => {
                 required
               />
             </label>
-            <label className="resolucion-foto">
-              {editandoResolucion ? 'Foto de cómo quedó (opcional si ya hay una)' : 'Foto de cómo quedó (obligatoria)'}
+            <div className="resolucion-foto">
+              <span>
+                {editandoResolucion ? 'Foto de cómo quedó (opcional si ya hay una)' : 'Foto de cómo quedó (obligatoria)'}
+              </span>
               <input
+                ref={inputGaleriaResolucionRef}
                 type="file"
                 accept="image/*"
+                className="sr-only-file"
                 onChange={handleResolutionPhoto}
               />
-            </label>
+              <input
+                ref={inputCamaraResolucionRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="sr-only-file"
+                onChange={handleResolutionPhoto}
+              />
+              <div className="popup-foto-botones">
+                <button
+                  type="button"
+                  className="popup-btn-secundario"
+                  onClick={() => inputGaleriaResolucionRef.current?.click()}
+                >
+                  Galería
+                </button>
+                <button
+                  type="button"
+                  className="popup-btn-secundario"
+                  onClick={abrirCamaraResolucion}
+                >
+                  Cámara
+                </button>
+                {resolutionPreview && (
+                  <button
+                    type="button"
+                    className="popup-btn-secundario"
+                    onClick={() => abrirEditorConSrc(resolutionPreview, 'resolucion')}
+                  >
+                    Editar
+                  </button>
+                )}
+              </div>
+            </div>
             {resolutionPreview && (
               <img
                 src={resolutionPreview}
@@ -2115,25 +3015,20 @@ const renderOficinas = (tipo, jurisdiccion) => {
         const puedoEditar = soyQuienResolvio() && casoAbierto;
         return (
           <>
-            <div style={{ marginTop: '8px', padding: '8px', background: '#dcfce7', borderRadius: '6px' }}>
-              <small style={{ color: '#166534' }}>
-                ✅ Este caso ya fue reportado como resuelto por: {formData.resolvedBy}
+            <div className="popup-resolucion-resumen">
+              <small>
+                ✅ Resuelto por {formData.resolvedBy}
                 {formData.resolvedByReportedAt && (
                   <span> el {new Date(formData.resolvedByReportedAt).toLocaleDateString()}</span>
                 )}
               </small>
-              {formData.resolutionDescription && (
-                <p style={{ margin: '8px 0 0', color: '#166534', fontSize: '13px' }}>
-                  <strong>Qué hizo:</strong> {formData.resolutionDescription}
-                </p>
-              )}
-              {formData.resolutionImageUrl && (
-                <img
-                  src={buildImageUrl(formData.resolutionImageUrl)}
-                  alt="Foto de la resolución"
-                  style={{ width: '100%', maxHeight: '160px', objectFit: 'cover', borderRadius: '6px', marginTop: '8px' }}
-                />
-              )}
+              <button
+                type="button"
+                className="popup-resolucion-ver"
+                onClick={() => setVerDetalleResolucion(true)}
+              >
+                Ver
+              </button>
               {puedoEditar && (
                 <button
                   type="button"
@@ -2144,6 +3039,47 @@ const renderOficinas = (tipo, jurisdiccion) => {
                 </button>
               )}
             </div>
+            {verDetalleResolucion && (
+              <div
+                className="popup-resolucion-modal-fondo"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Resolución del vecino"
+                onClick={() => setVerDetalleResolucion(false)}
+              >
+                <div
+                  className="popup-resolucion-modal"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="popup-resolucion-modal-cabecera">
+                    <strong>Resolución del vecino</strong>
+                    <button
+                      type="button"
+                      className="popup-btn-secundario"
+                      onClick={() => setVerDetalleResolucion(false)}
+                    >
+                      Cerrar
+                    </button>
+                  </div>
+                  <p className="popup-resolucion-modal-meta">
+                    {formData.resolvedBy}
+                    {formData.resolvedByReportedAt
+                      ? ` · ${new Date(formData.resolvedByReportedAt).toLocaleDateString()}`
+                      : ''}
+                  </p>
+                  <p className="popup-resolucion-modal-desc">
+                    {formData.resolutionDescription || 'Sin descripción.'}
+                  </p>
+                  {formData.resolutionImageUrl && (
+                    <img
+                      src={buildImageUrl(formData.resolutionImageUrl)}
+                      alt="Foto enviada por el vecino"
+                      className="popup-resolucion-modal-foto"
+                    />
+                  )}
+                </div>
+              </div>
+            )}
             {ventanaResolucion}
           </>
         );
@@ -2163,15 +3099,23 @@ const renderOficinas = (tipo, jurisdiccion) => {
       );
     };
 
-    const mostrarSelectorPunto = !showPopup && !mostrarCercanos && !mostrarMisReportes
+    const mostrarSelectorPunto = !modoSoloCaso && !showPopup && !mostrarCercanos && !mostrarMisReportes
       && !mostrarFiltros && !mostrarNotificaciones;
+    const tituloPopup = !editMode
+      ? 'Publicar aviso'
+      : (recienPublicado ? 'Aviso enviado' : 'Aviso');
+    const textoCategoriaPublicada = formData.category === 'cosas_perdidas'
+      ? `${categoryLabels.cosas_perdidas}${formData.perdidaTipo ? ` · ${perdidaLabels[formData.perdidaTipo]}` : ''}`
+      : (categoryLabels[formData.category] || formData.category || '—');
+    const puedeEditarAviso = Boolean(editMode && canEdit && !showDeleteOnly);
 
     return (
-      <div className="mapa-envoltorio">
-        {(soloMisReportes || categoryFilter !== 'todas') && (
+      <div className={`mapa-envoltorio${modoSoloCaso ? ' mapa-envoltorio-embebido' : ''}`}>
+        {!modoSoloCaso && (soloMisReportes || soloMiJurisdiccion || categoryFilter !== 'todas' || markersMeta.hasMore || markersMeta.total > 0) && (
           <div className="mapa-acciones">
             <div className="chip-filtros-activos">
               {soloMisReportes && <span>Solo mis reportes</span>}
+              {soloMiJurisdiccion && <span>Mi jurisdicción</span>}
               {categoryFilter !== 'todas' && (
                 <span>
                   {categoryLabels[categoryFilter] || categoryFilter}
@@ -2180,16 +3124,26 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     : ''}
                 </span>
               )}
-              <button
-                type="button"
-                onClick={() => {
-                  setSoloMisReportes(false);
-                  setCategoryFilter('todas');
-                  setAnimalFilter('todos');
-                }}
-              >
-                Limpiar
-              </button>
+              <span>
+                {markers.length}
+                {markersMeta.total > markers.length ? ` de ${markersMeta.total}` : ''} en el mapa
+              </span>
+              {markersMeta.hasMore && (
+                <span className="chip-filtros-aviso">Usá filtros para acotar</span>
+              )}
+              {(soloMisReportes || soloMiJurisdiccion || categoryFilter !== 'todas') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSoloMisReportes(false);
+                    setSoloMiJurisdiccion(false);
+                    setCategoryFilter('todas');
+                    setAnimalFilter('todos');
+                  }}
+                >
+                  Limpiar
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -2198,13 +3152,19 @@ const renderOficinas = (tipo, jurisdiccion) => {
             mapContainerClassName="mapa-ciudad"
             mapContainerStyle={{ width: '100%', height: '100%' }}
             center={mapCenter}
-            zoom={userLocation ? 18 : 15}
+            zoom={modoSoloCaso || userLocation ? 18 : 15}
             onLoad={onMapLoad}
             options={{
               mapTypeId: 'roadmap',
               streetViewControl: false,
               mapTypeControl: false,
               fullscreenControl: false,
+              // Sin íconos de negocios/POI: no se confunden con los pines de CiudadAr
+              styles: [
+                { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+                { featureType: 'poi.business', stylers: [{ visibility: 'off' }] },
+                { featureType: 'transit', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
+              ],
             }}
           >
           {userLocation && (
@@ -2224,7 +3184,11 @@ const renderOficinas = (tipo, jurisdiccion) => {
             const esMio = (marker.createdBy
               ? String(marker.createdBy).trim().toLowerCase()
               : 'anonimo') === userId;
-            const destacar = highlightedMarkerId === marker._id || (soloMisReportes && esMio);
+            const destacar = (
+              (highlightedMarkerId != null && String(highlightedMarkerId) === String(marker._id))
+              || (modoSoloCaso && focoCasoMapa?._id && String(focoCasoMapa._id) === String(marker._id))
+              || (soloMisReportes && esMio)
+            );
             if (destacar) {
               return (
                 <OverlayView
@@ -2319,37 +3283,40 @@ const renderOficinas = (tipo, jurisdiccion) => {
 
         {showPopup && (
           <div
-            className={`popup-fondo${isImageZoomed ? ' con-zoom' : ''}`}
-            onMouseDown={() => setShowPopup(false)}
+            className={`popup-fondo${isImageZoomed ? ' con-zoom' : ''}${modoSoloCaso ? ' popup-fondo-embebido' : ''}`}
+            onMouseDown={handleCancel}
           >
             <div
-              className={`popup-ciudadar${isImageZoomed ? ' ampliado' : ''}`}
+              className={`popup-ciudadar${isImageZoomed ? ' ampliado' : ''} popup-publicar`}
               onMouseDown={stopPropagation}
               onClick={stopPropagation}
             >
-              <div className="popup-cabecera">
-                <strong>
-                  {editMode ? `Reporte${formData.caseId ? ` #${formData.caseId}` : ''}` : 'Nuevo reporte'}
-                </strong>
-                <div className="popup-cabecera-acciones">
-                  {editMode && (
-                    <button
-                      type="button"
-                      className="btn-mapa chico"
-                      onClick={handleViewOnMap}
-                    >
-                      Ver en el mapa
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="popup-cerrar"
-                    onClick={() => setShowPopup(false)}
-                    aria-label="Cerrar"
-                  >
-                    ×
-                  </button>
-                </div>
+              <div className="popup-cabecera popup-cabecera-publicar">
+                <button
+                  type="button"
+                  className="popup-nav-btn"
+                  onClick={handleCancel}
+                  aria-label="Volver"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path fill="currentColor" d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z" />
+                  </svg>
+                </button>
+                <strong>{tituloPopup}</strong>
+                <button
+                  type="button"
+                  className="popup-nav-btn"
+                  onClick={handleCancel}
+                  aria-label="Cerrar"
+                  title="Cerrar"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M18.3 5.7 12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7 2.9 18.3 9.2 12 2.9 5.7 4.3 4.3l6.3 6.3 6.3-6.3z"
+                    />
+                  </svg>
+                </button>
               </div>
               {isImageZoomed ? (
                 selectedImage && (
@@ -2370,23 +3337,13 @@ const renderOficinas = (tipo, jurisdiccion) => {
                   </div>
                 )
               ) : editMode ? (
-                <div className="popup-cuerpo">
-                  {selectedImage && (
-                    <div className="popup-media">
-                      <img
-                        src={selectedImage}
-                        alt="Foto del reporte"
-                        className="popup-foto"
-                        onClick={handleImageClick}
-                        onError={handleImageError}
-                      />
-                    </div>
-                  )}
-                  {!showDeleteOnly && canEdit ? (
+                <div className="popup-cuerpo popup-cuerpo-publicar">
+                  {puedeEditarAviso ? (
                     <form
-                      className="popup-formulario"
+                      className="popup-formulario popup-form-publicar"
                       onSubmit={(e) => handleSaveUpdate(e, editMode)}
                     >
+                      <h3 className="popup-pregunta">Editar aviso</h3>
                       {formData.caseId && (
                         <div className="popup-caso-id">
                           <p>ID del caso</p>
@@ -2397,48 +3354,95 @@ const renderOficinas = (tipo, jurisdiccion) => {
                           </p>
                         </div>
                       )}
-                      <label>Dirección</label>
-                      <input
-                        type="text"
-                        value={formData.direccion || ''}
-                        onChange={handleDireccionChange}
-                        placeholder="Dirección del punto"
-                      />
-                      <label>Fecha</label>
-                      <input type="date" value={formData.date} onChange={handleDateChange} required />
-                      <label>Hora</label>
-                      <input type="time" value={formData.time} onChange={handleTimeChange} required />
-                      <label>Descripción</label>
-                      <textarea value={formData.description} onChange={handleDescriptionChange} required />
-                      <label>Categoría</label>
-                      <select value={formData.category} onChange={handleCategoryChange} required>
-                        {categoryOptions.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {option.label}
-                          </option>
-                        ))}
-                      </select>
+                      <div className="popup-campo">
+                        <label>Categoría</label>
+                        <div className="popup-select-wrap">
+                          <select value={formData.category} onChange={handleCategoryChange} required>
+                            {categoryOptions.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                          <span className="popup-select-icono" aria-hidden="true">
+                            <svg viewBox="0 0 24 24">
+                              <path fill="currentColor" d="M7 10l5 5 5-5z" />
+                            </svg>
+                          </span>
+                        </div>
+                      </div>
                       {renderFamiliasTipo()}
                       {renderAnimalTipo()}
-                      {renderStatusInfo(true)}
-                      {renderResolucionVecino()}
-                      <div className="popup-acciones">
-                        <button type="submit">Guardar</button>
-                        <button type="button" onClick={handleCancel}>Cancelar</button>
-                        <button
-                          type="button"
-                          className="peligro"
-                          onClick={() => handleDeleteMarker(editMode)}
-                        >
-                          Borrar
-                        </button>
+                      {renderPerdidaTipo()}
+                      <div className="popup-campo">
+                        <label>Descripción</label>
+                        <textarea
+                          value={formData.description}
+                          onChange={handleDescriptionChange}
+                          required
+                        />
                       </div>
+                      <div className="popup-campo">
+                        <label>Zona</label>
+                        <div className="popup-input-icono">
+                          <input
+                            type="text"
+                            value={formData.direccion || ''}
+                            onChange={handleDireccionChange}
+                            placeholder="Dirección del punto"
+                          />
+                          <span className="popup-input-pin" aria-hidden="true">
+                            <IconoUbicacion />
+                          </span>
+                        </div>
+                      </div>
+                      <div className="popup-campo">
+                        <label>Fecha</label>
+                        <input type="date" value={formData.date} onChange={handleDateChange} required />
+                      </div>
+                      <div className="popup-campo">
+                        <label>Hora</label>
+                        <input type="time" value={formData.time} onChange={handleTimeChange} required />
+                      </div>
+                      {selectedImage && (
+                        <div className="popup-campo">
+                          <div className="popup-media">
+                            <div className="popup-foto-caja">
+                              <img
+                                src={selectedImage}
+                                alt="Foto del reporte"
+                                className="popup-foto"
+                                onClick={handleImageClick}
+                                onError={handleImageError}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      <div className="popup-ficha-estado popup-estado-publicar">
+                        {renderStatusInfo(true)}
+                      </div>
+                      {renderResolucionVecino()}
+                      {renderAccionesCosasPerdidas()}
+                      <button type="submit" className="popup-btn-publicar">
+                        Guardar cambios
+                      </button>
+                      <button
+                        type="button"
+                        className="popup-btn-secundario"
+                        onClick={() => handleDeleteMarker(editMode)}
+                      >
+                        Borrar aviso
+                      </button>
                     </form>
-                  ) : showDeleteOnly ? (
-                    <div className="popup-formulario popup-lectura">
-                      {(formData.avisadoAt || (formData.status && formData.status !== 'pendiente_aprobacion')) && (
-                        <p className="popup-nota">
-                          Un administrador ya tomó acción sobre este caso. Solo podés consultarlo.
+                  ) : (
+                    <div className="popup-formulario popup-form-publicar">
+                      {recienPublicado && (
+                        <h3 className="popup-pregunta">Tu aviso quedó registrado</h3>
+                      )}
+                      {!showDeleteOnly && !recienPublicado && (
+                        <p className="popup-nota popup-nota-suave">
+                          Esta publicación anónima solo puede ser editada por su creador.
                         </p>
                       )}
                       {formData.caseId && (
@@ -2451,171 +3455,271 @@ const renderOficinas = (tipo, jurisdiccion) => {
                           </p>
                         </div>
                       )}
-                      <div className="popup-ficha">
-                        <div className="popup-ficha-campo popup-ficha-ancho">
-                          <span className="popup-ficha-etiqueta">Dirección</span>
-                          <span className="popup-ficha-valor">{formData.direccion || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo">
-                          <span className="popup-ficha-etiqueta">Fecha</span>
-                          <span className="popup-ficha-valor">{formData.date || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo">
-                          <span className="popup-ficha-etiqueta">Hora</span>
-                          <span className="popup-ficha-valor">{formData.time || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo">
-                          <span className="popup-ficha-etiqueta">Categoría</span>
-                          <span className="popup-ficha-valor">{categoryLabels[formData.category] || formData.category || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo popup-ficha-ancho">
-                          <span className="popup-ficha-etiqueta">Descripción</span>
-                          <span className="popup-ficha-valor">{formData.description || 'N/D'}</span>
-                        </div>
+                      <div className="popup-campo">
+                        <label>Categoría</label>
+                        <div className="popup-dato-publicar">{textoCategoriaPublicada}</div>
                       </div>
-                      <div className="popup-ficha-estado">
-                        {renderStatusInfo(true)}
-                      </div>
-                      {formData.resolvedBy && (
-                        <div className="popup-ficha-resolucion">
-                          <span className="popup-ficha-etiqueta">Resolución</span>
-                          <p>
-                            Reportado por {formData.resolvedBy}
-                            {formData.resolvedByReportedAt && (
-                              <span> el {new Date(formData.resolvedByReportedAt).toLocaleDateString()}</span>
-                            )}
-                          </p>
-                          {formData.resolutionDescription && (
-                            <p><strong>Qué hizo:</strong> {formData.resolutionDescription}</p>
-                          )}
-                          {formData.resolutionImageUrl && (
-                            <img
-                              src={buildImageUrl(formData.resolutionImageUrl)}
-                              alt="Foto de la resolución"
-                              className="popup-foto"
-                            />
-                          )}
+                      {formData.category === 'perros_gatos' && formData.animalTipo && (
+                        <div className="popup-campo">
+                          <label>Tipo</label>
+                          <div className="popup-dato-publicar">
+                            {ANIMAL_TIPOS[formData.animalTipo] || formData.animalTipo}
+                          </div>
                         </div>
                       )}
-                      <div className="popup-acciones">
-                        <button type="button" onClick={handleCancel}>Cerrar</button>
+                      {formData.category === 'cosas_perdidas' && formData.objeto && (
+                        <div className="popup-campo">
+                          <label>Objeto</label>
+                          <div className="popup-dato-publicar">{formData.objeto}</div>
+                        </div>
+                      )}
+                      <div className="popup-campo">
+                        <label>Descripción</label>
+                        <div className="popup-dato-publicar">{formData.description || '—'}</div>
                       </div>
-                    </div>
-                  ) : (
-                    <div className="popup-formulario popup-lectura">
-                      <p className="popup-lectura-aviso">
-                        Esta publicación anónima solo puede ser editada por su creador.
-                      </p>
-                      <div className="popup-ficha">
-                        <div className="popup-ficha-campo popup-ficha-ancho">
-                          <span className="popup-ficha-etiqueta">Municipio</span>
-                          <span className="popup-ficha-valor popup-ficha-municipio">
+                      <div className="popup-campo">
+                        <label>Zona</label>
+                        <div className="popup-dato-publicar popup-dato-con-pin">
+                          <span>{formData.direccion || '—'}</span>
+                          <span className="popup-input-pin" aria-hidden="true">
                             <IconoUbicacion />
-                            <span>{textoMunicipio(formData.jurisdictionName)}</span>
                           </span>
                         </div>
-                        <div className="popup-ficha-campo popup-ficha-ancho">
-                          <span className="popup-ficha-etiqueta">Dirección</span>
-                          <span className="popup-ficha-valor">{formData.direccion || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo">
-                          <span className="popup-ficha-etiqueta">Fecha</span>
-                          <span className="popup-ficha-valor">{formData.date || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo">
-                          <span className="popup-ficha-etiqueta">Hora</span>
-                          <span className="popup-ficha-valor">{formData.time || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo">
-                          <span className="popup-ficha-etiqueta">Categoría</span>
-                          <span className="popup-ficha-valor">{categoryLabels[formData.category] || formData.category || 'N/D'}</span>
-                        </div>
-                        <div className="popup-ficha-campo popup-ficha-ancho">
-                          <span className="popup-ficha-etiqueta">Descripción</span>
-                          <span className="popup-ficha-valor">{formData.description || 'N/D'}</span>
-                        </div>
                       </div>
-                      <div className="popup-ficha-estado">
+                      {(formData.date || formData.time) && (
+                        <div className="popup-campo">
+                          <label>Fecha y hora</label>
+                          <div className="popup-dato-publicar">
+                            {[formData.date, formData.time].filter(Boolean).join(' · ') || '—'}
+                          </div>
+                        </div>
+                      )}
+                      {selectedImage && (
+                        <div className="popup-campo">
+                          <div className="popup-media">
+                            <div className="popup-foto-caja">
+                              <img
+                                src={selectedImage}
+                                alt="Foto del reporte"
+                                className="popup-foto"
+                                onClick={handleImageClick}
+                                onError={handleImageError}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      <div className="popup-ficha-estado popup-estado-publicar">
                         {renderStatusInfo(true)}
                       </div>
+                      {renderPedidoDatosVecino()}
                       {renderResolucionVecino()}
-                      <div className="popup-acciones">
-                        <button type="button" onClick={handleCancel}>Cerrar</button>
-                      </div>
+                      {renderBotonWhatsApp()}
+                      {renderAccionesCosasPerdidas()}
+                      {!formData.pideDatosAt
+                        && !modoSoloCaso
+                        && formData.status !== 'resuelto'
+                        && formData.status !== 'rechazado'
+                        && !formData.eliminadoAt && (
+                        <button
+                          type="button"
+                          className="popup-btn-secundario"
+                          onClick={handleViewOnMap}
+                        >
+                          Ver en el mapa
+                        </button>
+                      )}
+                      {esPublicacionVencida(formData) && (
+                        <button
+                          type="button"
+                          className="popup-btn-publicar"
+                          disabled={renovandoId === editMode}
+                          onClick={() => renovarPublicacion({ ...formData, _id: editMode })}
+                        >
+                          {renovandoId === editMode ? 'Renovando…' : 'Renovar publicación'}
+                        </button>
+                      )}
+                      {!formData.pideDatosAt && !esPublicacionVencida(formData) && (
+                        <button
+                          type="button"
+                          className="popup-btn-publicar"
+                          onClick={handleCancel}
+                        >
+                          Listo
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="popup-cuerpo">
-                  <div className="popup-media">
-                    {!selectedImage ? (
-                      <div {...getRootProps()} className="popup-dropzone">
-                        <input {...getInputProps()} />
-                        <p>Agregá una foto del reclamo</p>
-                        <span className="popup-nota">Obligatoria · Arrastrá acá o elegí desde el celular</span>
-                        <button type="button" className="btn-mapa chico" onClick={open}>
-                          Seleccionar imagen
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="popup-foto-caja">
-                        <img
-                          src={selectedImage}
-                          alt="Foto del reporte"
-                          className="popup-foto"
-                          onClick={handleImageClick}
-                          onError={handleImageError}
-                        />
-                        <button
-                          type="button"
-                          className="popup-foto-quitar"
-                          onClick={quitarImagen}
-                          aria-label="Quitar foto"
-                          title="Quitar foto"
-                        >
-                          <svg viewBox="0 0 24 24" aria-hidden="true">
-                            <path
-                              fill="currentColor"
-                              d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9zm-1 12h12a1 1 0 0 0 1-1V7H5v13a1 1 0 0 0 1 1z"
-                            />
+                <div className="popup-cuerpo popup-cuerpo-publicar">
+                  <form className="popup-formulario popup-form-publicar" onSubmit={handleSubmit}>
+                    <h3 className="popup-pregunta">¿Qué vas a publicar?</h3>
+
+                    <div className="popup-campo">
+                      <label>Categoría</label>
+                      <div className="popup-select-wrap">
+                        <select value={formData.category} onChange={handleCategoryChange} required>
+                          {categoryOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <span className="popup-select-icono" aria-hidden="true">
+                          <svg viewBox="0 0 24 24">
+                            <path fill="currentColor" d="M7 10l5 5 5-5z" />
                           </svg>
-                        </button>
+                        </span>
                       </div>
-                    )}
-                  </div>
-                  <form className="popup-formulario" onSubmit={handleSubmit}>
-                    <label>Dirección</label>
-                    <input
-                      type="text"
-                      value={formData.direccion || ''}
-                      onChange={handleDireccionChange}
-                      placeholder="Se completa con el punto del mapa"
-                    />
-                    <label>Fecha</label>
-                    <input type="date" value={formData.date} onChange={handleDateChange} required />
-                    <label>Hora</label>
-                    <input type="time" value={formData.time} onChange={handleTimeChange} required />
-                    <label>Descripción</label>
-                    <textarea value={formData.description} onChange={handleDescriptionChange} required />
-                    <label>Categoría</label>
-                    <select value={formData.category} onChange={handleCategoryChange} required>
-                      {categoryOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
+                    </div>
+
                     {renderFamiliasTipo()}
                     {renderAnimalTipo()}
+                    {renderPerdidaTipo()}
+
+                    <div className="popup-campo">
+                      <label>Descripción</label>
+                      <input
+                        type="text"
+                        value={formData.description}
+                        onChange={handleDescriptionChange}
+                        placeholder={
+                          formData.category === 'cosas_perdidas'
+                            ? 'Ej.: Mochila negra, billetera, llaves...'
+                            : 'Contá qué pasó...'
+                        }
+                        required
+                      />
+                    </div>
+
+                    <div className="popup-campo">
+                      <label>Zona</label>
+                      <div className="popup-input-icono">
+                        <input
+                          type="text"
+                          value={formData.direccion || ''}
+                          onChange={handleDireccionChange}
+                          placeholder="Ej.: Plaza San Martín, barrio Centro"
+                        />
+                        <span className="popup-input-pin" aria-hidden="true">
+                          <IconoUbicacion />
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="popup-campo">
+                      <label>Foto</label>
+                      <div className="popup-media">
+                        <input
+                          ref={inputGaleriaRef}
+                          type="file"
+                          accept="image/*"
+                          className="sr-only-file"
+                          onChange={onElegirArchivoAviso}
+                        />
+                        <input
+                          ref={inputCamaraRef}
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          className="sr-only-file"
+                          onChange={onElegirArchivoAviso}
+                        />
+                        {!selectedImage ? (
+                          <div className="popup-dropzone popup-dropzone-publicar popup-foto-acciones">
+                            {!mostrarOpcionesFoto ? (
+                              <button
+                                type="button"
+                                className="popup-foto-abrir"
+                                onClick={() => setMostrarOpcionesFoto(true)}
+                              >
+                                <span className="popup-dropzone-camara" aria-hidden="true">
+                                  <svg viewBox="0 0 24 24">
+                                    <path fill="currentColor" d="M9 3 7.2 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 15a5 5 0 1 1 5-5 5 5 0 0 1-5 5zm0-2.2A2.8 2.8 0 1 0 9.2 13 2.8 2.8 0 0 0 12 15.8z" />
+                                  </svg>
+                                </span>
+                                <p>Agregá una foto</p>
+                                <span className="popup-nota">Tocá para elegir galería o cámara</span>
+                              </button>
+                            ) : (
+                              <>
+                                <p>¿Cómo querés cargar la foto?</p>
+                                <div className="popup-foto-botones">
+                                  <button
+                                    type="button"
+                                    className="popup-foto-opcion"
+                                    onClick={() => inputGaleriaRef.current?.click()}
+                                  >
+                                    Galería
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="popup-foto-opcion"
+                                    onClick={abrirCamaraAviso}
+                                  >
+                                    Cámara
+                                  </button>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="popup-foto-volver-opciones"
+                                  onClick={() => setMostrarOpcionesFoto(false)}
+                                >
+                                  Volver
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="popup-foto-caja">
+                            <img
+                              src={selectedImage}
+                              alt="Foto del reporte"
+                              className="popup-foto"
+                              onClick={handleImageClick}
+                              onError={handleImageError}
+                            />
+                            <div className="popup-foto-toolbar">
+                              <button
+                                type="button"
+                                className="popup-foto-editar"
+                                onClick={() => abrirEditorConSrc(selectedImage, 'aviso')}
+                              >
+                                Editar
+                              </button>
+                              <button
+                                type="button"
+                                className="popup-foto-quitar"
+                                onClick={quitarImagen}
+                                aria-label="Quitar foto"
+                                title="Quitar foto"
+                              >
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  <path
+                                    fill="currentColor"
+                                    d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9zm-1 12h12a1 1 0 0 0 1-1V7H5v13a1 1 0 0 0 1 1z"
+                                  />
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
                     {!esCasoFamilia(formData.category) && (
-                      <small className="popup-nota">
-                        Un administrador va a revisar tu reporte antes de publicarlo en el mapa.
+                      <small className="popup-nota popup-nota-suave">
+                        Un administrador va a revisar tu aviso antes de publicarlo.
                       </small>
                     )}
-                    <div className="popup-acciones">
-                      <button type="submit">Subir</button>
-                      <button type="button" onClick={handleCancel}>Cancelar</button>
-                    </div>
+
+                    <button type="submit" className="popup-btn-publicar">
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path fill="currentColor" d="M3.4 20.6 21 12 3.4 3.4 3 10l11 2L3 14z" />
+                      </svg>
+                      Publicar aviso
+                    </button>
                   </form>
                 </div>
               )}
@@ -2674,303 +3778,6 @@ const renderOficinas = (tipo, jurisdiccion) => {
             Error getting location: {geoError}
           </div>
         )}
-        {isAdmin && (
-          <div className="panel-admin">
-            <div className="panel-admin-encabezado">
-              <div>
-                <h3>Panel de administración</h3>
-                <p>
-                  {adminRole === 'SUPER_ADMIN'
-                    ? 'Super administrador: ves los casos de todas las jurisdicciones.'
-                    : `Administrás: ${adminJurisdictions.map((j) => j.name).join(', ')}`}
-                </p>
-              </div>
-              <div className="panel-admin-controles">
-                <label className="panel-admin-buscar">
-                  Buscar por número de caso
-                  <input
-                    type="search"
-                    value={busquedaAdmin}
-                    onChange={(event) => setBusquedaAdmin(event.target.value)}
-                    placeholder="Ejemplo: 12"
-                  />
-                </label>
-                <label className="panel-admin-buscar">
-                  Categoría
-                  <select
-                    value={filtroCategoriaAdmin}
-                    onChange={(event) => setFiltroCategoriaAdmin(event.target.value)}
-                  >
-                    <option value="todas">Todas</option>
-                    {categoryOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="panel-admin-buscar">
-                  Estado
-                  <select
-                    value={filtroEstadoAdmin}
-                    onChange={(event) => setFiltroEstadoAdmin(event.target.value)}
-                  >
-                    <option value="todos">Todos</option>
-                    <option value="pendiente_aprobacion">Pendiente de aprobación</option>
-                    <option value="pendiente">Pendiente</option>
-                    <option value="en_proceso">En proceso</option>
-                    <option value="resuelto">Resuelto</option>
-                  </select>
-                </label>
-              </div>
-            </div>
-            {casosPorAprobar > 0 && (
-              <button
-                type="button"
-                className={`panel-admin-aviso${soloPorAprobar ? ' panel-admin-aviso-activo' : ''}`}
-                onClick={() => {
-                  setSoloPorAprobar((activo) => !activo);
-                  setSoloUrgentes(false);
-                  setSoloResueltosVecino(false);
-                }}
-              >
-                <span>
-                  {soloPorAprobar
-                    ? 'Volver a ver todos los casos'
-                    : casosPorAprobar === 1
-                      ? 'Tenés 1 caso para aprobar'
-                      : `Tenés ${casosPorAprobar} casos para aprobar`}
-                </span>
-                {!soloPorAprobar && <span className="panel-admin-aviso-ver">Ver</span>}
-              </button>
-            )}
-            {casosResueltosVecino > 0 && (
-              <button
-                type="button"
-                className={`panel-admin-aviso panel-admin-resuelto${soloResueltosVecino ? ' panel-admin-aviso-activo' : ''}`}
-                onClick={() => {
-                  setSoloResueltosVecino((activo) => !activo);
-                  setSoloPorAprobar(false);
-                  setSoloUrgentes(false);
-                }}
-              >
-                <span>
-                  {soloResueltosVecino
-                    ? 'Volver a ver todos los casos'
-                    : casosResueltosVecino === 1
-                      ? 'Tenés 1 caso que un vecino marcó como resuelto'
-                      : `Tenés ${casosResueltosVecino} casos que un vecino marcó como resueltos`}
-                </span>
-                {!soloResueltosVecino && <span className="panel-admin-aviso-ver">Ver</span>}
-              </button>
-            )}
-            {casosUrgentes > 0 && (
-              <button
-                type="button"
-                className={`panel-admin-aviso panel-admin-urgente${soloUrgentes ? ' panel-admin-aviso-activo' : ''}`}
-                onClick={() => {
-                  setSoloUrgentes((activo) => !activo);
-                  setSoloPorAprobar(false);
-                  setSoloResueltosVecino(false);
-                }}
-              >
-                <span>
-                  {soloUrgentes
-                    ? 'Volver a ver todos los casos'
-                    : casosUrgentes === 1
-                      ? 'Tenés 1 caso urgente: varios vecinos reportaron el mismo problema'
-                      : `Tenés ${casosUrgentes} casos urgentes: varios vecinos reportaron el mismo problema`}
-                </span>
-                {!soloUrgentes && <span className="panel-admin-aviso-ver">Ver</span>}
-              </button>
-            )}
-            {deletedMarker && (
-              <div className="panel-admin-deshacer">
-                <div>
-                  <strong>
-                    Caso #{deletedMarker.caseId || deletedMarker._id?.slice(-6)} eliminado
-                  </strong>
-                  <p>
-                    El caso "{deletedMarker.description || 'Sin descripción'}" ha sido eliminado.
-                    Se eliminará permanentemente en <strong>{deleteCountdown}</strong> segundo{deleteCountdown !== 1 ? 's' : ''}.
-                  </p>
-                </div>
-                <button type="button" onClick={handleUndoDelete}>
-                  Deshacer
-                </button>
-              </div>
-            )}
-            {casosAdmin.length === 0 && (
-              <p className="panel-admin-vacio">
-                {textoBusqueda
-                  ? 'No hay un caso con ese número.'
-                  : soloPorAprobar
-                    ? 'No hay casos para aprobar.'
-                    : soloUrgentes
-                      ? 'No hay casos urgentes.'
-                      : soloResueltosVecino
-                        ? 'No hay casos marcados como resueltos por un vecino.'
-                        : (filtroCategoriaAdmin !== 'todas' || filtroEstadoAdmin !== 'todos')
-                          ? 'No hay casos con esos filtros.'
-                          : 'No hay casos para administrar.'}
-              </p>
-            )}
-            <div className="panel-admin-lista">
-              {casosAdmin.map((marker) => {
-                const daysLeft =
-                  marker.status === 'resuelto' && marker.resolvedAt
-                    ? getDaysUntilRemoval(marker.resolvedAt)
-                    : marker.category === 'perros_gatos'
-                      ? getDaysUntilPetExpiry(marker.createdAt)
-                      : null;
-                const creado = marker.createdAt
-                  ? new Date(marker.createdAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })
-                  : 'N/D';
-                const vecinos = marker.neighborCount || 1;
-                const urgente = casoEsUrgente(marker);
-                const categoriaTexto = esCasoFamilia(marker.category)
-                  ? 'Familias'
-                  : marker.category === 'perros_gatos' && ANIMAL_TIPOS[marker.animalTipo]
-                    ? `Perros y gatos · ${ANIMAL_TIPOS[marker.animalTipo]}`
-                    : (categoryLabels[marker.category] || marker.category || 'N/D');
-                return (
-                  <article className={`caso-admin${urgente ? ' caso-admin-marcado' : ''}`} key={marker._id || marker.description}>
-                    <div className="caso-admin-principal">
-                      <div className="caso-admin-cabeza">
-                        <strong className="caso-admin-id">{marker.caseId ? `#${marker.caseId}` : 'Sin número'}</strong>
-                        <span className="caso-admin-chip">{categoriaTexto}</span>
-                        <span className="caso-admin-municipio">{marker.jurisdictionName || 'Sin jurisdicción'}</span>
-                        {urgente && <span className="caso-admin-chip urgente">Urgente</span>}
-                      </div>
-                      <p className="caso-admin-descripcion">{marker.description || 'Sin descripción'}</p>
-                      <dl className="caso-admin-datos">
-                        <div>
-                          <dt>Dirección</dt>
-                          <dd>{marker.direccion || 'Sin dirección'}</dd>
-                        </div>
-                        <div>
-                          <dt>Usuario</dt>
-                          <dd>{marker.createdBy || 'anonimo'}</dd>
-                        </div>
-                        <div>
-                          <dt>Creado</dt>
-                          <dd>{creado}</dd>
-                        </div>
-                        <div>
-                          <dt>Expira</dt>
-                          <dd>{daysLeft !== null ? `${daysLeft} ${daysLeft === 1 ? 'día' : 'días'}` : '-'}</dd>
-                        </div>
-                      </dl>
-                      {marker.category === 'reparaciones' && (
-                        <p className={`caso-admin-vecinos${urgente ? ' urgente' : ''}`}>
-                          {vecinos === 1 ? '1 vecino lo reportó' : `${vecinos} vecinos lo reportaron`}
-                        </p>
-                      )}
-                      {(marker.confirmations || []).length > 0 && (
-                        <ul className="caso-admin-confirmaciones">
-                          {marker.confirmations.map((confirmacion, indice) => (
-                            <li key={`${marker._id}-confirma-${indice}`}>
-                              {confirmacion.userId || 'Vecino'}: {confirmacion.description || 'Sin descripción'}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                      {esCasoFamilia(marker.category) || (marker.category === 'perros_gatos' && marker.animalTipo === 'abandonado') ? (
-                        <div className="caso-admin-derivar">
-                          <p>A quién avisar</p>
-                          {renderOficinas(
-                            esCasoFamilia(marker.category) ? tipoDeFamilia(marker) : 'abandonado',
-                            marker.jurisdictionName
-                          )}
-                          {marker.avisadoAt ? (
-                            <p className="caso-admin-avisado">
-                              Ya avisaste · {new Date(marker.avisadoAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })}
-                            </p>
-                          ) : (
-                            <button
-                              type="button"
-                              className="caso-admin-avise"
-                              disabled={avisando === marker._id}
-                              onClick={() => marcarAvisado(marker._id)}
-                            >
-                              {avisando === marker._id ? 'Guardando...' : 'Ya avisé'}
-                            </button>
-                          )}
-                        </div>
-                      ) : null}
-                      {marker.resolvedBy && (
-                        <div className="caso-admin-resolucion">
-                          <strong>Reportado por:</strong> {marker.resolvedBy}
-                          <br />
-                          <small>
-                            {marker.resolvedByReportedAt
-                              ? new Date(marker.resolvedByReportedAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })
-                              : 'Fecha no disponible'}
-                          </small>
-                          {marker.resolutionDescription && (
-                            <p>
-                              <strong>Qué hizo:</strong> {marker.resolutionDescription}
-                            </p>
-                          )}
-                          {marker.resolutionImageUrl && (
-                            <div>
-                              <a href={buildImageUrl(marker.resolutionImageUrl)} target="_blank" rel="noopener noreferrer">
-                                Ver foto
-                              </a>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                    <div className="caso-admin-lateral">
-                      {!esCasoFamilia(marker.category) && (
-                        <div className="caso-admin-estado-caja">
-                          <label htmlFor={`estado-${marker._id}`}>Estado</label>
-                          <select
-                            id={`estado-${marker._id}`}
-                            className="caso-admin-estado"
-                            value={estadosPendientes[marker._id] || marker.status || 'pendiente'}
-                            aria-label="Estado del caso"
-                            onChange={(e) => elegirEstado(marker._id, marker.status || 'pendiente', e.target.value)}
-                          >
-                            {statusOptions.map((status) => (
-                              <option key={status} value={status}>
-                                {statusLabels[status] || status.replace('_', ' ')}
-                              </option>
-                            ))}
-                          </select>
-                          {estadosPendientes[marker._id] && (
-                            <button
-                              type="button"
-                              className="caso-admin-guardar"
-                              disabled={guardandoEstado === marker._id}
-                              onClick={() => guardarEstado(marker._id)}
-                            >
-                              {guardandoEstado === marker._id ? 'Guardando...' : 'Guardar'}
-                            </button>
-                          )}
-                        </div>
-                      )}
-                      <div className="caso-admin-acciones">
-                        <button type="button" className="caso-admin-ver" onClick={() => handleMarkerClick(marker, true)}>
-                          Ver
-                        </button>
-                        <button type="button" className="caso-admin-eliminar" onClick={() => handleAdminDeleteMarker(marker)}>
-                          Eliminar
-                        </button>
-                        {marker.status === 'pendiente_aprobacion' && !esCasoFamilia(marker.category) && (
-                          <button type="button" className="caso-admin-aprobar" onClick={() => handleApproveMarker(marker._id)}>
-                            Aprobar
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-          </div>
-        )}
         {mostrarFiltros && (
           <div className="panel-vecino-fondo" onClick={() => setMostrarFiltros(false)}>
             <div className="panel-vecino" onClick={(event) => event.stopPropagation()}>
@@ -2982,13 +3789,16 @@ const renderOficinas = (tipo, jurisdiccion) => {
                 <label>
                   Categoría
                   <select
-                    value={categoryFilter}
+                    value={categoryFilter === 'todas' ? '' : categoryFilter}
                     onChange={(e) => {
-                      setCategoryFilter(e.target.value);
-                      if (e.target.value !== 'perros_gatos') setAnimalFilter('todos');
+                      const valor = e.target.value || 'todas';
+                      setCategoryFilter(valor);
+                      if (valor !== 'perros_gatos') setAnimalFilter('todos');
                     }}
                   >
-                    <option value="todas">Todas</option>
+                    <option value="" disabled hidden>
+                      Elegí una categoría
+                    </option>
                     {availableCategoryOptions.map((option) => (
                       <option key={option.value} value={option.value}>
                         {option.label}
@@ -3018,6 +3828,19 @@ const renderOficinas = (tipo, jurisdiccion) => {
                   />
                   Solo mis reportes
                 </label>
+                {isAdmin && adminRole !== 'SUPER_ADMIN' && (adminJurisdictions || []).length > 0 && (
+                  <label className="filtro-mis-reportes">
+                    <input
+                      type="checkbox"
+                      checked={soloMiJurisdiccion}
+                      onChange={(e) => setSoloMiJurisdiccion(e.target.checked)}
+                    />
+                    Mi jurisdicción
+                    {(adminJurisdictions || []).length === 1
+                      ? ` (${adminJurisdictions[0].name})`
+                      : ''}
+                  </label>
+                )}
                 <button
                   type="button"
                   className="btn-aplicar-filtros"
@@ -3037,17 +3860,56 @@ const renderOficinas = (tipo, jurisdiccion) => {
                 <h3>Mis reportes</h3>
                 <button type="button" onClick={() => setMostrarMisReportes(false)}>Cerrar</button>
               </div>
-              {misReportes.length === 0 ? (
-                <p className="panel-vecino-vacio">Todavía no cargaste reportes con esta cuenta.</p>
-              ) : (
-                <>
+              <div className="panel-mis-tabs" role="tablist">
                 <button
                   type="button"
-                  className="btn-aplicar-filtros"
-                  onClick={verMisCasosEnElMapa}
+                  role="tab"
+                  aria-selected={misReportesSeccion === 'activos'}
+                  className={misReportesSeccion === 'activos' ? 'activo' : ''}
+                  onClick={() => {
+                    setMisReportesSeccion('activos');
+                    setMisPage(1);
+                    cargarMisLista('activos', 1);
+                  }}
                 >
-                  Ver mis casos en el mapa
+                  Activos
                 </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={misReportesSeccion === 'registro'}
+                  className={misReportesSeccion === 'registro' ? 'activo' : ''}
+                  onClick={() => {
+                    setMisReportesSeccion('registro');
+                    setMisPage(1);
+                    cargarMisLista('registro', 1);
+                  }}
+                >
+                  Registro
+                </button>
+              </div>
+              {cargandoMisLista ? (
+                <p className="panel-vecino-vacio">Cargando…</p>
+              ) : misReportes.length === 0 ? (
+                <p className="panel-vecino-vacio">
+                  {misReportesSeccion === 'registro'
+                    ? 'Todavía no tenés casos cerrados, anulados o vencidos.'
+                    : 'No tenés reportes activos con esta cuenta.'}
+                </p>
+              ) : (
+                <>
+                {misReportesSeccion === 'activos' && (
+                  <button
+                    type="button"
+                    className="btn-aplicar-filtros"
+                    onClick={verMisCasosEnElMapa}
+                  >
+                    Ver mis casos en el mapa
+                  </button>
+                )}
+                <p className="panel-mis-meta">
+                  {`Mostrando ${misReportes.length} de ${misMeta.total} · página ${misPage} de ${misTotalPaginas}`}
+                </p>
                 <ul className="panel-vecino-lista panel-mis-reportes">
                   {misReportes.map((marker) => {
                     const categoria = esCasoFamilia(marker.category)
@@ -3058,11 +3920,13 @@ const renderOficinas = (tipo, jurisdiccion) => {
                       hijos: 'Niños o adolescentes',
                       calle: 'Persona en situación de calle',
                     };
-                    const subtipo = categoria === 'perros_gatos' && ANIMAL_TIPOS[marker.animalTipo]
-                      ? ANIMAL_TIPOS[marker.animalTipo]
-                      : categoria === 'familias' && marker.familiasTipo
-                        ? (labelsFamilias[marker.familiasTipo] || marker.familiasTipo)
-                        : null;
+                    const subtipo = categoria === 'cosas_perdidas' && marker.perdidaTipo
+                      ? (perdidaLabels[marker.perdidaTipo] || marker.perdidaTipo)
+                      : categoria === 'perros_gatos' && ANIMAL_TIPOS[marker.animalTipo]
+                        ? ANIMAL_TIPOS[marker.animalTipo]
+                        : categoria === 'familias' && marker.familiasTipo
+                          ? (labelsFamilias[marker.familiasTipo] || marker.familiasTipo)
+                          : null;
                     const creado = marker.createdAt
                       ? new Date(marker.createdAt).toLocaleString('es-AR', {
                         dateStyle: 'short',
@@ -3074,52 +3938,112 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     const foto = marker.imageUrl ? buildImageUrl(marker.imageUrl) : null;
                     const descripcion = (marker.description || '').trim();
                     const direccion = (marker.direccion || '').trim();
+                    const enRegistro = Boolean(marker.eliminadoAt)
+                      || marker.status === 'resuelto'
+                      || marker.status === 'rechazado';
+                    const estadoTexto = enRegistro
+                      ? (marker.status === 'rechazado'
+                        ? 'Anulado'
+                        : (String(marker.motivoEliminacion || '').toLowerCase().includes('vencimiento')
+                          ? 'Vencido'
+                          : (statusLabels[marker.status] || 'En registro')))
+                      : (statusLabels[marker.status] || marker.status);
+                    const actividad = marker.pideDatosAt
+                      ? 'Te pidieron más datos'
+                      : (marker.ultimaRespuestaDatosAt
+                        ? `Respondiste datos el ${new Date(marker.ultimaRespuestaDatosAt).toLocaleDateString('es-AR')}`
+                        : null);
+                    const vencida = esPublicacionVencida(marker);
                     return (
                       <li key={marker._id}>
-                        <button
-                          type="button"
-                          className="tarjeta-mi-reporte"
-                          onClick={() => irAMiReporte(marker)}
-                        >
-                          {foto ? (
-                            <img
-                              src={foto}
-                              alt=""
-                              className="tarjeta-mi-reporte-foto"
-                            />
-                          ) : (
-                            <span className="tarjeta-mi-reporte-sin-foto" aria-hidden="true">
-                              Sin foto
+                        <div className="tarjeta-mi-reporte-wrap">
+                          <button
+                            type="button"
+                            className="tarjeta-mi-reporte"
+                            onClick={() => irAMiReporte(marker)}
+                          >
+                            {foto ? (
+                              <img
+                                src={foto}
+                                alt=""
+                                className="tarjeta-mi-reporte-foto"
+                              />
+                            ) : (
+                              <span className="tarjeta-mi-reporte-sin-foto" aria-hidden="true">
+                                Sin foto
+                              </span>
+                            )}
+                            <span className="tarjeta-mi-reporte-info">
+                              <strong>Caso #{marker.caseId || '-'}</strong>
+                              <span className="tarjeta-mi-reporte-meta">
+                                {`Categoría: ${categoryLabels[categoria] || categoria}${subtipo ? ` / ${subtipo}` : ''}`}
+                              </span>
+                              <span
+                                className="panel-vecino-estado"
+                                style={getStatusBadgeStyle(
+                                  vencida
+                                    ? 'rechazado'
+                                    : (enRegistro && marker.status !== 'rechazado' && marker.status !== 'resuelto'
+                                      ? 'resuelto'
+                                      : (marker.status || 'pendiente'))
+                                )}
+                              >
+                                {vencida ? 'Vencido' : estadoTexto}
+                              </span>
+                              {actividad && (
+                                <span className="tarjeta-mi-reporte-actividad">{actividad}</span>
+                              )}
+                              {direccion && (
+                                <span className="tarjeta-mi-reporte-direccion">{direccion}</span>
+                              )}
+                              {descripcion && (
+                                <span className="tarjeta-mi-reporte-desc">{descripcion}</span>
+                              )}
+                              <small>
+                                {marker.jurisdictionName || 'Sin municipio'}
+                                {creado ? ` · ${creado}` : ''}
+                                {marker.eliminadoAt
+                                  ? ` · Baja: ${new Date(marker.eliminadoAt).toLocaleDateString('es-AR')}`
+                                  : ''}
+                              </small>
                             </span>
-                          )}
-                          <span className="tarjeta-mi-reporte-info">
-                            <strong>Caso #{marker.caseId || '-'}</strong>
-                            <span className="tarjeta-mi-reporte-meta">
-                              {categoryLabels[categoria] || categoria}
-                              {subtipo ? ` · ${subtipo}` : ''}
-                            </span>
-                            <span
-                              className="panel-vecino-estado"
-                              style={getStatusBadgeStyle(marker.status || 'pendiente')}
+                          </button>
+                          {vencida && (
+                            <button
+                              type="button"
+                              className="btn-renovar-publicacion"
+                              disabled={renovandoId === marker._id}
+                              onClick={() => renovarPublicacion(marker)}
                             >
-                              {statusLabels[marker.status] || marker.status}
-                            </span>
-                            {direccion && (
-                              <span className="tarjeta-mi-reporte-direccion">{direccion}</span>
-                            )}
-                            {descripcion && (
-                              <span className="tarjeta-mi-reporte-desc">{descripcion}</span>
-                            )}
-                            <small>
-                              {marker.jurisdictionName || 'Sin municipio'}
-                              {creado ? ` · ${creado}` : ''}
-                            </small>
-                          </span>
-                        </button>
+                              {renovandoId === marker._id ? 'Renovando…' : 'Renovar 15 días'}
+                            </button>
+                          )}
+                        </div>
                       </li>
                     );
                   })}
                 </ul>
+                {misTotalPaginas > 1 && (
+                  <div className="panel-mis-paginacion">
+                    <button
+                      type="button"
+                      className="popup-btn-secundario"
+                      disabled={misPage <= 1 || cargandoMisLista}
+                      onClick={() => cargarMisLista(misReportesSeccion, misPage - 1)}
+                    >
+                      Anterior
+                    </button>
+                    <span>{misPage} / {misTotalPaginas}</span>
+                    <button
+                      type="button"
+                      className="popup-btn-secundario"
+                      disabled={!misMeta.hasMore || cargandoMisLista}
+                      onClick={() => cargarMisLista(misReportesSeccion, misPage + 1)}
+                    >
+                      Siguiente
+                    </button>
+                  </div>
+                )}
                 </>
               )}
             </div>
@@ -3183,6 +4107,94 @@ const renderOficinas = (tipo, jurisdiccion) => {
               Cerrar
             </button>
           </div>
+        )}
+
+        {confirmarRecupero && (
+          <div
+            className="popup-resolucion-modal-fondo"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirmar recuperación"
+            onClick={() => {
+              if (!confirmandoRecupero) setConfirmarRecupero(false);
+            }}
+          >
+            <div
+              className="popup-resolucion-modal"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="popup-resolucion-modal-cabecera">
+                <strong>¿Ya lo recuperaste?</strong>
+              </div>
+              <p className="popup-resolucion-modal-desc">
+                Si confirmás, el caso se cierra, sale del mapa y pasa al registro.
+              </p>
+              <div className="popup-confirm-acciones">
+                <button
+                  type="button"
+                  className="popup-btn-secundario"
+                  disabled={confirmandoRecupero}
+                  onClick={() => setConfirmarRecupero(false)}
+                >
+                  Volver
+                </button>
+                <button
+                  type="button"
+                  className="popup-btn-exito"
+                  disabled={confirmandoRecupero}
+                  onClick={handleResolverPerdida}
+                >
+                  {confirmandoRecupero ? 'Cerrando…' : 'Sí, ya lo recuperé'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {mostrarChatReclamo && editMode && (
+          <div className="chat-reclamo-fondo" onClick={() => setMostrarChatReclamo(false)}>
+            <div className="chat-reclamo-modal" onClick={(event) => event.stopPropagation()}>
+              <ChatReclamo
+                markerId={editMode}
+                caseId={formData.caseId}
+                userId={userId}
+                soloLectura={
+                  formData.status === 'resuelto'
+                  || formData.status === 'rechazado'
+                  || !!formData.eliminadoAt
+                }
+                onCerrar={() => setMostrarChatReclamo(false)}
+                onChatAbierto={() => {
+                  setFormData((prev) => (
+                    prev.chatAbiertoPorMi ? prev : { ...prev, chatAbiertoPorMi: true }
+                  ));
+                  setMarkers((prev) => prev.map((m) => (
+                    String(m._id) === String(editMode)
+                      ? { ...m, chatAbiertoPorMi: true }
+                      : m
+                  )));
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {mostrarCamara && (
+          <CamaraEnVivo
+            onCancelar={() => setMostrarCamara(false)}
+            onCapturar={(dataUrl) => {
+              setMostrarCamara(false);
+              abrirEditorConSrc(dataUrl, editorDestino);
+            }}
+          />
+        )}
+
+        {editorImagenSrc && (
+          <EditorImagen
+            imagenSrc={editorImagenSrc}
+            onCancelar={() => setEditorImagenSrc(null)}
+            onConfirmar={confirmarFotoEditada}
+          />
         )}
       </div>
     );

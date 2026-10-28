@@ -2,6 +2,8 @@
 const express = require('express');
 const multer = require('multer');
 const Marker = require('../models/marker');
+const ChatMensaje = require('../models/chatMensaje');
+const Usuario = require('../models/usuario');
 const { normalizeUserId, getRequestUser } = require('../utils/users');
 const {
   findJurisdictionForPoint,
@@ -11,19 +13,222 @@ const {
   buildManagedMarkersFilter,
 } = require('../utils/jurisdictions');
 const { removeExpiredMarkers } = require('../utils/markerExpiry');
-const { avisarCambioEstado, avisarOficina } = require('../utils/notificaciones');
+const {
+  avisarCambioEstado,
+  avisarOficina,
+  avisarRechazo,
+  crearNotificacion,
+  avisarAdminsPorAprobar,
+  avisarAdminsCasoAprobado,
+  avisarPartesCaso,
+  listarAdminsDelCaso,
+} = require('../utils/notificaciones');
 const router = express.Router();
 
 // Configuración de multer para almacenar los archivos en memoria
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-const STATUS_VALUES = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto'];
-const CATEGORY_VALUES = ['familias', 'persona', 'perros_gatos', 'reparaciones'];
+const STATUS_VALUES = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto', 'rechazado'];
+const CATEGORY_VALUES = ['familias', 'persona', 'perros_gatos', 'reparaciones', 'cosas_perdidas'];
 const FAMILIAS_TIPOS = ['violencia', 'hijos', 'calle'];
 const ANIMAL_TIPOS = ['abandonado', 'perdido', 'adopcion'];
+const PERDIDA_TIPOS = ['perdi', 'encontre'];
 const LIMITE_REPORTES_POR_DIA = 5;
 const MS_UN_DIA = 24 * 60 * 60 * 1000;
+const LIMITE_MAPA_DEFAULT = 60;
+const LIMITE_ADMIN_DEFAULT = 20;
+const LIMITE_MAX = 100;
+
+const parsePageLimit = (query, defaultLimit) => {
+  const page = Math.max(1, parseInt(query.page, 10) || 1);
+  let limit = parseInt(query.limit, 10) || defaultLimit;
+  if (!Number.isFinite(limit) || limit < 1) limit = defaultLimit;
+  limit = Math.min(LIMITE_MAX, limit);
+  return { page, limit, skip: (page - 1) * limit };
+};
+
+const buildListQuery = ({
+  requester,
+  adminScope,
+  category,
+  excludeCategory,
+  animalTipo,
+  perdidaTipo,
+  status,
+  mine,
+  myJurisdiction,
+  q,
+  atencion,
+  tipoCierre,
+  periodoDias,
+  fechaDesde,
+  fechaHasta,
+  soloAdminScope = false,
+  incluirEliminados = false,
+  soloEliminados = false,
+}) => {
+  const and = [];
+
+  if (soloEliminados) {
+    // Registro: bajas lógicas + resueltos/anulados (por si quedó alguno sin eliminadoAt)
+    and.push({
+      $or: [
+        { eliminadoAt: { $ne: null } },
+        { status: { $in: ['resuelto', 'rechazado'] } },
+      ],
+    });
+
+    const cierre = String(tipoCierre || '').trim();
+    if (cierre === 'resuelto') {
+      and.push({ status: 'resuelto' });
+    } else if (cierre === 'anulado') {
+      and.push({ status: 'rechazado' });
+    } else if (cierre === 'vencido') {
+      and.push({
+        motivoEliminacion: { $regex: 'vencimiento', $options: 'i' },
+      });
+    }
+
+    // Fecha de baja (eliminadoAt) o, si falta, createdAt
+    let desde = fechaDesde ? new Date(fechaDesde) : null;
+    let hasta = fechaHasta ? new Date(fechaHasta) : null;
+    const dias = parseInt(periodoDias, 10);
+    if (!desde && Number.isFinite(dias) && dias > 0) {
+      desde = new Date(Date.now() - dias * 24 * 60 * 60 * 1000);
+    }
+    if (desde && !Number.isNaN(desde.getTime())) {
+      and.push({
+        $or: [
+          { eliminadoAt: { $gte: desde } },
+          { eliminadoAt: null, createdAt: { $gte: desde } },
+        ],
+      });
+    }
+    if (hasta && !Number.isNaN(hasta.getTime())) {
+      const fin = new Date(hasta);
+      fin.setHours(23, 59, 59, 999);
+      and.push({
+        $or: [
+          { eliminadoAt: { $lte: fin } },
+          { eliminadoAt: null, createdAt: { $lte: fin } },
+        ],
+      });
+    }
+  } else if (!incluirEliminados) {
+    and.push({ eliminadoAt: null });
+    // Reportes / Cosas perdidas activos: no mezclar archivo
+    if (soloAdminScope) {
+      and.push({ status: { $nin: ['resuelto', 'rechazado'] } });
+    }
+  }
+
+  // Atajos del dashboard: urgentes / resolución vecino / respondieron datos
+  if (atencion === 'urgentes') {
+    and.push({
+      category: 'reparaciones',
+      status: { $in: ['pendiente', 'en_proceso'] },
+      'confirmations.0': { $exists: true },
+    });
+  } else if (atencion === 'resolucion') {
+    and.push({
+      resolvedBy: { $nin: [null, ''] },
+      status: { $ne: 'resuelto' },
+    });
+  } else if (atencion === 'respuestas') {
+    and.push({
+      respuestaDatosAt: { $ne: null },
+      status: { $nin: ['resuelto', 'rechazado'] },
+    });
+  }
+
+  if (soloAdminScope) {
+    // Dashboard: siempre acotar a la jurisdicción del admin (salvo super admin)
+    if (!adminScope?.isSuperAdmin) {
+      and.push(buildManagedMarkersFilter(adminScope));
+    }
+  } else if (!isScopeAdmin(adminScope)) {
+    // Vecino: no traer pendientes ajenos ni familias/persona ajenas
+    and.push({
+      $or: [
+        { createdBy: requester },
+        {
+          status: { $nin: ['pendiente_aprobacion', 'rechazado'] },
+          category: { $nin: ['familias', 'persona'] },
+        },
+      ],
+    });
+  }
+
+  if (mine === '1' || mine === 'true') {
+    and.push({ createdBy: requester });
+  }
+
+  // Mapa vecino: admin municipal acota a su municipio/comuna/provincia
+  if (
+    (myJurisdiction === '1' || myJurisdiction === 'true')
+    && isScopeAdmin(adminScope)
+    && !adminScope.isSuperAdmin
+  ) {
+    and.push(buildManagedMarkersFilter(adminScope));
+  }
+
+  if (category && category !== 'todas') {
+    if (category === 'familias') {
+      and.push({ category: { $in: ['familias', 'persona'] } });
+    } else if (CATEGORY_VALUES.includes(category)) {
+      and.push({ category });
+    }
+  }
+
+  if (excludeCategory && CATEGORY_VALUES.includes(excludeCategory)) {
+    and.push({ category: { $ne: excludeCategory } });
+  }
+
+  if (animalTipo && animalTipo !== 'todos' && ANIMAL_TIPOS.includes(animalTipo)) {
+    and.push({ animalTipo });
+  }
+
+  if (perdidaTipo && PERDIDA_TIPOS.includes(perdidaTipo)) {
+    and.push({ perdidaTipo });
+  }
+
+  if (status && status !== 'todos' && STATUS_VALUES.includes(status)) {
+    // En el panel admin, no esconder casos con novedad (respuesta de datos / nuevo)
+    // aunque el filtro de estado no coincida (p. ej. quedó en_proceso).
+    if (soloAdminScope) {
+      and.push({
+        $or: [
+          { status },
+          { respuestaDatosAt: { $ne: null } },
+          { nuevoParaAdmin: true },
+        ],
+      });
+    } else {
+      and.push({ status });
+    }
+  }
+
+  const texto = String(q || '').trim().replace(/^#/, '');
+  if (texto) {
+    const orTexto = [
+      { description: { $regex: texto, $options: 'i' } },
+      { direccion: { $regex: texto, $options: 'i' } },
+      { objeto: { $regex: texto, $options: 'i' } },
+      { createdBy: { $regex: texto, $options: 'i' } },
+      { motivoEliminacion: { $regex: texto, $options: 'i' } },
+      { resolutionDescription: { $regex: texto, $options: 'i' } },
+    ];
+    if (/^\d+$/.test(texto)) {
+      orTexto.push({ caseId: Number(texto) });
+    }
+    and.push({ $or: orTexto });
+  }
+
+  if (!and.length) return {};
+  if (and.length === 1) return and[0];
+  return { $and: and };
+};
 
 const normalizeFamiliasTipo = (category, value) => {
   if (category !== 'familias') return null;
@@ -35,6 +240,43 @@ const normalizeAnimalTipo = (category, value) => {
   if (category !== 'perros_gatos') return null;
   const normalized = String(value || '').trim().toLowerCase();
   return ANIMAL_TIPOS.includes(normalized) ? normalized : null;
+};
+
+const normalizePerdidaTipo = (category, value) => {
+  if (category !== 'cosas_perdidas') return null;
+  const normalized = String(value || '').trim().toLowerCase();
+  return PERDIDA_TIPOS.includes(normalized) ? normalized : null;
+};
+
+// Solo dígitos; para animales debe tener entre 8 y 15
+const normalizeContacto = (category, value) => {
+  if (category !== 'perros_gatos') return '';
+  const digitos = String(value || '').replace(/\D/g, '');
+  if (digitos.length < 8 || digitos.length > 15) return null;
+  return digitos;
+};
+
+const nombreDesdeUsuario = async (userId) => {
+  const email = normalizeUserId(userId);
+  if (!email || email === 'anonimo') return 'Vecino';
+  try {
+    const usuario = await Usuario.findOne({ email }).select('nombre email');
+    if (usuario?.nombre) return usuario.nombre;
+  } catch (_) { /* ignore */ }
+  return email.split('@')[0] || 'Vecino';
+};
+
+// Escribir: solo quien publicó y quien reclamó
+const puedeEscribirChat = (marker, requester) => {
+  if (!marker || !requester || requester === 'anonimo') return false;
+  if (normalizeUserId(marker.createdBy) === requester) return true;
+  return (marker.claims || []).some((c) => normalizeUserId(c.userId) === requester);
+};
+
+// Leer: participantes + admin del municipio (historial / auditoría)
+const puedeLeerChat = (marker, requester, adminScope) => {
+  if (puedeEscribirChat(marker, requester)) return true;
+  return canManageMarker(adminScope, marker);
 };
 
 const normalizeStatus = (value, fallback = 'pendiente_aprobacion') => {
@@ -51,6 +293,7 @@ const normalizeCategory = (value, fallback = 'persona') => {
   if (normalized.includes('familia')) return 'familias';
   if (normalized.includes('perro') || normalized.includes('gato')) return 'perros_gatos';
   if (normalized.includes('repar')) return 'reparaciones';
+  if (normalized.includes('perdid') || normalized.includes('encontr')) return 'cosas_perdidas';
   return fallback;
 };
 
@@ -115,6 +358,33 @@ const sanitizeMarkerResponse = (markerDoc, scope = null, requester = null) => {
         : ''),
     ...(puedeVerVecinos ? { userId: confirmacion.userId } : {}),
   }));
+  const claims = Array.isArray(marker.claims) ? marker.claims : [];
+  marker.claimCount = claims.length;
+  marker.claimedByMe = !!requester && claims.some(
+    (claim) => normalizeUserId(claim.userId) === requester
+  );
+  marker.canChat = !!requester && (
+    normalizeUserId(marker.createdBy) === requester
+    || marker.claimedByMe
+  );
+  marker.claims = claims.map((claim) => ({
+    nombre: claim.nombre || '',
+    createdAt: claim.createdAt,
+    ...(puedeVerVecinos || normalizeUserId(marker.createdBy) === requester
+      ? { userId: claim.userId }
+      : {}),
+  }));
+  const chatAbierto = (marker.chatAbiertoPor || []).map((id) => normalizeUserId(id));
+  const confirmaciones = Array.isArray(marker.confirmacionesPerdida)
+    ? marker.confirmacionesPerdida
+    : [];
+  marker.chatAbiertoPorMi = !!requester && chatAbierto.includes(requester);
+  marker.confirmacionPerdidaMia = confirmaciones.find(
+    (c) => normalizeUserId(c.userId) === requester
+  ) || null;
+  marker.confirmacionesPerdidaCount = confirmaciones.length;
+  // Ya no hace falta doble marca: cierra quien perdió el objeto
+  marker.perdidaEsperaOtraParte = false;
   const jurisdiction = marker.tenant && marker.tenant.name ? marker.tenant : null;
   marker.jurisdictionName = jurisdiction ? jurisdiction.name : null;
   marker.jurisdictionType = jurisdiction ? jurisdiction.type : null;
@@ -143,38 +413,85 @@ const requireJurisdictionAdmin = (req, res, next) => {
   next();
 };
 
+const rejectIfEliminado = (marker, res) => {
+  if (marker && marker.eliminadoAt) {
+    res.status(400).json({
+      message: 'Este caso está en el registro de eliminados y no se puede modificar',
+    });
+    return true;
+  }
+  return false;
+};
+
 router.use(loadAdminScope);
 
-// Ruta para obtener todos los marcadores
+// Lista paginada + filtros en servidor (no trae todo el dataset)
 router.get('/', async (req, res) => {
   try {
     await removeExpiredMarkers();
 
     const { requester, adminScope } = req;
+    const { page, limit, skip } = parsePageLimit(req.query, LIMITE_MAPA_DEFAULT);
+    const myJurisdictionOn = req.query.myJurisdiction === '1' || req.query.myJurisdiction === 'true';
+    const mineOn = req.query.mine === '1' || req.query.mine === 'true';
+    // Registro del vecino: solo sus propias bajas (resueltos / anulados / vencidos)
+    const registroPropio = mineOn && (
+      req.query.eliminados === '1'
+      || req.query.eliminados === 'true'
+      || req.query.registro === '1'
+    );
+    const filtro = buildListQuery({
+      requester,
+      adminScope,
+      category: req.query.category,
+      excludeCategory: req.query.excludeCategory,
+      animalTipo: req.query.animalTipo,
+      perdidaTipo: req.query.perdidaTipo,
+      status: req.query.status,
+      mine: req.query.mine,
+      myJurisdiction: req.query.myJurisdiction,
+      q: req.query.q,
+      soloAdminScope: false,
+      soloEliminados: registroPropio,
+    });
 
-    // Obtener todos los marcadores sin la información binaria de la imagen
-    const markers = await Marker.find()
-      .select('-image -resolutionImage -confirmations.image')
-      .populate('tenant', JURISDICTION_FIELDS);
+    const [total, markers] = await Promise.all([
+      Marker.countDocuments(filtro),
+      Marker.find(filtro)
+        .select('-image -resolutionImage -confirmations.image')
+        .populate('tenant', JURISDICTION_FIELDS)
+        .sort(registroPropio ? { eliminadoAt: -1, createdAt: -1 } : { createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+    ]);
 
-    // Los admins ven todo lo de su jurisdicción; el resto, solo lo aprobado y no privado
-    const visibleMarkers = markers.filter((marker) => {
-      if (canManageMarker(adminScope, marker)) {
-        return true;
-      }
+    // Seguridad extra por si el filtro no alcanzó (p. ej. admin de jurisdicción)
+    const visibles = markers.filter((marker) => {
       const markerOwner = normalizeUserId(marker.createdBy);
-      // Marcadores pendientes de aprobación: solo el creador puede verlos
-      if (marker.status === 'pendiente_aprobacion') {
+      if (registroPropio) {
         return markerOwner === requester;
       }
-      // Familias y personas en situación de calle: solo el creador puede verlas
+      // "Mi jurisdicción": solo casos que el admin puede gestionar
+      if (myJurisdictionOn && isScopeAdmin(adminScope) && !adminScope.isSuperAdmin) {
+        return canManageMarker(adminScope, marker);
+      }
+      if (canManageMarker(adminScope, marker)) return true;
+      if (marker.status === 'pendiente_aprobacion' || marker.status === 'rechazado') {
+        return markerOwner === requester;
+      }
       if (marker.category === 'familias' || marker.category === 'persona') {
         return markerOwner === requester;
       }
       return true;
     });
 
-    res.json(visibleMarkers.map((marker) => sanitizeMarkerResponse(marker, adminScope, requester)));
+    res.json({
+      items: visibles.map((marker) => sanitizeMarkerResponse(marker, adminScope, requester)),
+      total,
+      page,
+      limit,
+      hasMore: skip + limit < total,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -183,7 +500,10 @@ router.get('/', async (req, res) => {
 
 // Ruta para agregar un nuevo marcador
 router.post('/', upload.single('image'), async (req, res) => {
-  const { lat, lng, date, time, description, direccion, status, category, visibility, familiasTipo, animalTipo } = req.body;
+  const {
+    lat, lng, date, time, description, direccion, status, category, visibility,
+    familiasTipo, animalTipo, perdidaTipo, objeto, contacto,
+  } = req.body;
   const { requester: createdBy, adminScope } = req;
   const normalizedCategory = normalizeCategory(category);
 
@@ -194,6 +514,7 @@ router.post('/', upload.single('image'), async (req, res) => {
       const creadosHoy = await Marker.countDocuments({
         createdBy,
         createdAt: { $gte: desde },
+        eliminadoAt: null,
       });
       if (creadosHoy >= LIMITE_REPORTES_POR_DIA) {
         return res.status(429).json({
@@ -219,6 +540,19 @@ router.post('/', upload.single('image'), async (req, res) => {
     // Generar caseId único tomando el último caseId existente
     const caseId = await getNextCaseId();
 
+    if (normalizedCategory === 'cosas_perdidas' && !normalizePerdidaTipo(normalizedCategory, perdidaTipo)) {
+      return res.status(400).json({ message: 'Elegí si perdiste o encontraste algo.' });
+    }
+    if (normalizedCategory === 'perros_gatos' && !normalizeAnimalTipo(normalizedCategory, animalTipo)) {
+      return res.status(400).json({ message: 'Elegí de qué se trata el aviso de animales.' });
+    }
+    const contactoNormalizado = normalizeContacto(normalizedCategory, contacto);
+    if (normalizedCategory === 'perros_gatos' && !contactoNormalizado) {
+      return res.status(400).json({
+        message: 'En avisos de animales el celular de contacto es obligatorio (para WhatsApp).',
+      });
+    }
+
     const newMarker = new Marker({
       tenant: jurisdiction.tenant,
       province: jurisdiction.province,
@@ -232,6 +566,9 @@ router.post('/', upload.single('image'), async (req, res) => {
       category: normalizedCategory,
       familiasTipo: normalizeFamiliasTipo(normalizedCategory, familiasTipo),
       animalTipo: normalizeAnimalTipo(normalizedCategory, animalTipo),
+      perdidaTipo: normalizePerdidaTipo(normalizedCategory, perdidaTipo),
+      objeto: normalizedCategory === 'cosas_perdidas' ? String(objeto || '').trim().slice(0, 120) : '',
+      contacto: contactoNormalizado || '',
       visibility: visibility || 'public',
       createdBy,
       caseId,
@@ -246,6 +583,11 @@ router.post('/', upload.single('image'), async (req, res) => {
 
     const savedMarker = await newMarker.save();
     await savedMarker.populate('tenant', JURISDICTION_FIELDS);
+    if (savedMarker.status === 'pendiente_aprobacion') {
+      avisarAdminsPorAprobar(savedMarker).catch((err) => {
+        console.error('No se pudo notificar a admins del nuevo caso:', err.message);
+      });
+    }
     res.status(201).json(sanitizeMarkerResponse(savedMarker, adminScope, createdBy));
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -255,7 +597,10 @@ router.post('/', upload.single('image'), async (req, res) => {
 // Ruta para actualizar un marcador existente
 router.put('/:id', upload.single('image'), async (req, res) => {
   const { id } = req.params;
-  const { lat, lng, date, time, description, direccion, status, category, visibility, familiasTipo, animalTipo } = req.body;
+  const {
+    lat, lng, date, time, description, direccion, status, category, visibility,
+    familiasTipo, animalTipo, perdidaTipo, objeto, contacto,
+  } = req.body;
   const { requester, adminScope } = req;
 
   try {
@@ -263,6 +608,7 @@ router.put('/:id', upload.single('image'), async (req, res) => {
     if (!existingMarker) {
       return res.status(404).json({ message: 'Marker not found' });
     }
+    if (rejectIfEliminado(existingMarker, res)) return;
     const markerOwner = normalizeUserId(existingMarker.createdBy);
     if (markerOwner !== requester) {
       return res.status(403).json({ message: 'No autorizado para editar este marcador' });
@@ -278,6 +624,20 @@ router.put('/:id', upload.single('image'), async (req, res) => {
 
     const normalizedStatus = normalizeStatus(status, existingMarker.status);
     const normalizedCategory = normalizeCategory(category, existingMarker.category);
+    if (normalizedCategory === 'cosas_perdidas' && !normalizePerdidaTipo(normalizedCategory, perdidaTipo || existingMarker.perdidaTipo)) {
+      return res.status(400).json({ message: 'Elegí si perdiste o encontraste algo.' });
+    }
+    if (normalizedCategory === 'perros_gatos' && !normalizeAnimalTipo(normalizedCategory, animalTipo || existingMarker.animalTipo)) {
+      return res.status(400).json({ message: 'Elegí de qué se trata el aviso de animales.' });
+    }
+    const contactoFuente = contacto != null ? contacto : existingMarker.contacto;
+    const contactoNormalizado = normalizeContacto(normalizedCategory, contactoFuente);
+    if (normalizedCategory === 'perros_gatos' && !contactoNormalizado) {
+      return res.status(400).json({
+        message: 'En avisos de animales el celular de contacto es obligatorio (para WhatsApp).',
+      });
+    }
+
     const updateData = {
       lat,
       lng,
@@ -289,6 +649,11 @@ router.put('/:id', upload.single('image'), async (req, res) => {
       category: normalizedCategory,
       familiasTipo: normalizeFamiliasTipo(normalizedCategory, familiasTipo),
       animalTipo: normalizeAnimalTipo(normalizedCategory, animalTipo),
+      perdidaTipo: normalizePerdidaTipo(normalizedCategory, perdidaTipo || existingMarker.perdidaTipo),
+      objeto: normalizedCategory === 'cosas_perdidas'
+        ? String(objeto != null ? objeto : existingMarker.objeto || '').trim().slice(0, 120)
+        : '',
+      contacto: contactoNormalizado || '',
       visibility: visibility || existingMarker.visibility || 'public',
       resolvedAt: computeResolvedAt(normalizedStatus, existingMarker.resolvedAt),
     };
@@ -318,13 +683,16 @@ router.put('/:id', upload.single('image'), async (req, res) => {
   }
 });
 
-// Ruta para eliminar un marcador
+// Baja lógica: sale del mapa/listas activas pero queda en el registro
 router.delete('/:id', async (req, res) => {
   const { requester, adminScope } = req;
   try {
     const existingMarker = await Marker.findById(req.params.id);
     if (!existingMarker) {
       return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (existingMarker.eliminadoAt) {
+      return res.status(400).json({ message: 'Este caso ya está en el registro de eliminados' });
     }
     const markerOwner = normalizeUserId(existingMarker.createdBy);
     const esAdminDelCaso = canManageMarker(adminScope, existingMarker);
@@ -340,21 +708,216 @@ router.delete('/:id', async (req, res) => {
       });
     }
 
-    await existingMarker.deleteOne();
-    res.json({ message: 'Marker deleted' });
+    const motivo = String(req.body?.motivo || req.query?.motivo || '').trim().slice(0, 400);
+    existingMarker.eliminadoAt = new Date();
+    existingMarker.eliminadoPor = requester;
+    existingMarker.motivoEliminacion = motivo
+      || (esAdminDelCaso && markerOwner !== requester
+        ? 'Eliminado por administrador (baja lógica)'
+        : 'Eliminado por el vecino (baja lógica)');
+    await existingMarker.save();
+    await existingMarker.populate('tenant', JURISDICTION_FIELDS);
+
+    try {
+      if (esAdminDelCaso && markerOwner !== requester && markerOwner !== 'anonimo') {
+        await crearNotificacion({
+          userId: markerOwner,
+          markerId: existingMarker._id,
+          caseId: existingMarker.caseId,
+          tipo: 'estado',
+          mensaje: `Tu caso #${existingMarker.caseId} fue dado de baja y ya no aparece en el mapa.`,
+        });
+      }
+    } catch (errorNotif) {
+      console.error('No se pudo notificar la baja lógica:', errorNotif.message);
+    }
+
+    res.json({
+      message: 'Caso dado de baja (queda en el registro)',
+      marker: sanitizeMarkerResponse(existingMarker, adminScope, requester),
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// ----- Rutas de administrador -----
+// Contadores livianos para el dashboard (sin traer los documentos)
+router.get('/admin/stats', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const geo = buildManagedMarkersFilter(req.adminScope);
+    const conGeo = (extra) => (
+      req.adminScope.isSuperAdmin ? extra : { $and: [geo, extra] }
+    );
+    // Reportes / Cosas perdidas / Activos: solo casos ya aprobados (no pendientes ni rechazados)
+    const publicados = {
+      eliminadoAt: null,
+      status: { $nin: ['pendiente_aprobacion', 'rechazado'] },
+    };
+    const urgentesFiltro = conGeo({
+      eliminadoAt: null,
+      category: 'reparaciones',
+      status: { $in: ['pendiente', 'en_proceso'] },
+      'confirmations.0': { $exists: true },
+    });
+    const resolucionFiltro = conGeo({
+      eliminadoAt: null,
+      resolvedBy: { $nin: [null, ''] },
+      status: { $ne: 'resuelto' },
+    });
+    const respuestasFiltro = conGeo({
+      eliminadoAt: null,
+      respuestaDatosAt: { $ne: null },
+      status: { $nin: ['resuelto', 'rechazado'] },
+    });
+    const recientesFiltro = conGeo({
+      eliminadoAt: null,
+      status: { $ne: 'rechazado' },
+    });
+
+    const [
+      total,
+      reportes,
+      perdidas,
+      porAprobar,
+      enProceso,
+      registro,
+      nuevosReportes,
+      nuevasPerdidas,
+      urgentes,
+      resueltosVecino,
+      respuestasDatos,
+      recientesDocs,
+    ] = await Promise.all([
+      Marker.countDocuments(conGeo({ ...publicados })),
+      Marker.countDocuments(conGeo({ ...publicados, category: { $ne: 'cosas_perdidas' } })),
+      Marker.countDocuments(conGeo({ ...publicados, category: 'cosas_perdidas' })),
+      Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente_aprobacion' })),
+      Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'en_proceso' })),
+      Marker.countDocuments(conGeo({ eliminadoAt: { $ne: null } })),
+      Marker.countDocuments(conGeo({
+        ...publicados,
+        nuevoParaAdmin: true,
+        category: { $ne: 'cosas_perdidas' },
+      })),
+      Marker.countDocuments(conGeo({
+        ...publicados,
+        nuevoParaAdmin: true,
+        category: 'cosas_perdidas',
+      })),
+      Marker.countDocuments(urgentesFiltro),
+      Marker.countDocuments(resolucionFiltro),
+      Marker.countDocuments(respuestasFiltro),
+      Marker.find(recientesFiltro)
+        .select('-image -resolutionImage -confirmations.image')
+        .populate('tenant', JURISDICTION_FIELDS)
+        .sort({ createdAt: -1 })
+        .limit(5),
+    ]);
+
+    const recientes = recientesDocs
+      .filter((marker) => canManageMarker(req.adminScope, marker))
+      .map((marker) => sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+
+    res.json({
+      total,
+      reportes,
+      perdidas,
+      porAprobar,
+      enProceso,
+      registro,
+      nuevosReportes,
+      nuevasPerdidas,
+      urgentes,
+      resueltosVecino,
+      respuestasDatos,
+      recientes,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Marca como vistos los casos nuevos del admin (limpia el badge al abrir la sección)
+router.patch('/admin/marcar-vistos', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const seccion = String(req.body?.seccion || req.query?.seccion || '').trim();
+    const geo = buildManagedMarkersFilter(req.adminScope);
+    const base = {
+      eliminadoAt: null,
+      nuevoParaAdmin: true,
+      status: { $nin: ['pendiente_aprobacion', 'rechazado'] },
+    };
+    if (seccion === 'cosas_perdidas') {
+      base.category = 'cosas_perdidas';
+    } else if (seccion === 'reportes') {
+      base.category = { $ne: 'cosas_perdidas' };
+    } else {
+      return res.status(400).json({ message: 'Indicá la sección: reportes o cosas_perdidas' });
+    }
+    const filtro = req.adminScope.isSuperAdmin ? base : { $and: [geo, base] };
+    const result = await Marker.updateMany(filtro, { $set: { nuevoParaAdmin: false } });
+    res.json({
+      message: 'Casos marcados como vistos',
+      modificados: result.modifiedCount || 0,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 router.get('/admin', requireJurisdictionAdmin, async (req, res) => {
   try {
-    const markers = await Marker.find(buildManagedMarkersFilter(req.adminScope))
-      .select('-image -resolutionImage -confirmations.image')
-      .populate('tenant', JURISDICTION_FIELDS)
-      .sort({ createdAt: -1 });
-    res.json(markers.map((marker) => sanitizeMarkerResponse(marker, req.adminScope, req.requester)));
+    const { page, limit, skip } = parsePageLimit(req.query, LIMITE_ADMIN_DEFAULT);
+    const soloEliminados = req.query.eliminados === '1' || req.query.eliminados === 'true'
+      || req.query.soloEliminados === '1';
+    const atencion = String(req.query.atencion || '').trim();
+    const filtro = buildListQuery({
+      requester: req.requester,
+      adminScope: req.adminScope,
+      category: req.query.category,
+      excludeCategory: req.query.excludeCategory,
+      animalTipo: req.query.animalTipo,
+      perdidaTipo: req.query.perdidaTipo,
+      // Los atajos de atención ya filtran por estado
+      status: (atencion === 'urgentes' || atencion === 'resolucion' || atencion === 'respuestas')
+        ? undefined
+        : req.query.status,
+      mine: req.query.mine,
+      q: req.query.q,
+      atencion,
+      tipoCierre: req.query.tipoCierre,
+      periodoDias: req.query.periodoDias,
+      fechaDesde: req.query.fechaDesde,
+      fechaHasta: req.query.fechaHasta,
+      soloAdminScope: true,
+      soloEliminados,
+    });
+
+    const orden = soloEliminados
+      ? { eliminadoAt: -1, createdAt: -1 }
+      : { nuevoParaAdmin: -1, createdAt: -1 };
+
+    const [total, markers] = await Promise.all([
+      Marker.countDocuments(filtro),
+      Marker.find(filtro)
+        .select('-image -resolutionImage -confirmations.image')
+        .populate('tenant', JURISDICTION_FIELDS)
+        .sort(orden)
+        .skip(skip)
+        .limit(limit),
+    ]);
+
+    const items = markers
+      .filter((marker) => canManageMarker(req.adminScope, marker))
+      .map((marker) => sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+
+    res.json({
+      items,
+      total,
+      page,
+      limit,
+      hasMore: skip + limit < total,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -366,14 +929,40 @@ router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => 
     return res.status(400).json({ message: 'Estado requerido' });
   }
   const normalizedStatus = normalizeStatus(status);
+  const descripcionCierre = String(req.body.descripcion || req.body.motivo || '').trim();
   try {
     const marker = await Marker.findById(req.params.id);
     if (!marker) {
       return res.status(404).json({ message: 'Marker not found' });
     }
+    if (rejectIfEliminado(marker, res)) return;
     if (!canManageMarker(req.adminScope, marker)) {
       return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
+    // Cerrar caso: descripción obligatoria + pasa al registro de inmediato
+    if (normalizedStatus === 'resuelto') {
+      if (descripcionCierre.length < 5) {
+        return res.status(400).json({
+          message: 'Escribí una breve descripción del cierre para notificar al vecino',
+        });
+      }
+      marker.status = 'resuelto';
+      marker.resolvedAt = new Date();
+      marker.resolutionDescription = descripcionCierre;
+      marker.eliminadoAt = new Date();
+      marker.eliminadoPor = req.requester;
+      marker.motivoEliminacion = `Cierre del administrador: ${descripcionCierre}`;
+      marker.nuevoParaAdmin = false;
+      await marker.save();
+      await marker.populate('tenant', JURISDICTION_FIELDS);
+      const caso = marker.caseId ? `#${marker.caseId}` : '';
+      await avisarPartesCaso(
+        marker,
+        `Tu caso ${caso} fue cerrado por el administrador y pasó al registro. ${descripcionCierre}`
+      ).catch(() => {});
+      return res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+    }
+
     const estadoAnterior = marker.status;
     const updatedMarker = await Marker.findByIdAndUpdate(
       marker._id,
@@ -401,6 +990,7 @@ router.patch('/admin/:id/avisar', requireJurisdictionAdmin, async (req, res) => 
     if (!marker) {
       return res.status(404).json({ message: 'Marker not found' });
     }
+    if (rejectIfEliminado(marker, res)) return;
     if (!canManageMarker(req.adminScope, marker)) {
       return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
@@ -431,6 +1021,7 @@ router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) =>
     if (!marker) {
       return res.status(404).json({ message: 'Marker not found' });
     }
+    if (rejectIfEliminado(marker, res)) return;
     if (!canManageMarker(req.adminScope, marker)) {
       return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
@@ -443,6 +1034,8 @@ router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) =>
       {
         status: 'pendiente',
         resolvedAt: null,
+        aprobadoAt: new Date(),
+        nuevoParaAdmin: true,
       },
       { new: true }
     ).populate('tenant', JURISDICTION_FIELDS);
@@ -451,7 +1044,54 @@ router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) =>
     } catch (errorNotif) {
       console.error('No se pudo crear la notificación de aprobación:', errorNotif.message);
     }
+    avisarAdminsCasoAprobado(updatedMarker).catch((err) => {
+      console.error('No se pudo notificar admins del caso aprobado:', err.message);
+    });
     res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// No aprobar / anular: casos que no corresponden
+router.patch('/admin/:id/rechazar', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (marker.status === 'rechazado') {
+      return res.status(400).json({ message: 'Este caso ya está rechazado' });
+    }
+    if (marker.status === 'resuelto') {
+      return res.status(400).json({ message: 'No se puede anular un caso ya resuelto' });
+    }
+    const motivo = String(req.body.motivo || '').trim().slice(0, 400);
+    const estadoAnterior = marker.status;
+    marker.status = 'rechazado';
+    marker.resolvedAt = null;
+    // Anulado: sale del mapa y pasa al Registro
+    marker.eliminadoAt = new Date();
+    marker.eliminadoPor = req.requester;
+    marker.motivoEliminacion = motivo
+      ? `Anulado: ${motivo}`
+      : 'Anulado por el administrador';
+    marker.nuevoParaAdmin = false;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    try {
+      await avisarRechazo(marker, motivo);
+    } catch (errorNotif) {
+      console.error('No se pudo notificar el rechazo:', errorNotif.message);
+      try {
+        await avisarCambioEstado(marker, estadoAnterior, 'rechazado');
+      } catch (_) { /* ignore */ }
+    }
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -520,6 +1160,7 @@ router.post('/:id/report-resolved', upload.single('image'), async (req, res) => 
       resolvedBy: req.requester,
       resolvedByReportedAt: new Date(),
       resolutionDescription,
+      nuevoParaAdmin: true,
     };
     if (req.file) {
       cambios.resolutionImage = {
@@ -610,6 +1251,469 @@ router.get('/:id/confirmations/:index/image', async (req, res) => {
     res.set('Content-Type', confirmacion.image.contentType || 'application/octet-stream');
     res.set('Cache-Control', 'private, max-age=3600');
     res.send(confirmacion.image.data);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ----- Cosas perdidas: reclamo + chat -----
+router.post('/:id/reclamar', async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (marker.category !== 'cosas_perdidas') {
+      return res.status(400).json({ message: 'Solo se puede reclamar un aviso de cosas perdidas' });
+    }
+    if (marker.status !== 'pendiente' && marker.status !== 'en_proceso') {
+      return res.status(400).json({ message: 'Este aviso todavía no está publicado o ya se cerró' });
+    }
+    if (normalizeUserId(marker.createdBy) === req.requester) {
+      return res.status(400).json({ message: 'Este aviso es tuyo' });
+    }
+    const yaReclamo = (marker.claims || []).some(
+      (claim) => normalizeUserId(claim.userId) === req.requester
+    );
+    if (!yaReclamo) {
+      const nombre = await nombreDesdeUsuario(req.requester);
+      marker.claims.push({
+        userId: req.requester,
+        nombre,
+        createdAt: new Date(),
+      });
+      await marker.save();
+      const caso = marker.caseId ? `#${marker.caseId}` : '';
+      try {
+        await crearNotificacion({
+          userId: marker.createdBy,
+          markerId: marker._id,
+          caseId: marker.caseId,
+          tipo: 'reclamo',
+          mensaje: `${nombre} cree que el aviso ${caso} es suyo y quiere chatear.`,
+        });
+      } catch (errorNotif) {
+        console.error('No se pudo notificar el reclamo:', errorNotif.message);
+      }
+    }
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Cierra quien perdió el objeto (una sola marca: "Ya lo recuperé")
+router.patch('/:id/resolver-perdida', async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (marker.category !== 'cosas_perdidas') {
+      return res.status(400).json({ message: 'Solo aplica a avisos de cosas perdidas' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (marker.status === 'resuelto') {
+      await marker.populate('tenant', JURISDICTION_FIELDS);
+      return res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+    }
+    if (marker.status !== 'pendiente' && marker.status !== 'en_proceso') {
+      return res.status(400).json({ message: 'Este aviso todavía no está publicado o ya se cerró' });
+    }
+    if (!(marker.claims || []).length) {
+      return res.status(400).json({ message: 'Todavía no hay un vecino que haya reclamado' });
+    }
+
+    const duenoId = normalizeUserId(marker.createdBy);
+    const esDueno = duenoId === req.requester;
+    const esReclamante = (marker.claims || []).some(
+      (claim) => normalizeUserId(claim.userId) === req.requester
+    );
+    // Quien perdió: dueño si publicó "Perdí", o reclamante si el aviso es "Encontré"
+    const soyQuienPerdio = marker.perdidaTipo === 'perdi' ? esDueno : esReclamante;
+    if (!soyQuienPerdio) {
+      return res.status(403).json({
+        message: 'Solo quien había perdido el objeto puede marcar que ya lo recuperó',
+      });
+    }
+
+    const abrioChat = (marker.chatAbiertoPor || []).some(
+      (id) => normalizeUserId(id) === req.requester
+    );
+    if (!abrioChat) {
+      return res.status(400).json({
+        message: 'Primero abrí el chat del reclamo. Después vas a poder marcar que ya lo recuperaste.',
+      });
+    }
+
+    if (!Array.isArray(marker.confirmacionesPerdida)) {
+      marker.confirmacionesPerdida = [];
+    }
+    const yaConfirmo = marker.confirmacionesPerdida.some(
+      (c) => normalizeUserId(c.userId) === req.requester
+    );
+    if (!yaConfirmo) {
+      marker.confirmacionesPerdida.push({
+        userId: req.requester,
+        accion: 'recupere',
+        createdAt: new Date(),
+      });
+    }
+
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    marker.status = 'resuelto';
+    marker.resolvedAt = new Date();
+    marker.resolvedBy = req.requester;
+    marker.resolvedByReportedAt = new Date();
+    marker.resolutionDescription = 'Quien había perdido el objeto confirmó que ya lo recuperó.';
+    marker.eliminadoAt = new Date();
+    marker.eliminadoPor = req.requester;
+    marker.motivoEliminacion = 'Cierre: el dueño del objeto confirmó que lo recuperó';
+    marker.nuevoParaAdmin = false;
+
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+
+    await avisarPartesCaso(
+      marker,
+      `El caso ${caso} de cosas perdidas quedó resuelto: ya recuperaron el objeto. Pasó al registro.`,
+      'estado'
+    ).catch(() => {});
+
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.get('/:id/chat', async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (marker.category !== 'cosas_perdidas') {
+      return res.status(400).json({ message: 'Este caso no tiene chat de reclamo' });
+    }
+    if (!puedeLeerChat(marker, req.requester, req.adminScope)) {
+      return res.status(403).json({ message: 'No tenés acceso a este chat' });
+    }
+    // Registrar que el participante abrió el chat (habilita botones de cierre)
+    if (puedeEscribirChat(marker, req.requester)) {
+      const ya = (marker.chatAbiertoPor || []).some(
+        (id) => normalizeUserId(id) === req.requester
+      );
+      if (!ya) {
+        marker.chatAbiertoPor = [...(marker.chatAbiertoPor || []), req.requester];
+        await marker.save();
+      }
+    }
+    const mensajes = await ChatMensaje.find({ markerId: marker._id })
+      .select('-image.data')
+      .sort({ createdAt: 1 })
+      .limit(200)
+      .lean();
+    const casoCerrado = marker.status === 'resuelto'
+      || marker.status === 'rechazado'
+      || !!marker.eliminadoAt;
+    const esParticipante = puedeEscribirChat(marker, req.requester);
+    // Cerrado o admin (no participante): solo historial, sin escribir
+    const soloLectura = casoCerrado || !esParticipante;
+    const abrioChat = (marker.chatAbiertoPor || []).some(
+      (id) => normalizeUserId(id) === req.requester
+    );
+    res.json({
+      markerId: marker._id,
+      caseId: marker.caseId,
+      soloLectura,
+      chatAbiertoPorMi: abrioChat || esParticipante,
+      mensajes: mensajes.map((m) => ({
+        id: m._id,
+        userId: m.userId,
+        nombre: m.nombre || '',
+        texto: m.texto || '',
+        createdAt: m.createdAt,
+        mio: normalizeUserId(m.userId) === req.requester,
+        imageUrl: m.tieneImagen
+          ? `/api/markers/${marker._id}/chat/${m._id}/image`
+          : null,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.get('/:id/chat/:mensajeId/image', async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id).select('category createdBy claims tenant province');
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    // <img> no puede mandar x-user-id: aceptamos ?userId= como en el resto del auth local
+    const viewer = normalizeUserId(req.query.userId || req.requester);
+    const adminScope = viewer
+      ? (viewer === req.requester ? req.adminScope : await getAdminScope(viewer))
+      : null;
+    if (!puedeLeerChat(marker, viewer, adminScope || req.adminScope)) {
+      return res.status(403).json({ message: 'No tenés acceso a este chat' });
+    }
+    const mensaje = await ChatMensaje.findOne({
+      _id: req.params.mensajeId,
+      markerId: marker._id,
+    }).select('image');
+    if (!mensaje?.image?.data) {
+      return res.status(404).json({ message: 'Imagen no encontrada' });
+    }
+    const buffer = Buffer.isBuffer(mensaje.image.data)
+      ? mensaje.image.data
+      : Buffer.from(mensaje.image.data.buffer || mensaje.image.data);
+    res.set('Content-Type', mensaje.image.contentType || 'image/jpeg');
+    res.set('Cache-Control', 'private, max-age=3600');
+    return res.send(buffer);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.post('/:id/chat', upload.single('image'), async (req, res) => {
+  try {
+    const texto = String(req.body.texto || '').trim();
+    if (!texto && !req.file) {
+      return res.status(400).json({ message: 'Escribí un mensaje o adjuntá una foto' });
+    }
+    if (texto.length > 1000) {
+      return res.status(400).json({ message: 'El mensaje es demasiado largo' });
+    }
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (marker.category !== 'cosas_perdidas') {
+      return res.status(400).json({ message: 'Este caso no tiene chat de reclamo' });
+    }
+    if (marker.status === 'resuelto' || marker.eliminadoAt) {
+      return res.status(400).json({ message: 'El caso ya está cerrado' });
+    }
+    // Solo dueño (con reclamo) o reclamante — el admin solo lee historial
+    if (!puedeEscribirChat(marker, req.requester)) {
+      return res.status(403).json({ message: 'Solo los vecinos del reclamo pueden escribir en este chat' });
+    }
+    const esDueno = normalizeUserId(marker.createdBy) === req.requester;
+    const esReclamante = (marker.claims || []).some(
+      (claim) => normalizeUserId(claim.userId) === req.requester
+    );
+    if (esDueno && !(marker.claims || []).length) {
+      return res.status(400).json({ message: 'Todavía no hay un vecino que haya reclamado' });
+    }
+    if (!esDueno && !esReclamante) {
+      return res.status(403).json({ message: 'No tenés acceso a este chat' });
+    }
+
+    const nombre = await nombreDesdeUsuario(req.requester);
+    const payload = {
+      markerId: marker._id,
+      userId: req.requester,
+      nombre,
+      texto: texto || (req.file ? '📷 Foto' : ''),
+      tieneImagen: Boolean(req.file),
+    };
+    if (req.file) {
+      payload.image = {
+        data: req.file.buffer,
+        contentType: req.file.mimetype || 'image/jpeg',
+      };
+    }
+    const mensaje = await ChatMensaje.create(payload);
+
+    const destinatarios = new Set();
+    destinatarios.add(normalizeUserId(marker.createdBy));
+    (marker.claims || []).forEach((claim) => destinatarios.add(normalizeUserId(claim.userId)));
+    destinatarios.delete(req.requester);
+    destinatarios.delete('anonimo');
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    await Promise.allSettled(
+      [...destinatarios].map((userId) => crearNotificacion({
+        userId,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tipo: 'chat',
+        mensaje: req.file
+          ? `Nueva foto en el reclamo ${caso}.`
+          : `Nuevo mensaje en el reclamo ${caso}.`,
+      }))
+    );
+
+    res.status(201).json({
+      id: mensaje._id,
+      userId: mensaje.userId,
+      nombre: mensaje.nombre,
+      texto: mensaje.texto,
+      createdAt: mensaje.createdAt,
+      mio: true,
+      imageUrl: mensaje.tieneImagen
+        ? `/api/markers/${marker._id}/chat/${mensaje._id}/image`
+        : null,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.patch('/admin/:id/pedir-datos', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (marker.status === 'resuelto' || marker.status === 'rechazado') {
+      return res.status(400).json({ message: 'Este caso ya está cerrado' });
+    }
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    const nota = String(req.body.mensaje || '').trim().slice(0, 500);
+    if (nota.length < 5) {
+      return res.status(400).json({
+        message: 'Escribí qué datos necesitás (al menos unas palabras)',
+      });
+    }
+    // No cambia el estado: En proceso es solo cuando el municipio actúa
+    marker.pideDatosMensaje = nota;
+    marker.pideDatosAt = new Date();
+    await marker.save();
+    await crearNotificacion({
+      userId: marker.createdBy,
+      markerId: marker._id,
+      caseId: marker.caseId,
+      tipo: 'pedir_datos',
+      mensaje: `Te piden más datos del caso ${caso}: ${nota}`,
+    });
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// El vecino responde al pedido de datos (descripción y/o foto)
+router.patch('/:id/responder-datos', upload.single('image'), async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (normalizeUserId(marker.createdBy) !== req.requester) {
+      return res.status(403).json({ message: 'Solo quien publicó el caso puede responder' });
+    }
+    if (!marker.pideDatosAt) {
+      return res.status(400).json({ message: 'No hay un pedido de datos pendiente' });
+    }
+    if (marker.status === 'resuelto' || marker.status === 'rechazado') {
+      return res.status(400).json({ message: 'Este caso ya está cerrado' });
+    }
+    const descripcion = String(req.body.description || req.body.descripcion || '').trim();
+    if (descripcion.length < 5 && !req.file) {
+      return res.status(400).json({
+        message: 'Agregá una descripción o una foto para responder',
+      });
+    }
+    if (descripcion.length >= 5) {
+      marker.description = descripcion.slice(0, 2000);
+    }
+    if (req.file) {
+      marker.image = {
+        data: req.file.buffer,
+        contentType: req.file.mimetype || 'application/octet-stream',
+      };
+      marker.imageUrl = `/api/markers/${marker._id}/image`;
+    }
+    marker.pideDatosMensaje = '';
+    marker.pideDatosAt = null;
+    marker.respuestaDatosAt = new Date();
+    marker.ultimaRespuestaDatosAt = marker.respuestaDatosAt;
+    marker.nuevoParaAdmin = true;
+    await marker.save();
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    const admins = await listarAdminsDelCaso(marker);
+    for (const admin of admins) {
+      await crearNotificacion({
+        userId: admin,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tipo: 'respuesta_datos',
+        mensaje: `El vecino respondió al pedido de datos del caso ${caso}. Revisalo en Reportes.`,
+      }).catch(() => {});
+    }
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Vecino renueva una publicación vencida (vuelve al mapa 15 días más)
+router.patch('/:id/renovar', async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (normalizeUserId(marker.createdBy) !== req.requester) {
+      return res.status(403).json({ message: 'Solo quien publicó el aviso puede renovarlo' });
+    }
+    if (marker.category !== 'perros_gatos' && marker.category !== 'cosas_perdidas') {
+      return res.status(400).json({ message: 'Solo se pueden renovar avisos de animales o cosas perdidas' });
+    }
+    const motivo = String(marker.motivoEliminacion || '').toLowerCase();
+    const esVencido = Boolean(marker.eliminadoAt) && motivo.includes('vencimiento');
+    if (!esVencido) {
+      return res.status(400).json({
+        message: 'Solo se pueden renovar publicaciones vencidas',
+      });
+    }
+    marker.eliminadoAt = null;
+    marker.eliminadoPor = null;
+    marker.motivoEliminacion = '';
+    marker.status = 'pendiente';
+    marker.aprobadoAt = new Date();
+    marker.resolvedAt = null;
+    marker.nuevoParaAdmin = true;
+    await marker.save();
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    await crearNotificacion({
+      userId: marker.createdBy,
+      markerId: marker._id,
+      caseId: marker.caseId,
+      tipo: 'renovado',
+      mensaje: `Renovaste tu publicación ${caso}. Vuelve a estar visible 15 días más.`,
+    }).catch(() => {});
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Admin abrió la ficha tras una respuesta de datos
+router.patch('/admin/:id/visto-respuesta', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    marker.respuestaDatosAt = null;
+    marker.nuevoParaAdmin = false;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

@@ -1,7 +1,14 @@
 import React from 'react';
 import MapComponent from './MapComponent';
 
-const Home = ({ correoUsuario, panelVecino, onPanelVecinoVisto, onNoLeidasChange }) => {
+const Home = ({
+  correoUsuario,
+  panelVecino,
+  onPanelVecinoVisto,
+  onNoLeidasChange,
+  focoCasoMapa = null,
+  onFocoCasoVisto,
+}) => {
   const GOOGLE_MAPS_API_KEY = 'AIzaSyBKHbs5m_qsi4sd80epFp-mLP8KSFixk_4';
 
   return (
@@ -13,6 +20,8 @@ const Home = ({ correoUsuario, panelVecino, onPanelVecinoVisto, onNoLeidasChange
           panelVecino={panelVecino}
           onPanelVecinoVisto={onPanelVecinoVisto}
           onNoLeidasChange={onNoLeidasChange}
+          focoCasoMapa={focoCasoMapa}
+          onFocoCasoVisto={onFocoCasoVisto}
         />
       </div>
     </div>

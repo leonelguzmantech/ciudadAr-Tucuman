@@ -14,12 +14,13 @@ router.get('/markers', async (req, res) => {
     const filters = {
       visibility: 'public',
       category: { $nin: ['familias', 'persona'] },
-      status: { $ne: 'pendiente_aprobacion' },
+      status: { $nin: ['pendiente_aprobacion', 'rechazado'] },
+      eliminadoAt: null,
     };
     if (tenant) {
       filters.tenant = tenant._id;
     }
-    if (status && status !== 'pendiente_aprobacion') {
+    if (status && status !== 'pendiente_aprobacion' && status !== 'rechazado') {
       filters.status = status;
     }
     if (category && category !== 'familias' && category !== 'persona') {

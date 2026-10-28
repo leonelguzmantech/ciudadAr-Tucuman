@@ -6,6 +6,7 @@ import Home from '../src/components/Home';
 import VerificarEmail from '../src/components/VerificarEmail';
 import CompletarCelular from '../src/components/CompletarCelular';
 import Barra from '../src/components/Barra';
+import AdminDashboard from '../src/components/AdminDashboard';
 import './App.css';
 import axios from 'axios';
 
@@ -19,12 +20,23 @@ function App() {
   const [tieneCelular, setTieneCelular] = useState(false);
   const [panelVecino, setPanelVecino] = useState(null);
   const [noLeidas, setNoLeidas] = useState(0);
+  const [esAdmin, setEsAdmin] = useState(false);
+  const [rolListo, setRolListo] = useState(false);
+  // Por defecto el admin entra al dashboard; puede pasar a vista vecino (mapa) si hace falta
+  const [vistaAdmin, setVistaAdmin] = useState('dashboard');
+  // Caso a enfocar en el mapa vecino (desde "Ver en el mapa" del dashboard)
+  const [focoCasoMapa, setFocoCasoMapa] = useState(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (usuariofirebase) => {
       setUsuario(usuariofirebase);
       setCorreoConfirmado(!!usuariofirebase?.emailVerified);
       setSesionLista(true);
+      if (!usuariofirebase) {
+        setEsAdmin(false);
+        setRolListo(false);
+        setVistaAdmin('dashboard');
+      }
     });
 
     return () => unsubscribe();
@@ -58,6 +70,31 @@ function App() {
     };
   }, [usuario, correoConfirmado]);
 
+  useEffect(() => {
+    if (!usuario?.email || !correoConfirmado || !tieneCelular) {
+      setEsAdmin(false);
+      setRolListo(false);
+      return undefined;
+    }
+    let cancelado = false;
+    setRolListo(false);
+    axios.get('http://localhost:5001/api/auth/me', {
+      headers: { 'x-user-id': usuario.email },
+    }).then((respuesta) => {
+      if (cancelado) return;
+      setEsAdmin(!!respuesta.data.isAdmin);
+      setRolListo(true);
+      if (respuesta.data.isAdmin) setVistaAdmin('dashboard');
+    }).catch(() => {
+      if (cancelado) return;
+      setEsAdmin(false);
+      setRolListo(true);
+    });
+    return () => {
+      cancelado = true;
+    };
+  }, [usuario, correoConfirmado, tieneCelular]);
+
   if (!sesionLista) {
     return <div className="cargando-sesion">Cargando...</div>;
   }
@@ -65,7 +102,9 @@ function App() {
   const entroConGoogle = !!usuario?.providerData?.some((dato) => dato.providerId === 'google.com')
     && !usuario?.providerData?.some((dato) => dato.providerId === 'password');
 
-  const enMapa = !!(usuario && correoConfirmado && cuentaLista && tieneCelular);
+  const sesionCompleta = !!(usuario && correoConfirmado && cuentaLista && tieneCelular);
+  const enDashboardAdmin = !!(sesionCompleta && rolListo && esAdmin && vistaAdmin === 'dashboard');
+  const enMapaVecino = !!(sesionCompleta && rolListo && (!esAdmin || vistaAdmin === 'mapa'));
 
   let pantalla = <Login />;
   if (usuario && correoConfirmado && !cuentaLista) {
@@ -79,6 +118,18 @@ function App() {
         onListo={() => setTieneCelular(true)}
       />
     );
+  } else if (usuario && correoConfirmado && !rolListo) {
+    pantalla = <div className="cargando-sesion">Cargando...</div>;
+  } else if (enDashboardAdmin) {
+    pantalla = (
+      <AdminDashboard
+        userId={usuario.email}
+        onSalirMapaVecino={() => {
+          setFocoCasoMapa(null);
+          setVistaAdmin('mapa');
+        }}
+      />
+    );
   } else if (usuario && correoConfirmado) {
     pantalla = (
       <Home
@@ -86,6 +137,13 @@ function App() {
         panelVecino={panelVecino}
         onPanelVecinoVisto={() => setPanelVecino(null)}
         onNoLeidasChange={setNoLeidas}
+        esAdmin={esAdmin}
+        onAbrirDashboardAdmin={esAdmin ? () => {
+          setFocoCasoMapa(null);
+          setVistaAdmin('dashboard');
+        } : undefined}
+        focoCasoMapa={focoCasoMapa}
+        onFocoCasoVisto={() => setFocoCasoMapa(null)}
       />
     );
   } else if (usuario) {
@@ -93,18 +151,20 @@ function App() {
   }
 
   return (
-    <div className={enMapa ? 'app-shell' : undefined}>
-      {usuario && (
+    <div className={enMapaVecino ? 'app-shell' : (enDashboardAdmin ? 'app-shell app-shell-admin' : undefined)}>
+      {usuario && enMapaVecino && (
         <Barra
           usuario={usuario}
           noLeidas={noLeidas}
-          conSidebar={enMapa}
+          conSidebar
+          esAdmin={esAdmin}
           onFiltros={() => setPanelVecino('filtros')}
           onMisReportes={() => setPanelVecino('mis-reportes')}
           onNotificaciones={() => setPanelVecino('notificaciones')}
+          onDashboardAdmin={esAdmin ? () => setVistaAdmin('dashboard') : undefined}
         />
       )}
-      <div className={enMapa ? 'app-principal' : undefined}>
+      <div className={enMapaVecino || enDashboardAdmin ? 'app-principal' : undefined}>
         {pantalla}
       </div>
     </div>
