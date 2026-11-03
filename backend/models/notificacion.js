@@ -14,6 +14,12 @@ const notificacionSchema = new mongoose.Schema({
     default: null,
   },
   caseId: { type: Number, default: null },
+  tenantId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Tenant',
+    default: null,
+    index: true,
+  },
   tipo: {
     type: String,
     enum: [
@@ -28,8 +34,10 @@ const notificacionSchema = new mongoose.Schema({
       'por_aprobar',
       'nuevo_reporte',
       'nueva_perdida',
+      'cerca',
       'vencido',
       'renovado',
+      'cuadrilla',
     ],
     required: true,
   },

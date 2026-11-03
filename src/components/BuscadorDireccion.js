@@ -103,12 +103,33 @@ const mapearPhoton = (features) =>
     })
     .filter(Boolean);
 
+const mapearGooglePredictions = (items) =>
+  (items || []).map((p) => {
+    const titulo = p.titulo || String(p.direccion || '').split(',')[0] || 'Lugar';
+    const detalle = p.detalle || '';
+    const direccion = p.direccion || (detalle ? `${titulo}, ${detalle}` : titulo);
+    return {
+      id: `g-${p.placeId}`,
+      placeId: p.placeId,
+      titulo,
+      detalle,
+      direccion,
+      lat: null,
+      lng: null,
+      enTucuman: esTucuman(direccion),
+      km: 0,
+      tipo: 'google',
+      score: esTucuman(direccion) ? 100 : 50,
+    };
+  });
+
 const rankearYFiltrar = (items, { calle = '', numero = '' } = {}) => {
   const calleNorm = calle.toLowerCase();
   const unicos = [];
   const vistos = new Set();
   items.forEach((item) => {
-    const clave = `${item.lat.toFixed(5)},${item.lng.toFixed(5)},${item.titulo}`;
+    const clave = item.placeId
+      || `${Number(item.lat).toFixed(5)},${Number(item.lng).toFixed(5)},${item.titulo}`;
     if (vistos.has(clave)) return;
     vistos.add(clave);
     unicos.push(item);
@@ -116,6 +137,7 @@ const rankearYFiltrar = (items, { calle = '', numero = '' } = {}) => {
 
   return unicos
     .map((item) => {
+      if (item.tipo === 'google') return item;
       let score = 0;
       if (item.enTucuman) score += 40;
       if (item.km < 8) score += 25;
@@ -130,8 +152,45 @@ const rankearYFiltrar = (items, { calle = '', numero = '' } = {}) => {
       return { ...item, score };
     })
     .sort((a, b) => b.score - a.score)
-    .filter((item) => item.km < 120 || item.enTucuman)
+    .filter((item) => item.tipo === 'google' || item.km < 120 || item.enTucuman)
     .slice(0, 7);
+};
+
+const API_GEO = 'http://localhost:5001/api/geocode';
+
+const buscarPrediccionesGoogle = async (consulta, signal) => {
+  try {
+    const res = await fetch(
+      `${API_GEO}/search?q=${encodeURIComponent(consulta)}`,
+      { signal, headers: { Accept: 'application/json' } }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.items) ? data.items : [];
+  } catch (_) {
+    return [];
+  }
+};
+
+const detalleLugarGoogle = async (placeId) => {
+  try {
+    const res = await fetch(
+      `${API_GEO}/place?placeId=${encodeURIComponent(placeId)}`,
+      { headers: { Accept: 'application/json' } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const lat = Number(data.lat);
+    const lng = Number(data.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    return {
+      lat,
+      lng,
+      direccion: data.direccion || '',
+    };
+  } catch (_) {
+    return null;
+  }
 };
 
 const BuscadorDireccion = ({
@@ -214,6 +273,54 @@ const BuscadorDireccion = ({
     actualizarPosicionMenu();
   };
 
+  const buscarConOsmFallback = async (consulta, signal) => {
+    const { calle, numero } = parsearCalleNumero(consulta);
+    const photonUrl =
+      `https://photon.komoot.io/api/?q=${encodeURIComponent(consulta)}` +
+      `&lat=${CENTRO_TUCUMAN.lat}&lon=${CENTRO_TUCUMAN.lng}` +
+      `&limit=8&location_bias_scale=0.4`;
+    const nominatimLibre =
+      `https://nominatim.openstreetmap.org/search?format=jsonv2` +
+      `&q=${encodeURIComponent(`${consulta}, Tucumán, Argentina`)}` +
+      `&addressdetails=1&limit=5&countrycodes=ar` +
+      `&viewbox=${VIEWBOX_TUCUMAN}&bounded=1` +
+      `&accept-language=es`;
+
+    const peticiones = [
+      fetch(photonUrl, { signal, headers: { Accept: 'application/json' } })
+        .then((r) => (r.ok ? r.json() : { features: [] }))
+        .catch(() => ({ features: [] })),
+      fetch(nominatimLibre, { signal, headers: { Accept: 'application/json' } })
+        .then((r) => (r.ok ? r.json() : []))
+        .catch(() => []),
+    ];
+
+    if (numero) {
+      const estructurada =
+        `https://nominatim.openstreetmap.org/search?format=jsonv2` +
+        `&street=${encodeURIComponent(`${calle} ${numero}`)}` +
+        `&city=${encodeURIComponent('San Miguel de Tucumán')}` +
+        `&state=${encodeURIComponent('Tucumán')}` +
+        `&country=${encodeURIComponent('Argentina')}` +
+        `&addressdetails=1&limit=5&countrycodes=ar`;
+      peticiones.push(
+        fetch(estructurada, { signal, headers: { Accept: 'application/json' } })
+          .then((r) => (r.ok ? r.json() : []))
+          .catch(() => [])
+      );
+    }
+
+    const [photonData, nomLibre, nomEstructurada = []] = await Promise.all(peticiones);
+    return rankearYFiltrar(
+      [
+        ...mapearPhoton(photonData.features || []),
+        ...mapearNominatim(nomLibre),
+        ...mapearNominatim(nomEstructurada),
+      ],
+      { calle, numero }
+    );
+  };
+
   const buscarDirecciones = async (consulta, seq) => {
     if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
@@ -222,57 +329,19 @@ const BuscadorDireccion = ({
     const signal = controller.signal;
 
     try {
-      const photonUrl =
-        `https://photon.komoot.io/api/?q=${encodeURIComponent(consulta)}` +
-        `&lat=${CENTRO_TUCUMAN.lat}&lon=${CENTRO_TUCUMAN.lng}` +
-        `&limit=8&location_bias_scale=0.4`;
-
-      const nominatimLibre =
-        `https://nominatim.openstreetmap.org/search?format=jsonv2` +
-        `&q=${encodeURIComponent(`${consulta}, Tucumán, Argentina`)}` +
-        `&addressdetails=1&limit=5&countrycodes=ar` +
-        `&viewbox=${VIEWBOX_TUCUMAN}&bounded=1` +
-        `&accept-language=es`;
-
-      const peticiones = [
-        fetch(photonUrl, { signal, headers: { Accept: 'application/json' } })
-          .then((r) => (r.ok ? r.json() : { features: [] }))
-          .catch(() => ({ features: [] })),
-        fetch(nominatimLibre, {
-          signal,
-          headers: { Accept: 'application/json' },
-        })
-          .then((r) => (r.ok ? r.json() : []))
-          .catch(() => []),
-      ];
-
-      if (numero) {
-        const estructurada =
-          `https://nominatim.openstreetmap.org/search?format=jsonv2` +
-          `&street=${encodeURIComponent(`${calle} ${numero}`)}` +
-          `&city=${encodeURIComponent('San Miguel de Tucumán')}` +
-          `&state=${encodeURIComponent('Tucumán')}` +
-          `&country=${encodeURIComponent('Argentina')}` +
-          `&addressdetails=1&limit=5&countrycodes=ar`;
-        peticiones.push(
-          fetch(estructurada, {
-            signal,
-            headers: { Accept: 'application/json' },
-          })
-            .then((r) => (r.ok ? r.json() : []))
-            .catch(() => [])
-        );
-      }
-
-      const [photonData, nomLibre, nomEstructurada = []] = await Promise.all(peticiones);
+      // 1) Google Places API (New) vía backend
+      const predictions = await buscarPrediccionesGoogle(consulta, signal);
       if (seq !== busquedaSeqRef.current) return;
 
-      const combinados = [
-        ...mapearPhoton(photonData.features || []),
-        ...mapearNominatim(nomLibre),
-        ...mapearNominatim(nomEstructurada),
-      ];
-      mostrarResultados(rankearYFiltrar(combinados, { calle, numero }));
+      if (predictions.length) {
+        mostrarResultados(rankearYFiltrar(mapearGooglePredictions(predictions), { calle, numero }));
+        return;
+      }
+
+      // 2) Fallback OSM si Google no devolvió nada / Places no habilitado
+      const osm = await buscarConOsmFallback(consulta, signal);
+      if (seq !== busquedaSeqRef.current) return;
+      mostrarResultados(osm);
     } catch (err) {
       if (err?.name === 'AbortError') return;
       if (seq !== busquedaSeqRef.current) return;
@@ -322,7 +391,23 @@ const BuscadorDireccion = ({
     setAviso('');
   };
 
-  const elegirSugerencia = (item) => {
+  const elegirSugerencia = async (item) => {
+    if (item.tipo === 'google' && item.placeId) {
+      setBuscando(true);
+      const detalle = await detalleLugarGoogle(item.placeId);
+      setBuscando(false);
+      if (!detalle) {
+        setAviso('No se pudo abrir ese lugar. Probá otra sugerencia.');
+        setAbierto(true);
+        return;
+      }
+      confirmarLugar({
+        direccion: detalle.direccion || item.direccion,
+        lat: detalle.lat,
+        lng: detalle.lng,
+      });
+      return;
+    }
     confirmarLugar({
       direccion: item.direccion,
       lat: item.lat,

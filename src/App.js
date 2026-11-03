@@ -7,10 +7,22 @@ import VerificarEmail from '../src/components/VerificarEmail';
 import CompletarCelular from '../src/components/CompletarCelular';
 import Barra from '../src/components/Barra';
 import AdminDashboard from '../src/components/AdminDashboard';
+import SuperDashboard from '../src/components/SuperDashboard';
+import OperarioDashboard from '../src/components/OperarioDashboard';
 import './App.css';
 import axios from 'axios';
 
 const auth = getAuth(appfirebase);
+
+const leerVistaAdmin = () => {
+  try {
+    const guardada = sessionStorage.getItem('ciudadar-vista-admin');
+    if (guardada === 'mapa' || guardada === 'dashboard' || guardada === 'casos') return guardada;
+  } catch {
+    /* ignore */
+  }
+  return 'dashboard';
+};
 
 function App() {
   const [usuario, setUsuario] = useState(null);
@@ -20,12 +32,23 @@ function App() {
   const [tieneCelular, setTieneCelular] = useState(false);
   const [panelVecino, setPanelVecino] = useState(null);
   const [noLeidas, setNoLeidas] = useState(0);
+  const [perdidasNoLeidas, setPerdidasNoLeidas] = useState(0);
   const [esAdmin, setEsAdmin] = useState(false);
+  const [esOperario, setEsOperario] = useState(false);
+  const [rolAdmin, setRolAdmin] = useState('');
   const [rolListo, setRolListo] = useState(false);
-  // Por defecto el admin entra al dashboard; puede pasar a vista vecino (mapa) si hace falta
-  const [vistaAdmin, setVistaAdmin] = useState('dashboard');
+  // dashboard | mapa | casos (super → panel municipal de casos)
+  const [vistaAdmin, setVistaAdmin] = useState(leerVistaAdmin);
   // Caso a enfocar en el mapa vecino (desde "Ver en el mapa" del dashboard)
   const [focoCasoMapa, setFocoCasoMapa] = useState(null);
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem('ciudadar-vista-admin', vistaAdmin);
+    } catch {
+      /* ignore */
+    }
+  }, [vistaAdmin]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (usuariofirebase) => {
@@ -34,6 +57,8 @@ function App() {
       setSesionLista(true);
       if (!usuariofirebase) {
         setEsAdmin(false);
+        setEsOperario(false);
+        setRolAdmin('');
         setRolListo(false);
         setVistaAdmin('dashboard');
       }
@@ -73,6 +98,8 @@ function App() {
   useEffect(() => {
     if (!usuario?.email || !correoConfirmado || !tieneCelular) {
       setEsAdmin(false);
+      setEsOperario(false);
+      setRolAdmin('');
       setRolListo(false);
       return undefined;
     }
@@ -82,12 +109,21 @@ function App() {
       headers: { 'x-user-id': usuario.email },
     }).then((respuesta) => {
       if (cancelado) return;
+      const role = respuesta.data.role || '';
+      const soloOperario = role === 'OPERARIO' || !!respuesta.data.isOperario;
+      setEsOperario(soloOperario);
       setEsAdmin(!!respuesta.data.isAdmin);
+      setRolAdmin(role);
       setRolListo(true);
-      if (respuesta.data.isAdmin) setVistaAdmin('dashboard');
+      // Operario: solo panel cuadrilla (sin vista vecino)
+      if (soloOperario && role === 'OPERARIO') {
+        setVistaAdmin((v) => (v === 'mapa' ? 'dashboard' : v));
+      }
     }).catch(() => {
       if (cancelado) return;
       setEsAdmin(false);
+      setEsOperario(false);
+      setRolAdmin('');
       setRolListo(true);
     });
     return () => {
@@ -103,8 +139,32 @@ function App() {
     && !usuario?.providerData?.some((dato) => dato.providerId === 'password');
 
   const sesionCompleta = !!(usuario && correoConfirmado && cuentaLista && tieneCelular);
-  const enDashboardAdmin = !!(sesionCompleta && rolListo && esAdmin && vistaAdmin === 'dashboard');
-  const enMapaVecino = !!(sesionCompleta && rolListo && (!esAdmin || vistaAdmin === 'mapa'));
+  const esSuper = rolAdmin === 'SUPER_ADMIN';
+  const esSoloOperario = esOperario && rolAdmin === 'OPERARIO';
+  const enPanelAdmin = !!(
+    sesionCompleta && rolListo && esAdmin
+    && (esSoloOperario || vistaAdmin === 'dashboard' || vistaAdmin === 'casos')
+  );
+  const enDashboardAdmin = enPanelAdmin;
+  const enMapaVecino = !!(
+    sesionCompleta && rolListo && !esSoloOperario
+    && (!esAdmin || vistaAdmin === 'mapa')
+  );
+  const irMapaVecino = () => {
+    setFocoCasoMapa(null);
+    setVistaAdmin('mapa');
+  };
+
+  const abrirCasoDesdeNotifAdmin = (foco = {}) => {
+    try {
+      sessionStorage.setItem('ciudadar-super-casos-foco', JSON.stringify(foco || {}));
+    } catch {
+      /* ignore */
+    }
+    setFocoCasoMapa(null);
+    // Super: entrar directo a Operar casos; municipal: su dashboard de casos
+    setVistaAdmin(esSuper ? 'casos' : 'dashboard');
+  };
 
   let pantalla = <Login />;
   if (usuario && correoConfirmado && !cuentaLista) {
@@ -120,14 +180,33 @@ function App() {
     );
   } else if (usuario && correoConfirmado && !rolListo) {
     pantalla = <div className="cargando-sesion">Cargando...</div>;
-  } else if (enDashboardAdmin) {
+  } else if (enPanelAdmin && esSoloOperario) {
+    pantalla = (
+      <OperarioDashboard
+        userId={usuario.email}
+      />
+    );
+  } else if (enPanelAdmin && esSuper && vistaAdmin === 'dashboard') {
+    pantalla = (
+      <SuperDashboard
+        userId={usuario.email}
+        onOperarCasos={(foco = {}) => {
+          try {
+            sessionStorage.setItem('ciudadar-super-casos-foco', JSON.stringify(foco || {}));
+          } catch {
+            /* ignore */
+          }
+          setVistaAdmin('casos');
+        }}
+        onSalirMapaVecino={irMapaVecino}
+      />
+    );
+  } else if (enPanelAdmin) {
     pantalla = (
       <AdminDashboard
         userId={usuario.email}
-        onSalirMapaVecino={() => {
-          setFocoCasoMapa(null);
-          setVistaAdmin('mapa');
-        }}
+        onSalirMapaVecino={irMapaVecino}
+        onVolverSuper={esSuper ? () => setVistaAdmin('dashboard') : undefined}
       />
     );
   } else if (usuario && correoConfirmado) {
@@ -137,11 +216,8 @@ function App() {
         panelVecino={panelVecino}
         onPanelVecinoVisto={() => setPanelVecino(null)}
         onNoLeidasChange={setNoLeidas}
-        esAdmin={esAdmin}
-        onAbrirDashboardAdmin={esAdmin ? () => {
-          setFocoCasoMapa(null);
-          setVistaAdmin('dashboard');
-        } : undefined}
+        onPerdidasNoLeidasChange={setPerdidasNoLeidas}
+        onAbrirCasoAdmin={esAdmin ? abrirCasoDesdeNotifAdmin : null}
         focoCasoMapa={focoCasoMapa}
         onFocoCasoVisto={() => setFocoCasoMapa(null)}
       />
@@ -156,10 +232,13 @@ function App() {
         <Barra
           usuario={usuario}
           noLeidas={noLeidas}
+          perdidasNoLeidas={perdidasNoLeidas}
           conSidebar
           esAdmin={esAdmin}
+          esOperario={esSoloOperario}
           onFiltros={() => setPanelVecino('filtros')}
           onMisReportes={() => setPanelVecino('mis-reportes')}
+          onCosasPerdidas={() => setPanelVecino('cosas-perdidas')}
           onNotificaciones={() => setPanelVecino('notificaciones')}
           onDashboardAdmin={esAdmin ? () => setVistaAdmin('dashboard') : undefined}
         />

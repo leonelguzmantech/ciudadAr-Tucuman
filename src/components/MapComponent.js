@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { GoogleMap, useJsApiLoader, Marker, OverlayView } from '@react-google-maps/api';
+import { GoogleMap, useJsApiLoader, OverlayView, Polyline } from '@react-google-maps/api';
 import axios from 'axios';
 import marcadorCiudad from '../assets/marcador-ciudadar.svg';
 import marcadorCiudadLuz from '../assets/marcador-ciudadar-luz.svg';
+import iconoPatita from '../assets/icono-patita-blanca.png';
 import BuscadorDireccion from './BuscadorDireccion';
 import ChatReclamo from './ChatReclamo';
 import EditorImagen from './EditorImagen';
@@ -16,15 +17,260 @@ const ALTO_LUZ = ANCHO_LUZ * (120 / 112);
 const PUNTA_LUZ_X = ANCHO_LUZ * (56 / 112);
 const PUNTA_LUZ_Y = ALTO_LUZ * (98.6 / 120);
 
-const iconoReporte = () => ({
-  url: marcadorCiudad,
-  scaledSize: new window.google.maps.Size(ANCHO_PIN, ALTO_PIN),
-  anchor: new window.google.maps.Point(ANCHO_PIN / 2, PUNTA_PIN_Y),
-});
+/** Color del pin: misma silueta CiudadAr, distinto acento (sin íconos ruidosos) */
+const COLOR_PIN_CATEGORIA = {
+  reparaciones: '#2F6FDB',
+  cosas_perdidas: '#EA580C',
+  perros_gatos: '#059669',
+  familias: '#DB2777',
+};
+const COLOR_PIN_DEFAULT = '#6AADFF';
+
+const LEYENDA_PINES = [
+  { key: 'reparaciones', label: 'Reparaciones', color: COLOR_PIN_CATEGORIA.reparaciones },
+  { key: 'cosas_perdidas', label: 'Cosas perdidas', color: COLOR_PIN_CATEGORIA.cosas_perdidas },
+  { key: 'perros_gatos', label: 'Animales', color: COLOR_PIN_CATEGORIA.perros_gatos },
+  { key: 'familias', label: 'Familias', color: COLOR_PIN_CATEGORIA.familias },
+];
+
+/** Interior original del pin (rayos CiudadAr) */
+const INTERIOR_PIN_ORIGINAL = [
+  '<circle cx="32" cy="29" r="13.6" fill="none" stroke="#ffffff" stroke-width="2.6"/>',
+  '<g fill="#ffffff">',
+  '<path d="M 32.00 17.50 A 11.5 11.5 0 0 1 40.27 21.01 L 35.00 28.03 Z"/>',
+  '<path d="M 41.96 23.25 A 11.5 11.5 0 0 1 43.05 32.17 L 34.34 31.11 Z"/>',
+  '<path d="M 41.96 34.75 A 11.5 11.5 0 0 1 34.78 40.16 L 31.35 32.08 Z"/>',
+  '<path d="M 32.00 40.50 A 11.5 11.5 0 0 1 23.73 36.99 L 29.00 29.97 Z"/>',
+  '<path d="M 22.04 34.75 A 11.5 11.5 0 0 1 20.95 25.83 L 29.66 26.89 Z"/>',
+  '<path d="M 22.04 23.25 A 11.5 11.5 0 0 1 29.22 17.84 L 32.65 25.92 Z"/>',
+  '</g>',
+].join('');
+
+/** Cabeza del pin de animales: sin círculo; solo la huella PNG encima. */
+const INTERIOR_PIN_ANIMALES = '';
+
+const pinSvgUrlCache = new Map();
+
+const normalizarCategoriaPin = (category) => {
+  const c = String(category || '').trim().toLowerCase();
+  if (COLOR_PIN_CATEGORIA[c]) return c;
+  if (c.includes('animal') || c.includes('perro') || c.includes('gato')) return 'perros_gatos';
+  if (c.includes('perd')) return 'cosas_perdidas';
+  if (c.includes('repar')) return 'reparaciones';
+  if (c.includes('famil') || c.includes('person')) return 'familias';
+  return '';
+};
+
+/** SVG: silueta original + color; animales dejan el círculo libre para la PNG de patita */
+const urlPinCategoria = (category) => {
+  const cat = normalizarCategoriaPin(category);
+  const cacheKey = cat === 'perros_gatos' ? 'perros_gatos-v7-sin-circulo' : (cat || 'default');
+  if (pinSvgUrlCache.has(cacheKey)) return pinSvgUrlCache.get(cacheKey);
+  const color = COLOR_PIN_CATEGORIA[cat] || COLOR_PIN_DEFAULT;
+  const interior = cat === 'perros_gatos'
+    ? INTERIOR_PIN_ANIMALES
+    : `${INTERIOR_PIN_ORIGINAL}<circle cx="32" cy="29" r="3.05" fill="${color}"/>`;
+  const svg = [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 88">',
+    `<path fill="${color}" stroke="#f7fbff" stroke-width="2.6" stroke-linejoin="round" d="M32 5.2c-13.6 0-24.4 10.6-24.4 24.2C7.6 47.6 32 82.6 32 82.6s24.4-35 24.4-53.2C56.4 15.8 45.6 5.2 32 5.2z"/>`,
+    interior,
+    '</svg>',
+  ].join('');
+  const url = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+  pinSvgUrlCache.set(cacheKey, url);
+  return url;
+};
 
 // const libraries = ['marker']; // Eliminado
 const mapLibraries = ['visualization', 'places'];
 const RADIO_MISMO_CASO_METROS = 50;
+const RADIO_LLEGO_DESTINO_METROS = 35;
+const RADIO_PASO_GUIA_METROS = 28;
+const RADIO_FUERA_RUTA_METROS = 55; // si te alejás más → recalcular (estilo Google)
+const RECALC_RUTA_COOLDOWN_MS = 12000;
+
+/** Distancia mínima del punto a la polilínea de la ruta (metros) */
+const distanciaAlPathMetros = (punto, path) => {
+  if (!punto || !path?.length) return Infinity;
+  if (path.length === 1) {
+    return distanciaMetros(punto.lat, punto.lng, path[0].lat, path[0].lng);
+  }
+  const toXY = (q) => {
+    const cos = Math.cos((punto.lat * Math.PI) / 180);
+    return {
+      x: q.lng * cos * 111320,
+      y: q.lat * 110540,
+    };
+  };
+  let min = Infinity;
+  const P = toXY(punto);
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const a = path[i];
+    const b = path[i + 1];
+    const A = toXY(a);
+    const B = toXY(b);
+    const ABx = B.x - A.x;
+    const ABy = B.y - A.y;
+    const len2 = ABx * ABx + ABy * ABy;
+    let metros;
+    if (len2 < 1) {
+      metros = distanciaMetros(punto.lat, punto.lng, a.lat, a.lng);
+    } else {
+      let t = ((P.x - A.x) * ABx + (P.y - A.y) * ABy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      const projLat = a.lat + t * (b.lat - a.lat);
+      const projLng = a.lng + t * (b.lng - a.lng);
+      metros = distanciaMetros(punto.lat, punto.lng, projLat, projLng);
+    }
+    if (metros < min) min = metros;
+  }
+  return min;
+};
+
+const stripHtmlIndicacion = (html) => String(html || '')
+  .replace(/<[^>]+>/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const mismosPinesVisibles = (a, b) => {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      String(x._id) !== String(y._id)
+      || Number(x.lat) !== Number(y.lat)
+      || Number(x.lng) !== Number(y.lng)
+      || x.category !== y.category
+      || x.createdBy !== y.createdBy
+    ) {
+      return false;
+    }
+  }
+  return true;
+};
+
+/** Capa de pines aislada: no se re-monta si solo cambia la dirección del buscador / pin central */
+const CapaPinesMapa = React.memo(function CapaPinesMapa({
+  markers,
+  mapaListoTick,
+  userId,
+  isAdmin,
+  highlightedMarkerId,
+  modoSoloCaso,
+  focoCasoId,
+  soloMisReportes,
+  onMarkerClick,
+}) {
+  if (mapaListoTick <= 0) return null;
+  return markers.map((marker, index) => {
+    const posicion = { lat: Number(marker.lat), lng: Number(marker.lng) };
+    const clave = marker._id || `nuevo-${index}`;
+    const esMio = !isAdmin && userId !== 'anonimo' && (marker.createdBy
+      ? String(marker.createdBy).trim().toLowerCase()
+      : 'anonimo') === userId;
+    const destacar = (
+      (highlightedMarkerId != null && String(highlightedMarkerId) === String(marker._id))
+      || (modoSoloCaso && focoCasoId && String(focoCasoId) === String(marker._id))
+      || (soloMisReportes && esMio)
+    );
+    const anclaX = ANCHO_PIN / 2;
+    const anclaY = PUNTA_PIN_Y;
+    const esAnimal = normalizarCategoriaPin(marker.category) === 'perros_gatos';
+    return (
+      <OverlayView
+        key={`${clave}-${mapaListoTick}`}
+        position={posicion}
+        mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+      >
+        <button
+          type="button"
+          className={`pin-elegido${esMio ? ' pin-mio' : ''}${destacar ? ' pin-elegido-brillo' : ''}${esMio && !destacar ? ' pin-mio-solo' : ''}`}
+          style={{
+            width: ANCHO_PIN,
+            height: ALTO_PIN,
+            transform: `translate(${-anclaX}px, ${-anclaY}px)`,
+          }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onMarkerClick(marker);
+          }}
+          aria-label={esMio ? 'Tu aviso' : 'Reporte'}
+        >
+          {destacar && (
+            <img
+              src={marcadorCiudadLuz}
+              alt=""
+              className="pin-elegido-luz"
+              style={{
+                width: ANCHO_LUZ,
+                height: ALTO_LUZ,
+                left: anclaX - PUNTA_LUZ_X,
+                top: anclaY - PUNTA_LUZ_Y,
+              }}
+            />
+          )}
+          <img
+            src={urlPinCategoria(marker.category)}
+            alt=""
+            className="pin-elegido-cuerpo"
+            style={{
+              width: ANCHO_PIN,
+              height: ALTO_PIN,
+              left: 0,
+              top: 0,
+            }}
+          />
+          {esAnimal && (
+            <img
+              src={iconoPatita}
+              alt=""
+              className="pin-elegido-patita"
+              aria-hidden="true"
+            />
+          )}
+          {esMio && <span className="pin-mio-punto" aria-hidden="true" />}
+        </button>
+      </OverlayView>
+    );
+  });
+}, (prev, next) => (
+  prev.mapaListoTick === next.mapaListoTick
+  && prev.userId === next.userId
+  && prev.isAdmin === next.isAdmin
+  && prev.highlightedMarkerId === next.highlightedMarkerId
+  && prev.modoSoloCaso === next.modoSoloCaso
+  && String(prev.focoCasoId || '') === String(next.focoCasoId || '')
+  && prev.soloMisReportes === next.soloMisReportes
+  && prev.onMarkerClick === next.onMarkerClick
+  && mismosPinesVisibles(prev.markers, next.markers)
+));
+
+/** Rumbo en grados (0 = norte) entre dos puntos */
+const rumboEntre = (desde, hasta) => {
+  if (!desde || !hasta) return null;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const toDeg = (r) => (r * 180) / Math.PI;
+  const lat1 = toRad(Number(desde.lat));
+  const lat2 = toRad(Number(hasta.lat));
+  const dLng = toRad(Number(hasta.lng) - Number(desde.lng));
+  if (![lat1, lat2, dLng].every(Number.isFinite)) return null;
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2)
+    - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+};
+
+const tipoManiobra = (texto) => {
+  const t = String(texto || '').toLowerCase();
+  if (/u-?turn|retorn|media vuelta|dar la vuelta/.test(t)) return 'uturn';
+  if (/izquierda|left/.test(t)) return 'izquierda';
+  if (/derecha|right/.test(t)) return 'derecha';
+  if (/llegaste|destino|destination/.test(t)) return 'llegada';
+  return 'recto';
+};
 
 const digitosContacto = (valor) => String(valor || '').replace(/\D/g, '');
 const contactoValido = (valor) => {
@@ -310,7 +556,7 @@ const obtenerDireccionGoogle = (lat, lng) =>
       listo = true;
       resolve(texto || '');
     };
-    const timer = setTimeout(() => terminar(''), 1200);
+    const timer = setTimeout(() => terminar(''), 3500);
     try {
       const geocoder = new window.google.maps.Geocoder();
       geocoder.geocode(
@@ -360,8 +606,13 @@ const obtenerDireccionDesdePunto = async (lat, lng) => {
   const clave = claveCacheDireccion(lat, lng);
   if (cacheDireccion.has(clave)) return cacheDireccion.get(clave);
 
-  // Backend proxy (Photon/Nominatim): evita CORS y rate-limit del navegador
-  let texto = await obtenerDireccionDesdeBackend(lat, lng);
+  // 1) Google Geocoder en el cliente (rápido si el mapa ya cargó)
+  let texto = await obtenerDireccionGoogle(lat, lng);
+
+  // 2) Backend: Google Geocoding + fallback OSM
+  if (!texto) {
+    texto = await obtenerDireccionDesdeBackend(lat, lng);
+  }
 
   if (!texto) {
     const photon = await obtenerDireccionPhoton(lat, lng, '');
@@ -372,10 +623,6 @@ const obtenerDireccionDesdePunto = async (lat, lng) => {
         ciudad: photon.ciudad,
       });
     }
-  }
-
-  if (!texto) {
-    texto = await obtenerDireccionGoogle(lat, lng);
   }
 
   if (texto) cacheDireccion.set(clave, texto);
@@ -455,6 +702,33 @@ const IconoUbicacion = () => (
 
 const textoMunicipio = (nombre) => nombre || 'Fuera de las jurisdicciones registradas';
 
+/** Normaliza texto para buscar coincidencias en el Radar (sin acentos, minúsculas). */
+const normalizarBusquedaRadar = (valor) => String(valor || '')
+  .toLowerCase()
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const coincideBusquedaRadar = (marker, consulta) => {
+  const q = normalizarBusquedaRadar(consulta);
+  if (!q) return true;
+  if (!marker) return false;
+  const animalLabel = marker.animalTipo && ANIMAL_TIPOS[marker.animalTipo]
+    ? ANIMAL_TIPOS[marker.animalTipo]
+    : '';
+  const haystack = normalizarBusquedaRadar([
+    marker.objeto,
+    marker.description,
+    marker.direccion,
+    marker.perdidaTipo,
+    animalLabel,
+    marker.animalTipo,
+  ].filter(Boolean).join(' '));
+  const palabras = q.split(' ').filter(Boolean);
+  return palabras.every((p) => haystack.includes(p));
+};
+
 const esCasoFamilia = (category) => category === 'familias' || category === 'persona';
 
 const tipoDeFamilia = (marker) => {
@@ -477,16 +751,50 @@ const buscarReparacionesCercanas = (lista, lat, lng) => lista
   .sort((a, b) => a.metros - b.metros)
   .slice(0, 3);
 
+const TIPOS_NOTIF_PANEL_ADMIN = new Set(['por_aprobar', 'nuevo_reporte', 'nueva_perdida']);
+const RADAR_VISTA_KEY = 'ciudadar-radar-vista';
+const ANIMAL_FILTROS_RADAR = new Set(['todos', 'perdido', 'abandonado', 'adopcion']);
+
+const leerRadarVistaGuardada = () => {
+  try {
+    const raw = sessionStorage.getItem(RADAR_VISTA_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return null;
+    const radio = Number(data.cercaRadio);
+    return {
+      abierto: !!data.abierto,
+      modo: data.modo === 'animales' ? 'animales' : 'cosas',
+      seccion: data.seccion === 'activos' ? 'activos' : 'cerca',
+      animalFiltro: ANIMAL_FILTROS_RADAR.has(data.animalFiltro) ? data.animalFiltro : 'todos',
+      cercaOrigen: data.cercaOrigen === 'mapa' || data.cercaOrigen === 'vigilada'
+        ? data.cercaOrigen
+        : 'gps',
+      cercaRadio: Number.isFinite(radio)
+        ? Math.min(8000, Math.max(500, radio))
+        : 2500,
+      busqueda: typeof data.busqueda === 'string' ? data.busqueda.slice(0, 120) : '',
+    };
+  } catch {
+    return null;
+  }
+};
+
 function MapComponent({
   googleMapsApiKey,
   currentUser,
   panelVecino = null,
   onPanelVecinoVisto,
   onNoLeidasChange,
+  onPerdidasNoLeidasChange,
+  onAbrirCasoAdmin = null,
   focoCasoMapa = null,
   onFocoCasoVisto,
   modoSoloCaso = false,
   onCerrarSoloCaso,
+  habilitarGuiaGps = false,
+  autoIniciarGuia = false,
+  onGuiaIniciada = null,
 }) {
   const userId = currentUser ? String(currentUser).trim().toLowerCase() : 'anonimo';
   const [markers, setMarkers] = useState([]);
@@ -515,9 +823,52 @@ function MapComponent({
   const [editMode, setEditMode] = useState(null); // Estado para el modo de edición
   const [userLocation, setUserLocation] = useState(null); // Punto azul: dónde está la persona
   const [mapCenter, setMapCenter] = useState({ lat: -26.8084602, lng: -65.2175701 });
+  const mapCenterRef = useRef(mapCenter);
+  mapCenterRef.current = mapCenter;
   const [direccionPreview, setDireccionPreview] = useState('');
-  const [pinMoviendo, setPinMoviendo] = useState(false);
+  // Clase "moviendo" del pin central: vía DOM (no setState) para no re-renderizar OverlayViews
+  const pinCentralRefs = useRef([]);
+  const highlightedMarkerIdRef = useRef(null);
+  const ocultarPunteroMapaRef = useRef(false);
+  const mapaOpciones = useMemo(() => ({
+    mapTypeId: 'roadmap',
+    streetViewControl: false,
+    mapTypeControl: false,
+    fullscreenControl: false,
+    zoomControl: false,
+    // Sin íconos de negocios/POI: no se confunden con los pines de CiudadAr
+    styles: [
+      { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+      { featureType: 'poi.business', stylers: [{ visibility: 'off' }] },
+      { featureType: 'transit', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
+    ],
+  }), []);
+  const mapaContainerStyle = useMemo(() => ({ width: '100%', height: '100%' }), []);
+  const [guiaActiva, setGuiaActiva] = useState(false);
+  const [guiaCargando, setGuiaCargando] = useState(false);
+  const [guiaError, setGuiaError] = useState('');
+  const [guiaPath, setGuiaPath] = useState([]);
+  const [guiaPasos, setGuiaPasos] = useState([]);
+  const [guiaPasoIdx, setGuiaPasoIdx] = useState(0);
+  const [guiaResumen, setGuiaResumen] = useState('');
+  const [guiaLlego, setGuiaLlego] = useState(false);
+  const [guiaDestino, setGuiaDestino] = useState(null);
+  const [userHeading, setUserHeading] = useState(null); // grados, 0 = norte
+  const [guiaSimulando, setGuiaSimulando] = useState(false);
+  const [guiaRecalculando, setGuiaRecalculando] = useState(false);
   const yaCentroUsuario = useRef(false);
+  const guiaActivaRef = useRef(false);
+  const destinoGuiaRef = useRef(null);
+  const autoGuiaPedidaRef = useRef(false);
+  const ultimaPosGuiaRef = useRef(null);
+  const brujulaTsRef = useRef(0); // si hay brújula reciente, no pisa el rumbo el GPS
+  const guiaSimulandoRef = useRef(false);
+  const guiaSimTimerRef = useRef(null);
+  const guiaPathRef = useRef([]);
+  const guiaRecalcTsRef = useRef(0);
+  const guiaRecalcEnCursoRef = useRef(false);
+  const mapRef = useRef(null);
+  const mapaLienzoRef = useRef(null);
   const puntoElegidoRef = useRef(null);
   const idleTimerRef = useRef(null);
   const omitirIdleRef = useRef(false);
@@ -536,7 +887,7 @@ function MapComponent({
   const [isAdmin, setIsAdmin] = useState(false);
   const [adminRole, setAdminRole] = useState(null);
   const [adminJurisdictions, setAdminJurisdictions] = useState([]);
-  const statusOptions = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto', 'rechazado'];
+  const statusOptions = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'pendiente_cierre', 'resuelto', 'rechazado'];
   const categoryOptions = [
     { value: 'reparaciones', label: 'Reparaciones' },
     { value: 'familias', label: 'Familias' },
@@ -544,6 +895,11 @@ function MapComponent({
     { value: 'cosas_perdidas', label: 'Cosas perdidas' },
   ];
   const [highlightedMarkerId, setHighlightedMarkerId] = useState(null);
+  highlightedMarkerIdRef.current = highlightedMarkerId;
+  // Tras elegir un aviso: ocultar el puntero celeste hasta que el usuario mueva el mapa
+  const [ocultarPunteroMapa, setOcultarPunteroMapa] = useState(false);
+  ocultarPunteroMapaRef.current = ocultarPunteroMapa;
+  const omitirRestaurarPunteroRef = useRef(false); // pan/zoom programático no debe devolver el puntero
   const [deletedMarker, setDeletedMarker] = useState(null); // Caso eliminado temporalmente para poder deshacer
   const [deleteCountdown, setDeleteCountdown] = useState(10); // Contador de segundos para eliminar
   const [resolutionPhoto, setResolutionPhoto] = useState(null);
@@ -584,9 +940,37 @@ function MapComponent({
   const [soloMisReportes, setSoloMisReportes] = useState(false);
   const [soloMiJurisdiccion, setSoloMiJurisdiccion] = useState(false);
   const [mostrarMisReportes, setMostrarMisReportes] = useState(false);
+  const [radarVistaInicial] = useState(() => (modoSoloCaso ? null : leerRadarVistaGuardada()));
+  const [mostrarCosasPerdidas, setMostrarCosasPerdidas] = useState(() => !!radarVistaInicial?.abierto);
   const [misReportesSeccion, setMisReportesSeccion] = useState('activos'); // activos | registro
   const [misReportesActivos, setMisReportesActivos] = useState([]);
   const [misReportesRegistro, setMisReportesRegistro] = useState([]);
+  const [radarModo, setRadarModo] = useState(() => radarVistaInicial?.modo || 'cosas'); // cosas | animales
+  const [perdidasSeccion, setPerdidasSeccion] = useState(() => radarVistaInicial?.seccion || 'cerca'); // cerca | activos
+  const [animalFiltroRadar, setAnimalFiltroRadar] = useState(() => radarVistaInicial?.animalFiltro || 'todos');
+  const [perdidasLista, setPerdidasLista] = useState([]);
+  // Pines del mapa en Cerca: se acumulan al buscar (no parpadean al mover el radio)
+  const [pinesCercaMapa, setPinesCercaMapa] = useState([]);
+  const [radarBusqueda, setRadarBusqueda] = useState(() => radarVistaInicial?.busqueda || '');
+  const [radarVistaAmpliada, setRadarVistaAmpliada] = useState(false);
+  const [perdidasNoLeidasLocal, setPerdidasNoLeidasLocal] = useState(0);
+  const [cercaOrigen, setCercaOrigen] = useState(() => radarVistaInicial?.cercaOrigen || 'gps'); // gps | mapa | vigilada
+  const [cercaRadioMetros, setCercaRadioMetros] = useState(() => radarVistaInicial?.cercaRadio || 2500);
+  const radarRestauradoRef = useRef(!!radarVistaInicial?.abierto);
+  const [zonaAlerta, setZonaAlerta] = useState(null); // { lat, lng, radio }
+  const [guardandoZonaAlerta, setGuardandoZonaAlerta] = useState(false);
+  const perdidasCercaActivoRef = useRef(false);
+  const cercaOrigenRef = useRef('gps');
+  const ignorarDragCercaRef = useRef(false);
+  const cercaReloadTimerRef = useRef(null);
+  const perdidasFetchSeqRef = useRef(0);
+  const cercaGpsListoRef = useRef(false);
+  const radioCercaCircleRef = useRef(null); // radio de búsqueda (azul / naranja)
+  const radioVigiladaCircleRef = useRef(null); // radio verde persistente de zona vigilada
+  const [mapaListoTick, setMapaListoTick] = useState(0);
+  const [idRegistroDestacado, setIdRegistroDestacado] = useState(null);
+  const [idPerdidaDestacada, setIdPerdidaDestacada] = useState(null);
+  const ultimaUbicacionEnviadaRef = useRef({ at: 0, lat: null, lng: null });
   const [misPage, setMisPage] = useState(1);
   const [misMeta, setMisMeta] = useState({ total: 0, hasMore: false, limit: 8 });
   const [cargandoMisLista, setCargandoMisLista] = useState(false);
@@ -598,16 +982,35 @@ function MapComponent({
   const [noLeidasLocal, setNoLeidasLocal] = useState(0);
 
   const avisoTimerRef = useRef(null);
-  const mostrarAviso = (texto, alerta = false) => {
+  const [avisoAccion, setAvisoAccion] = useState(null); // { label, onClick }
+  const mostrarAviso = (texto, alerta = false, accion = null) => {
     if (avisoTimerRef.current) clearTimeout(avisoTimerRef.current);
     setAvisoEsAlerta(alerta);
     setAvisoVecino(texto);
+    setAvisoAccion(accion);
     if (!alerta) {
       avisoTimerRef.current = setTimeout(() => {
         setAvisoVecino('');
         setAvisoEsAlerta(false);
-      }, 3500);
+        setAvisoAccion(null);
+      }, 4500);
     }
+  };
+  const cerrarAvisoVecino = () => {
+    if (avisoTimerRef.current) clearTimeout(avisoTimerRef.current);
+    setAvisoVecino('');
+    setAvisoEsAlerta(false);
+    setAvisoAccion(null);
+  };
+  const notifApuntaAlRegistro = (aviso) => {
+    const tipo = String(aviso?.tipo || '');
+    const msg = String(aviso?.mensaje || '').toLowerCase();
+    return tipo === 'rechazado'
+      || msg.includes('registro')
+      || msg.includes('resuelto')
+      || msg.includes('anulado')
+      || msg.includes('ya no aparece')
+      || msg.includes('no está disponible');
   };
   const [avisando, setAvisando] = useState(null);
   const ignorarCercanosRef = useRef(false);
@@ -619,23 +1022,42 @@ function MapComponent({
   // Casos traídos desde el dashboard admin que pueden no estar en el listado público
   const casosAdminForzadosRef = useRef(new Map());
   const statusLabels = {
-    pendiente_aprobacion: 'Por aprobar',
-    pendiente: 'Publicado',
-    en_proceso: 'En proceso',
+    pendiente_aprobacion: 'En revisión',
+    pendiente: 'Publicado / pendiente de atención',
+    en_proceso: 'El municipio lo está atendiendo',
+    pendiente_cierre: 'Cierre propuesto · esperando confirmación',
     resuelto: 'Resuelto',
-    rechazado: 'Rechazado',
+    rechazado: 'Anulado',
+  };
+
+  /** Etiqueta de estado en el popup vecino (según categoría) */
+  const etiquetaEstadoPopup = (status, datos = formData) => {
+    if (datos.category === 'perros_gatos' && datos.animalTipo === 'abandonado' && datos.avisadoAt) {
+      return 'Oficina avisada';
+    }
+    if (status === 'pendiente') {
+      if (datos.category === 'perros_gatos') {
+        // Solo abandonados esperan atención municipal; perdido/adopción son entre vecinos
+        if (datos.animalTipo === 'abandonado' && !datos.avisadoAt) {
+          return 'Publicado / pendiente de atención';
+        }
+        return 'Publicado';
+      }
+      if (datos.category === 'cosas_perdidas') return 'Publicado';
+    }
+    return statusLabels[status] || status;
   };
   const statusBadgeColors = {
     pendiente_aprobacion: { bg: '#fef3c7', color: '#92400e' },
     pendiente: { bg: '#dbeafe', color: '#1e40af' },
     en_proceso: { bg: '#bfdbfe', color: '#1e3a8a' },
+    pendiente_cierre: { bg: '#fce7f3', color: '#9d174d' },
     resuelto: { bg: '#dcfce7', color: '#166534' },
     rechazado: { bg: '#fee2e2', color: '#991b1b' },
   };
   const categoryLabels = useMemo(
     () => ({
       familias: 'Familias',
-      persona: 'Persona en situación de calle',
       perros_gatos: 'Perros y gatos',
       reparaciones: 'Reparaciones',
       cosas_perdidas: 'Cosas perdidas',
@@ -654,11 +1076,13 @@ const getStatusBadgeStyle = (status) => {
   return {
     background: paleta.bg,
     color: paleta.color,
-    padding: '4px 10px',
-    borderRadius: '999px',
-    fontSize: '12px',
+    padding: '3px 8px',
+    borderRadius: '8px',
+    fontSize: '11px',
     fontWeight: 700,
     display: 'inline-block',
+    width: 'fit-content',
+    lineHeight: 1.25,
     fontFamily: "'IBM Plex Sans', sans-serif",
   };
 };
@@ -680,15 +1104,16 @@ const esPublicacionVencida = (marker) => (
 );
   const normalizeCategoryValue = useCallback(
     (value) => {
-      if (!value) return 'persona';
+      if (!value) return 'reparaciones';
       const normalized = String(value).trim().toLowerCase();
+      // legado: persona (= calle) → familias
+      if (normalized === 'persona' || normalized.includes('persona')) return 'familias';
       if (categoryLabels[normalized]) return normalized;
       if (normalized.includes('familia')) return 'familias';
       if (normalized.includes('perro') || normalized.includes('gato')) return 'perros_gatos';
       if (normalized.includes('repar')) return 'reparaciones';
       if (normalized.includes('perdid') || normalized.includes('encontr')) return 'cosas_perdidas';
-      if (normalized.includes('persona')) return 'persona';
-      return 'persona';
+      return 'reparaciones';
     },
     [categoryLabels]
   );
@@ -744,16 +1169,58 @@ const stopTouchPropagation = (event) => {
     }
 
     const handleSuccess = (position) => {
-      const { latitude, longitude } = position.coords;
+      // Durante la simulación de prueba no pisamos la posición animada
+      if (guiaSimulandoRef.current) return;
+      const { latitude, longitude, heading, speed } = position.coords;
       const current = { lat: latitude, lng: longitude };
-      setUserLocation(current);
-      if (!modoSoloCaso && !yaCentroUsuario.current) {
+      // Misma referencia si casi no se movió → evita que el punto azul parpadee/desaparezca
+      setUserLocation((prev) => {
+        if (
+          prev
+          && distanciaMetros(prev.lat, prev.lng, current.lat, current.lng) < 4
+        ) {
+          return prev;
+        }
+        return current;
+      });
+      setGeoError(null);
+
+      // Rumbo GPS solo si la brújula no está activa (últimos 1.5 s)
+      const brujulaReciente = Date.now() - brujulaTsRef.current < 1500;
+      if (!brujulaReciente) {
+        let rumbo = (typeof heading === 'number' && !Number.isNaN(heading) && heading >= 0)
+          ? heading
+          : null;
+        if (rumbo == null && ultimaPosGuiaRef.current) {
+          const metros = distanciaMetros(
+            ultimaPosGuiaRef.current.lat,
+            ultimaPosGuiaRef.current.lng,
+            current.lat,
+            current.lng
+          );
+          if (metros > 4 || (typeof speed === 'number' && speed > 1)) {
+            rumbo = rumboEntre(ultimaPosGuiaRef.current, current);
+          }
+        }
+        if (rumbo != null) setUserHeading(rumbo);
+      }
+      ultimaPosGuiaRef.current = current;
+
+      if (guiaActivaRef.current && mapRef.current) {
+        mapRef.current.panTo(current);
+      } else if (!modoSoloCaso && !yaCentroUsuario.current) {
         yaCentroUsuario.current = true;
         setMapCenter(current);
+        if (mapRef.current) mapRef.current.panTo(current);
       }
     };
 
     const handleError = (error) => {
+        // TIMEOUT intermitente del watch: no borrar el último punto ni spamear error
+        if (error?.code === error.TIMEOUT) {
+          console.warn('Geolocalización: timeout (se mantiene la última posición)');
+          return;
+        }
         let errorMessage = '';
         switch (error.code) {
           case error.PERMISSION_DENIED:
@@ -762,9 +1229,6 @@ const stopTouchPropagation = (event) => {
           case error.POSITION_UNAVAILABLE:
           errorMessage = 'Ubicación no disponible. Intenta más tarde.';
             break;
-          case error.TIMEOUT:
-          errorMessage = 'La solicitud de ubicación expiró. Intenta de nuevo.';
-            break;
           default:
           errorMessage = 'Error desconocido al obtener la ubicación.';
         }
@@ -772,24 +1236,325 @@ const stopTouchPropagation = (event) => {
         setGeoError(errorMessage);
     };
 
-    navigator.geolocation.getCurrentPosition(handleSuccess, handleError, {
+    const geoOpts = {
       enableHighAccuracy: true,
-    });
+      maximumAge: 30000,
+      timeout: 25000,
+    };
 
-    const watchId = navigator.geolocation.watchPosition(handleSuccess, handleError, {
-      enableHighAccuracy: true,
-    });
+    navigator.geolocation.getCurrentPosition(handleSuccess, handleError, geoOpts);
+
+    const watchId = navigator.geolocation.watchPosition(handleSuccess, handleError, geoOpts);
 
     return () => {
       navigator.geolocation.clearWatch(watchId);
     };
   }, [modoSoloCaso]);
 
+  const detenerSimulacionGuia = useCallback(() => {
+    guiaSimulandoRef.current = false;
+    setGuiaSimulando(false);
+    if (guiaSimTimerRef.current) {
+      window.clearInterval(guiaSimTimerRef.current);
+      guiaSimTimerRef.current = null;
+    }
+  }, []);
+
+  const detenerGuiaGps = useCallback(() => {
+    detenerSimulacionGuia();
+    guiaActivaRef.current = false;
+    guiaRecalcEnCursoRef.current = false;
+    setGuiaActiva(false);
+    setGuiaCargando(false);
+    setGuiaRecalculando(false);
+    setGuiaError('');
+    setGuiaPath([]);
+    guiaPathRef.current = [];
+    setGuiaPasos([]);
+    setGuiaPasoIdx(0);
+    setGuiaResumen('');
+    setGuiaLlego(false);
+    destinoGuiaRef.current = null;
+    setGuiaDestino(null);
+    setUserHeading(null);
+    brujulaTsRef.current = 0;
+  }, [detenerSimulacionGuia]);
+
+  const aplicarRutaGuia = useCallback((data, origen, destino, { ajustarVista = false } = {}) => {
+    const path = Array.isArray(data.path) ? data.path : [];
+    const pasos = (Array.isArray(data.steps) ? data.steps : []).map((step) => ({
+      instruction: stripHtmlIndicacion(step.instruction),
+      distance: step.distance || '',
+      end: step.end,
+    })).filter((s) => s.end && Number.isFinite(s.end.lat) && Number.isFinite(s.end.lng));
+
+    if (path.length < 2) throw new Error('Sin tramo');
+
+    setGuiaPath(path);
+    guiaPathRef.current = path;
+    setGuiaPasos(pasos);
+    setGuiaPasoIdx(0);
+    setGuiaResumen(data.resumen || [data.distanceText, data.durationText].filter(Boolean).join(' · '));
+    setGuiaLlego(false);
+    setGuiaError('');
+    const primerRumbo = pasos[0]?.end ? rumboEntre(origen, pasos[0].end) : rumboEntre(origen, destino);
+    if (primerRumbo != null) setUserHeading(primerRumbo);
+
+    if (ajustarVista && mapRef.current && path.length && window.google?.maps) {
+      const bounds = new window.google.maps.LatLngBounds();
+      path.forEach((p) => bounds.extend(p));
+      bounds.extend(origen);
+      bounds.extend(destino);
+      mapRef.current.fitBounds(bounds, 48);
+    }
+  }, []);
+
+  const recalcularRutaGuia = useCallback(async (origen) => {
+    const destino = destinoGuiaRef.current;
+    if (!destino || !origen || guiaRecalcEnCursoRef.current) return false;
+    if (Date.now() - guiaRecalcTsRef.current < RECALC_RUTA_COOLDOWN_MS) return false;
+
+    guiaRecalcEnCursoRef.current = true;
+    guiaRecalcTsRef.current = Date.now();
+    setGuiaRecalculando(true);
+    try {
+      const { data } = await axios.post('http://localhost:5001/api/rutas/guia', {
+        origin: origen,
+        destination: destino,
+      });
+      aplicarRutaGuia(data, origen, destino, { ajustarVista: false });
+      if (mapRef.current) mapRef.current.panTo(origen);
+      return true;
+    } catch (err) {
+      console.error('Recálculo de ruta:', err);
+      return false;
+    } finally {
+      guiaRecalcEnCursoRef.current = false;
+      setGuiaRecalculando(false);
+    }
+  }, [aplicarRutaGuia]);
+
+  /** Prueba sin caminar: el triángulo avanza por la ruta hasta el destino */
+  const simularRecorridoGuia = useCallback(() => {
+    if (!guiaActiva || guiaPath.length < 2 || guiaSimulandoRef.current) return;
+    detenerSimulacionGuia();
+    guiaSimulandoRef.current = true;
+    setGuiaSimulando(true);
+    setGuiaLlego(false);
+    let idx = 0;
+    // Empezar cerca del origen de la ruta
+    const primero = guiaPath[0];
+    setUserLocation(primero);
+    ultimaPosGuiaRef.current = primero;
+
+    guiaSimTimerRef.current = window.setInterval(() => {
+      idx += 1;
+      if (idx >= guiaPath.length) {
+        detenerSimulacionGuia();
+        setGuiaLlego(true);
+        return;
+      }
+      const punto = guiaPath[idx];
+      const prev = guiaPath[idx - 1] || punto;
+      const rumbo = rumboEntre(prev, punto);
+      setUserLocation(punto);
+      ultimaPosGuiaRef.current = punto;
+      if (rumbo != null) {
+        brujulaTsRef.current = Date.now();
+        setUserHeading(rumbo);
+      }
+      if (mapRef.current) {
+        mapRef.current.panTo(punto);
+      }
+      // Actualizar paso de indicación según cercanía
+      setGuiaPasoIdx((pasoIdx) => {
+        let next = pasoIdx;
+        while (
+          next < guiaPasos.length - 1
+          && distanciaMetros(
+            punto.lat,
+            punto.lng,
+            guiaPasos[next].end.lat,
+            guiaPasos[next].end.lng
+          ) <= RADIO_PASO_GUIA_METROS
+        ) {
+          next += 1;
+        }
+        return next;
+      });
+    }, 280);
+  }, [guiaActiva, guiaPath, guiaPasos, detenerSimulacionGuia]);
+
+  const pedirPermisoBrujula = useCallback(async () => {
+    try {
+      if (
+        typeof DeviceOrientationEvent !== 'undefined'
+        && typeof DeviceOrientationEvent.requestPermission === 'function'
+      ) {
+        const estado = await DeviceOrientationEvent.requestPermission();
+        return estado === 'granted';
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const iniciarGuiaGps = useCallback(async () => {
+    if (!habilitarGuiaGps || !modoSoloCaso) return;
+    const destinoLat = Number(focoCasoMapa?.lat);
+    const destinoLng = Number(focoCasoMapa?.lng);
+    if (!Number.isFinite(destinoLat) || !Number.isFinite(destinoLng)) {
+      setGuiaError('Este caso no tiene ubicación válida.');
+      return;
+    }
+
+    // Pedir brújula en el mismo gesto del botón (requerido en iOS)
+    await pedirPermisoBrujula();
+
+    setGuiaCargando(true);
+    setGuiaError('');
+    setGuiaLlego(false);
+
+    const pedirUbicacion = () => new Promise((resolve, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error('Geolocalización no disponible'));
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        (err) => reject(err),
+        { enableHighAccuracy: true, timeout: 15000 }
+      );
+    });
+
+    try {
+      const origen = userLocation || await pedirUbicacion();
+      setUserLocation(origen);
+      const destino = { lat: destinoLat, lng: destinoLng };
+      destinoGuiaRef.current = destino;
+      setGuiaDestino(destino);
+
+      // Routes API vía backend
+      const { data } = await axios.post('http://localhost:5001/api/rutas/guia', {
+        origin: origen,
+        destination: destino,
+      });
+
+      aplicarRutaGuia(data, origen, destino, { ajustarVista: true });
+      guiaRecalcTsRef.current = Date.now();
+      guiaActivaRef.current = true;
+      setGuiaActiva(true);
+      setGuiaCargando(false);
+      setShowPopup(false);
+      if (onGuiaIniciada) onGuiaIniciada();
+    } catch (err) {
+      console.error('Guía GPS:', err);
+      setGuiaCargando(false);
+      guiaActivaRef.current = false;
+      setGuiaActiva(false);
+      const codigo = err?.code;
+      const apiMsg = err?.response?.data?.message || '';
+      if (codigo === 1) {
+        setGuiaError('Necesitamos tu ubicación para guiarte. Activá el permiso e intentá de nuevo.');
+      } else if (/ZERO_RESULTS|no encontramos una ruta/i.test(apiMsg)) {
+        setGuiaError('No encontramos una ruta en auto hasta ese punto.');
+      } else if (apiMsg) {
+        setGuiaError(apiMsg);
+      } else {
+        setGuiaError('No se pudo calcular la ruta. Reiniciá el backend e intentá de nuevo.');
+      }
+    }
+  }, [habilitarGuiaGps, modoSoloCaso, focoCasoMapa, userLocation, onGuiaIniciada, pedirPermisoBrujula, aplicarRutaGuia]);
+
+  // Si el conductor se desvía, recalcular ruta (similar a Google Maps)
+  useEffect(() => {
+    if (!guiaActiva || !userLocation || guiaSimulando || guiaLlego) return;
+    const path = guiaPathRef.current;
+    if (!path.length) return;
+    const fuera = distanciaAlPathMetros(userLocation, path);
+    if (fuera <= RADIO_FUERA_RUTA_METROS) return;
+    recalcularRutaGuia(userLocation);
+  }, [guiaActiva, userLocation, guiaSimulando, guiaLlego, recalcularRutaGuia]);
+
+  // Brújula del dispositivo: el triángulo rota al girar el celular
+  useEffect(() => {
+    if (!guiaActiva) return undefined;
+
+    const rumboDesdeEvento = (event) => {
+      if (typeof event.webkitCompassHeading === 'number' && !Number.isNaN(event.webkitCompassHeading)) {
+        return event.webkitCompassHeading;
+      }
+      if (typeof event.alpha !== 'number' || Number.isNaN(event.alpha)) return null;
+      // alpha: 0 cuando el tope del dispositivo apunta al norte (absolute) → rumbo = 360 - alpha
+      return (360 - event.alpha + 360) % 360;
+    };
+
+    const onOrientacion = (event) => {
+      const rumbo = rumboDesdeEvento(event);
+      if (rumbo == null) return;
+      brujulaTsRef.current = Date.now();
+      setUserHeading(rumbo);
+    };
+
+    const absOk = 'ondeviceorientationabsolute' in window;
+    if (absOk) {
+      window.addEventListener('deviceorientationabsolute', onOrientacion, true);
+    }
+    window.addEventListener('deviceorientation', onOrientacion, true);
+
+    return () => {
+      if (absOk) {
+        window.removeEventListener('deviceorientationabsolute', onOrientacion, true);
+      }
+      window.removeEventListener('deviceorientation', onOrientacion, true);
+    };
+  }, [guiaActiva]);
+
+  // Avanzar indicación / llegada según posición
+  useEffect(() => {
+    if (!guiaActiva || !userLocation) return;
+    const destino = destinoGuiaRef.current;
+    if (
+      destino
+      && distanciaMetros(userLocation.lat, userLocation.lng, destino.lat, destino.lng)
+        <= RADIO_LLEGO_DESTINO_METROS
+    ) {
+      setGuiaLlego(true);
+      return;
+    }
+    if (!guiaPasos.length) return;
+    setGuiaPasoIdx((idx) => {
+      let next = idx;
+      while (
+        next < guiaPasos.length - 1
+        && distanciaMetros(
+          userLocation.lat,
+          userLocation.lng,
+          guiaPasos[next].end.lat,
+          guiaPasos[next].end.lng
+        ) <= RADIO_PASO_GUIA_METROS
+      ) {
+        next += 1;
+      }
+      return next;
+    });
+  }, [guiaActiva, userLocation, guiaPasos]);
+
+  useEffect(() => {
+    if (!modoSoloCaso) {
+      detenerGuiaGps();
+      autoGuiaPedidaRef.current = false;
+    }
+  }, [modoSoloCaso, detenerGuiaGps]);
+
   const cargarNotificaciones = useCallback(async () => {
     if (!userId || userId === 'anonimo') {
       setNotificaciones([]);
       setNoLeidasLocal(0);
+      setPerdidasNoLeidasLocal(0);
       if (onNoLeidasChange) onNoLeidasChange(0);
+      if (onPerdidasNoLeidasChange) onPerdidasNoLeidasChange(0);
       return;
     }
     try {
@@ -798,12 +1563,15 @@ const stopTouchPropagation = (event) => {
       });
       setNotificaciones(respuesta.data.notificaciones || []);
       const cantidad = respuesta.data.noLeidas || 0;
+      const perdidas = respuesta.data.perdidasNoLeidas || 0;
       setNoLeidasLocal(cantidad);
+      setPerdidasNoLeidasLocal(perdidas);
       if (onNoLeidasChange) onNoLeidasChange(cantidad);
+      if (onPerdidasNoLeidasChange) onPerdidasNoLeidasChange(perdidas);
     } catch (error) {
       console.error('Error cargando notificaciones:', error);
     }
-  }, [userId, onNoLeidasChange]);
+  }, [userId, onNoLeidasChange, onPerdidasNoLeidasChange]);
 
   const normalizarMisItem = useCallback((marker) => ({
     ...marker,
@@ -826,6 +1594,7 @@ const stopTouchPropagation = (event) => {
         mine: '1',
         limit: MIS_PAGE_SIZE,
         page,
+        excludeCategory: 'cosas_perdidas',
       };
       if (seccion === 'registro') params.eliminados = '1';
       const { data } = await axios.get('http://localhost:5001/api/markers', {
@@ -858,29 +1627,597 @@ const stopTouchPropagation = (event) => {
     }
   }, [userId, misReportesSeccion, normalizarMisItem]);
 
+  const puntoCercaActivo = useCallback((origen = cercaOrigen) => {
+    if (origen === 'vigilada' && zonaAlerta
+      && Number.isFinite(Number(zonaAlerta.lat))
+      && Number.isFinite(Number(zonaAlerta.lng))) {
+      return {
+        lat: Number(zonaAlerta.lat),
+        lng: Number(zonaAlerta.lng),
+        origen: 'vigilada',
+      };
+    }
+    if (origen === 'mapa') {
+      // Centro vivo del mapa (evita closure viejo al panear en Radar)
+      const vivo = mapRef.current?.getCenter?.();
+      if (vivo) {
+        return { lat: vivo.lat(), lng: vivo.lng(), origen: 'mapa' };
+      }
+      const guardado = mapCenterRef.current || mapCenter;
+      if (guardado) {
+        return { lat: Number(guardado.lat), lng: Number(guardado.lng), origen: 'mapa' };
+      }
+    }
+    if (origen === 'gps' && userLocation) {
+      return { lat: Number(userLocation.lat), lng: Number(userLocation.lng), origen: 'gps' };
+    }
+    if (userLocation) {
+      return { lat: Number(userLocation.lat), lng: Number(userLocation.lng), origen: 'gps' };
+    }
+    const fallback = mapCenterRef.current || mapCenter;
+    if (fallback) {
+      return { lat: Number(fallback.lat), lng: Number(fallback.lng), origen: 'mapa' };
+    }
+    return null;
+  }, [cercaOrigen, mapCenter, userLocation, zonaAlerta]);
+
+  const cargarPerdidasLista = useCallback(async (
+    seccion = perdidasSeccion,
+    page = 1,
+    origenOverride = null,
+    modoOverride = null,
+    animalOverride = null,
+    limitOverride = null,
+  ) => {
+    if (!userId || userId === 'anonimo') {
+      setPerdidasLista([]);
+      return;
+    }
+    // Registro histórico vive en Mis reportes, no en el Radar
+    const seccionRadar = seccion === 'registro' ? 'activos' : seccion;
+    const modo = modoOverride || radarModo;
+    const animalFiltro = animalOverride || animalFiltroRadar;
+    const pageLimit = Math.min(
+      100,
+      Math.max(1, Number(limitOverride) || (radarVistaAmpliada ? 50 : MIS_PAGE_SIZE))
+    );
+    const seq = ++perdidasFetchSeqRef.current;
+    // Solo limpiar al cambiar de pestaña (Míos ↔ Cerca), no en cada pan/reload del radio
+    const cambioSeccion = seccionRadar !== perdidasSeccion;
+    if (cambioSeccion) {
+      setPerdidasLista([]);
+      if (seccionRadar === 'cerca') setPinesCercaMapa([]);
+    }
+    setCargandoMisLista(true);
+    try {
+      if (seccionRadar === 'cerca') {
+        const punto = puntoCercaActivo(origenOverride || cercaOrigen);
+        if (!punto) {
+          if (seq !== perdidasFetchSeqRef.current) return;
+          setPerdidasLista([]);
+          setMisMeta({ total: 0, hasMore: false, limit: pageLimit });
+          return;
+        }
+        const radio = Number(cercaRadioMetros) || 2500;
+        const params = {
+          cerca: '1',
+          lat: punto.lat,
+          lng: punto.lng,
+          radius: radio,
+          limit: pageLimit,
+          page,
+          category: modo === 'animales' ? 'perros_gatos' : 'cosas_perdidas',
+        };
+        if (modo === 'animales' && animalFiltro && animalFiltro !== 'todos') {
+          params.animalTipo = animalFiltro;
+        }
+        const { data } = await axios.get('http://localhost:5001/api/markers', {
+          headers: { 'x-user-id': userId },
+          params,
+        });
+        if (seq !== perdidasFetchSeqRef.current) return;
+        const yo = String(userId || '').trim().toLowerCase();
+        // El servidor ya filtra por radio; no re-filtrar acá (provoca parpadeo al mover el slider/centro)
+        const lista = (data.items || [])
+          .map((m) => ({
+            ...normalizarMisItem(m),
+            distanciaMetros: m.distanciaMetros,
+          }))
+          .filter((m) => {
+            if (yo && yo !== 'anonimo'
+              && String(m.createdBy || '').trim().toLowerCase() === yo) {
+              return false;
+            }
+            return true;
+          });
+        setPerdidasLista(lista);
+        // Mapa: fusionar resultados para que al mover el radio no “parpadeen” ni se borren al instante
+        setPinesCercaMapa((prev) => {
+          const byId = new Map(prev.map((m) => [String(m._id), m]));
+          lista.forEach((m) => byId.set(String(m._id), m));
+          return Array.from(byId.values());
+        });
+        setMisPage(page);
+        setMisMeta({
+          total: lista.length,
+          hasMore: !!data.hasMore,
+          limit: data.limit || pageLimit,
+        });
+        return;
+      }
+
+      // Míos (activos): perdidas / animales del vecino
+      const params = {
+        limit: pageLimit,
+        page,
+      };
+      if (modo === 'animales') {
+        params.mine = '1';
+        params.category = 'perros_gatos';
+        if (animalFiltro && animalFiltro !== 'todos') params.animalTipo = animalFiltro;
+      } else {
+        params.misPerdidas = '1';
+      }
+      const { data } = await axios.get('http://localhost:5001/api/markers', {
+        headers: { 'x-user-id': userId },
+        params,
+      });
+      if (seq !== perdidasFetchSeqRef.current) return;
+      const lista = (Array.isArray(data) ? data : (data.items || [])).map(normalizarMisItem);
+      setPerdidasLista(
+        lista.filter((m) => !m.eliminadoAt && m.status !== 'resuelto' && m.status !== 'rechazado')
+      );
+      setMisPage(page);
+      setMisMeta({
+        total: Array.isArray(data) ? lista.length : (data.total || lista.length),
+        hasMore: Array.isArray(data) ? false : !!data.hasMore,
+        limit: Array.isArray(data) ? pageLimit : (data.limit || pageLimit),
+      });
+    } catch (error) {
+      if (seq !== perdidasFetchSeqRef.current) return;
+      console.error('Error cargando radar:', error);
+      setPerdidasLista([]);
+    } finally {
+      if (seq === perdidasFetchSeqRef.current) setCargandoMisLista(false);
+    }
+  }, [
+    userId,
+    perdidasSeccion,
+    radarModo,
+    animalFiltroRadar,
+    cercaOrigen,
+    cercaRadioMetros,
+    puntoCercaActivo,
+    normalizarMisItem,
+    radarVistaAmpliada,
+  ]);
+
+  const guardarZonaAlerta = useCallback(async (quitar = false, puntoForzado = null) => {
+    if (!userId || userId === 'anonimo') return;
+    setGuardandoZonaAlerta(true);
+    try {
+      if (quitar) {
+        const { data } = await axios.patch(
+          'http://localhost:5001/api/usuarios/me/zona-alerta',
+          { quitar: true },
+          { headers: { 'x-user-id': userId } }
+        );
+        setZonaAlerta(null);
+        if (cercaOrigen === 'vigilada') {
+          setCercaOrigen('mapa');
+          cargarPerdidasLista('cerca', 1, 'mapa');
+        }
+        mostrarAviso('Ya no vas a recibir avisos de esa zona.');
+        return data;
+      }
+      let punto = puntoForzado;
+      if (!punto && mapRef.current?.getCenter) {
+        const c = mapRef.current.getCenter();
+        if (c) punto = { lat: c.lat(), lng: c.lng() };
+      }
+      punto = punto || puntoCercaActivo('mapa') || puntoCercaActivo('gps');
+      if (!punto) {
+        mostrarAviso('Mové el mapa a la zona o activá tu ubicación.', true);
+        return null;
+      }
+      const { data } = await axios.patch(
+        'http://localhost:5001/api/usuarios/me/zona-alerta',
+        { lat: punto.lat, lng: punto.lng, radio: cercaRadioMetros },
+        { headers: { 'x-user-id': userId } }
+      );
+      const zona = {
+        lat: data.zonaAlertaLat,
+        lng: data.zonaAlertaLng,
+        radio: data.zonaAlertaRadio || cercaRadioMetros,
+      };
+      setZonaAlerta(zona);
+      setCercaOrigen('vigilada');
+      setMapCenter({ lat: Number(zona.lat), lng: Number(zona.lng) });
+      if (mapRef.current) {
+        mapRef.current.panTo({ lat: Number(zona.lat), lng: Number(zona.lng) });
+      }
+      // Esperar el setState de zonaAlerta para que el radio verde use el punto correcto
+      window.setTimeout(() => {
+        cargarPerdidasLista('cerca', 1, 'vigilada');
+      }, 0);
+      mostrarAviso('Vas a recibir avisos de esta zona del mapa (aunque no estés ahí).');
+      return data;
+    } catch (error) {
+      mostrarAviso(error.response?.data?.message || 'No se pudo guardar la zona.', true);
+      return null;
+    } finally {
+      setGuardandoZonaAlerta(false);
+    }
+  }, [userId, puntoCercaActivo, cercaRadioMetros, cercaOrigen, cargarPerdidasLista]);
+
+  const programarReloadCercaDesdeMapa = useCallback(() => {
+    if (!perdidasCercaActivoRef.current || !mapRef.current?.getCenter) return;
+    const c = mapRef.current.getCenter();
+    if (!c) return;
+    const punto = { lat: c.lat(), lng: c.lng() };
+    mapCenterRef.current = punto;
+    setMapCenter(punto);
+    setCercaOrigen('mapa');
+    if (cercaReloadTimerRef.current) clearTimeout(cercaReloadTimerRef.current);
+    cercaReloadTimerRef.current = setTimeout(() => {
+      // 'mapa' + getCenter/mapCenterRef vivos (no depende del closure de mapCenter)
+      cargarPerdidasLista('cerca', 1, 'mapa');
+    }, 400);
+  }, [cargarPerdidasLista]);
+
+  /** Marca leídos avisos del Radar. `tipos`: p.ej. ['cerca'] al abrir Cerca; chat/reclamo al tocar la tarjeta. */
+  const marcarPerdidasLeidas = useCallback(async (markerId = null, tipos = null) => {
+    if (!userId || userId === 'anonimo') return;
+    const tiposOk = Array.isArray(tipos) && tipos.length
+      ? tipos.filter((t) => t === 'reclamo' || t === 'chat' || t === 'cerca')
+      : null;
+    try {
+      const body = {};
+      if (markerId) body.markerId = markerId;
+      if (tiposOk) body.tipos = tiposOk;
+      const { data } = await axios.patch(
+        'http://localhost:5001/api/notificaciones/perdidas/leer',
+        body,
+        { headers: { 'x-user-id': userId } }
+      );
+      const cantidad = data.perdidasNoLeidas || 0;
+      setPerdidasNoLeidasLocal(cantidad);
+      if (onPerdidasNoLeidasChange) onPerdidasNoLeidasChange(cantidad);
+      setNotificaciones((prev) => prev.map((n) => {
+        const esRadar = n.tipo === 'reclamo' || n.tipo === 'chat' || n.tipo === 'cerca';
+        if (!esRadar || n.leida) return n;
+        if (tiposOk && !tiposOk.includes(n.tipo)) return n;
+        if (markerId && String(n.markerId) !== String(markerId)) return n;
+        return { ...n, leida: true };
+      }));
+    } catch (error) {
+      console.error('Error marcando avisos de perdidas:', error);
+    }
+  }, [userId, onPerdidasNoLeidasChange]);
+
+  // Sincronizar GPS con el servidor (para avisos de cercanía)
+  useEffect(() => {
+    if (!userId || userId === 'anonimo' || !userLocation) return;
+    const ahora = Date.now();
+    const prev = ultimaUbicacionEnviadaRef.current;
+    const movio = prev.lat == null
+      || distanciaMetros(prev.lat, prev.lng, userLocation.lat, userLocation.lng) > 80;
+    if (!movio && ahora - prev.at < 60000) return;
+    ultimaUbicacionEnviadaRef.current = {
+      at: ahora,
+      lat: userLocation.lat,
+      lng: userLocation.lng,
+    };
+    axios.patch(
+      'http://localhost:5001/api/usuarios/me/ubicacion',
+      { lat: userLocation.lat, lng: userLocation.lng },
+      { headers: { 'x-user-id': userId } }
+    ).catch(() => {});
+  }, [userId, userLocation]);
+
+  // Cargar zona de alerta guardada
+  useEffect(() => {
+    if (!userId || userId === 'anonimo') {
+      setZonaAlerta(null);
+      return;
+    }
+    axios.get('http://localhost:5001/api/usuarios/me', {
+      headers: { 'x-user-id': userId },
+    }).then(({ data }) => {
+      if (data.zonaAlertaLat != null && data.zonaAlertaLng != null) {
+        setZonaAlerta({
+          lat: data.zonaAlertaLat,
+          lng: data.zonaAlertaLng,
+          radio: data.zonaAlertaRadio || 2500,
+        });
+        if (data.zonaAlertaRadio) setCercaRadioMetros(Number(data.zonaAlertaRadio) || 2500);
+      } else {
+        setZonaAlerta(null);
+      }
+    }).catch(() => {});
+  }, [userId]);
+
+  useEffect(() => {
+    perdidasCercaActivoRef.current = Boolean(mostrarCosasPerdidas && perdidasSeccion === 'cerca');
+  }, [mostrarCosasPerdidas, perdidasSeccion]);
+
+  useEffect(() => {
+    if (!mostrarCosasPerdidas && radarVistaAmpliada) setRadarVistaAmpliada(false);
+  }, [mostrarCosasPerdidas, radarVistaAmpliada]);
+
+  // Al cerrar Radar o cambiar Cosas/Animales, resetear pines acumulados de Cerca
+  useEffect(() => {
+    if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca') {
+      setPinesCercaMapa([]);
+    }
+  }, [mostrarCosasPerdidas, perdidasSeccion]);
+
+  useEffect(() => {
+    setPinesCercaMapa([]);
+  }, [radarModo, animalFiltroRadar]);
+
+  useEffect(() => {
+    if (perdidasSeccion === 'registro') setPerdidasSeccion('activos');
+  }, [perdidasSeccion]);
+
+  useEffect(() => {
+    cercaOrigenRef.current = cercaOrigen;
+  }, [cercaOrigen]);
+
+  // Persistir Radar al refrescar (misma pestaña)
+  useEffect(() => {
+    if (modoSoloCaso) return;
+    try {
+      sessionStorage.setItem(RADAR_VISTA_KEY, JSON.stringify({
+        abierto: mostrarCosasPerdidas,
+        modo: radarModo,
+        seccion: perdidasSeccion === 'activos' ? 'activos' : 'cerca',
+        animalFiltro: animalFiltroRadar,
+        cercaOrigen: cercaOrigen === 'mapa' || cercaOrigen === 'vigilada' ? cercaOrigen : 'gps',
+        cercaRadio: cercaRadioMetros,
+        busqueda: radarBusqueda,
+      }));
+    } catch {
+      /* ignore quota / private mode */
+    }
+  }, [
+    modoSoloCaso,
+    mostrarCosasPerdidas,
+    radarModo,
+    perdidasSeccion,
+    animalFiltroRadar,
+    cercaOrigen,
+    cercaRadioMetros,
+    radarBusqueda,
+  ]);
+
+  // Tras F5: si el Radar estaba abierto, recargar la lista
+  useEffect(() => {
+    if (!radarRestauradoRef.current) return;
+    if (modoSoloCaso || !mostrarCosasPerdidas) {
+      radarRestauradoRef.current = false;
+      return;
+    }
+    if (!userId || userId === 'anonimo') return;
+    radarRestauradoRef.current = false;
+    cargarPerdidasLista(perdidasSeccion, 1);
+  }, [userId, modoSoloCaso, mostrarCosasPerdidas, perdidasSeccion, cargarPerdidasLista]);
+
+  // Vista dividida: resize al entrar al Radar (no en cada tick del slider → distorsiona)
+  useEffect(() => {
+    if (!mostrarCosasPerdidas || !mapRef.current || !window.google?.maps?.event) return;
+    // Un poco más alejados para ver el radio completo con el puntero
+    const zoomRadar = cercaRadioMetros >= 4000 ? 11 : (cercaRadioMetros >= 2000 ? 12 : 13);
+    const t = window.setTimeout(() => {
+      if (!mapRef.current) return;
+      window.google.maps.event.trigger(mapRef.current, 'resize');
+      const c = mapRef.current.getCenter?.();
+      if (c) mapRef.current.setCenter(c);
+      if (perdidasSeccion === 'cerca') {
+        mapRef.current.setZoom(zoomRadar);
+      }
+    }, 80);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- solo al cambiar de sección, no al mover el radio
+  }, [mostrarCosasPerdidas, perdidasSeccion]);
+
+  // Radios nativos: búsqueda (azul/naranja) + zona vigilada (verde, se mantiene)
+  useEffect(() => {
+    const map = mapRef.current;
+    const gmaps = window.google?.maps;
+    if (!map || !gmaps) return undefined;
+
+    const activo = Boolean(mostrarCosasPerdidas && perdidasSeccion === 'cerca');
+    const limpiar = (ref) => {
+      if (ref.current) {
+        ref.current.setMap(null);
+        ref.current = null;
+      }
+    };
+    const aplicarCirculo = (ref, opts) => {
+      if (!ref.current) {
+        ref.current = new gmaps.Circle(opts);
+      } else {
+        ref.current.setOptions(opts);
+      }
+    };
+
+    // Radio verde persistente de la zona vigilada (siempre que exista)
+    const vLat = Number(zonaAlerta?.lat);
+    const vLng = Number(zonaAlerta?.lng);
+    // En "Ver vigilada" el slider mueve el radio verde; si buscás en otra zona, se ve el radio guardado
+    const radioVigilada = cercaOrigen === 'vigilada'
+      ? (Number(cercaRadioMetros) || Number(zonaAlerta?.radio) || 2500)
+      : (Number(zonaAlerta?.radio) || Number(cercaRadioMetros) || 2500);
+    if (activo && zonaAlerta && Number.isFinite(vLat) && Number.isFinite(vLng)) {
+      aplicarCirculo(radioVigiladaCircleRef, {
+        center: { lat: vLat, lng: vLng },
+        radius: radioVigilada,
+        strokeColor: '#059669',
+        strokeOpacity: cercaOrigen === 'vigilada' ? 0.95 : 0.75,
+        strokeWeight: cercaOrigen === 'vigilada' ? 2.5 : 2,
+        fillColor: '#10b981',
+        fillOpacity: cercaOrigen === 'vigilada' ? 0.18 : 0.1,
+        clickable: false,
+        zIndex: cercaOrigen === 'vigilada' ? 3 : 1,
+        map,
+      });
+    } else {
+      limpiar(radioVigiladaCircleRef);
+    }
+
+    // Radio de búsqueda azul / naranja (si estás en vigilada, el verde ya cubre la búsqueda)
+    if (!activo || cercaOrigen === 'vigilada') {
+      limpiar(radioCercaCircleRef);
+      return undefined;
+    }
+
+    let centro;
+    if (cercaOrigen === 'gps' && userLocation) {
+      centro = userLocation;
+    } else {
+      // Centro vivo del mapa; en “otra zona” el follow lo hace center_changed (más fluido)
+      const vivo = map.getCenter?.();
+      const guardado = mapCenterRef.current || mapCenter;
+      centro = vivo
+        ? { lat: vivo.lat(), lng: vivo.lng() }
+        : guardado;
+    }
+    const lat = Number(centro?.lat);
+    const lng = Number(centro?.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      limpiar(radioCercaCircleRef);
+      return undefined;
+    }
+
+    const colorStroke = cercaOrigen === 'gps' ? '#2563eb' : '#ea580c';
+    const colorFill = cercaOrigen === 'gps' ? '#3b82f6' : '#f97316';
+    const radio = Number(cercaRadioMetros) || 2500;
+    // En modo mapa: no pisar el center en cada setState (provoca tirones al arrastrar)
+    if (cercaOrigen === 'mapa' && radioCercaCircleRef.current) {
+      radioCercaCircleRef.current.setRadius(radio);
+      radioCercaCircleRef.current.setOptions({
+        strokeColor: colorStroke,
+        strokeOpacity: 0.9,
+        strokeWeight: 2,
+        fillColor: colorFill,
+        fillOpacity: 0.14,
+        clickable: false,
+        zIndex: 2,
+      });
+      return undefined;
+    }
+    aplicarCirculo(radioCercaCircleRef, {
+      center: { lat, lng },
+      radius: radio,
+      strokeColor: colorStroke,
+      strokeOpacity: 0.9,
+      strokeWeight: 2,
+      fillColor: colorFill,
+      fillOpacity: 0.14,
+      clickable: false,
+      zIndex: 2,
+      map,
+    });
+    return undefined;
+  }, [
+    mostrarCosasPerdidas,
+    perdidasSeccion,
+    cercaOrigen,
+    cercaRadioMetros,
+    userLocation,
+    mapCenter,
+    zonaAlerta,
+    mapaListoTick,
+  ]);
+
+  useEffect(() => () => {
+    if (radioCercaCircleRef.current) {
+      radioCercaCircleRef.current.setMap(null);
+      radioCercaCircleRef.current = null;
+    }
+    if (radioVigiladaCircleRef.current) {
+      radioVigiladaCircleRef.current.setMap(null);
+      radioVigiladaCircleRef.current = null;
+    }
+  }, []);
+
+  // En Radar "Cerca de mí": el mapa sigue al GPS; la 1ª vez con GPS recarga la lista (evita F5 con centro viejo)
+  useEffect(() => {
+    if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca' || cercaOrigen !== 'gps') {
+      if (cercaOrigen !== 'gps') cercaGpsListoRef.current = false;
+      return;
+    }
+    if (!userLocation || !mapRef.current) return;
+    if (ignorarDragCercaRef.current) return;
+    const c = mapRef.current.getCenter?.();
+    const lejos = c
+      ? distanciaMetros(c.lat(), c.lng(), userLocation.lat, userLocation.lng) >= 35
+      : true;
+    if (!cercaGpsListoRef.current) {
+      cercaGpsListoRef.current = true;
+      mapRef.current.panTo(userLocation);
+      setMapCenter(userLocation);
+      cargarPerdidasLista('cerca', 1, 'gps');
+      return;
+    }
+    if (lejos) {
+      mapRef.current.panTo(userLocation);
+      setMapCenter(userLocation);
+    }
+  }, [userLocation, cercaOrigen, mostrarCosasPerdidas, perdidasSeccion, cargarPerdidasLista]);
+
+  // Debounce del radio/modo: si pedimos en cada tick del slider, los pines parpadean
+  useEffect(() => {
+    if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca') return undefined;
+    const t = window.setTimeout(() => {
+      cargarPerdidasLista('cerca', 1);
+    }, 400);
+    return () => window.clearTimeout(t);
+  }, [cercaRadioMetros, radarModo, animalFiltroRadar]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Al abrir Radar en Cerca: bajar badge de avisos nuevos cerca (no mezcla con chat de Míos)
+  useEffect(() => {
+    if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca') return;
+    marcarPerdidasLeidas(null, ['cerca']);
+  }, [mostrarCosasPerdidas, perdidasSeccion, marcarPerdidasLeidas]);
+
   useEffect(() => {
     if (!panelVecino) return;
     if (panelVecino === 'mis-reportes') {
       setMostrarNotificaciones(false);
       setMostrarFiltros(false);
+      setMostrarCosasPerdidas(false);
       setMostrarMisReportes(true);
       setMisReportesSeccion('activos');
       setMisPage(1);
       cargarMisLista('activos', 1);
     }
+    if (panelVecino === 'cosas-perdidas') {
+      setMostrarNotificaciones(false);
+      setMostrarFiltros(false);
+      setMostrarMisReportes(false);
+      setMostrarCosasPerdidas(true);
+      setPerdidasSeccion('cerca');
+      setMisPage(1);
+      cargarPerdidasLista('cerca', 1);
+      // El badge de "Nuevo"/cerca se limpia al mostrar Cerca (efecto abajo)
+    }
     if (panelVecino === 'filtros') {
       setMostrarNotificaciones(false);
       setMostrarMisReportes(false);
+      setMostrarCosasPerdidas(false);
       setMostrarFiltros(true);
     }
     if (panelVecino === 'notificaciones') {
       setMostrarMisReportes(false);
+      setMostrarCosasPerdidas(false);
       setMostrarFiltros(false);
       setMostrarNotificaciones(true);
       cargarNotificaciones();
     }
     if (onPanelVecinoVisto) onPanelVecinoVisto();
-  }, [panelVecino, onPanelVecinoVisto, cargarNotificaciones, cargarMisLista]);
+  }, [panelVecino, onPanelVecinoVisto, cargarNotificaciones, cargarMisLista, cargarPerdidasLista]);
 
   useEffect(() => {
     cargarNotificaciones();
@@ -1182,9 +2519,40 @@ const stopTouchPropagation = (event) => {
     // mapIds: ['7f9f71bb3b378371fcb70fd1'], // ID de mapa eliminado
   });
 
-  const mapRef = useRef(null);
+  // Si el lienzo cambia de tamaño (barra, panel, mobile), recalcular proyección de OverlayView
+  useEffect(() => {
+    if (!isLoaded || !mapaLienzoRef.current) return undefined;
+    const el = mapaLienzoRef.current;
+    let t = null;
+    const ro = new ResizeObserver(() => {
+      if (t) window.clearTimeout(t);
+      t = window.setTimeout(() => {
+        const map = mapRef.current;
+        if (!map || !window.google?.maps?.event) return;
+        window.google.maps.event.trigger(map, 'resize');
+        const c = map.getCenter?.();
+        if (c) map.setCenter(c);
+      }, 60);
+    });
+    ro.observe(el);
+    return () => {
+      if (t) window.clearTimeout(t);
+      ro.disconnect();
+    };
+  }, [isLoaded]);
+
+  // Auto-iniciar guía GPS (Cómo llegar / tras tomar caso)
+  useEffect(() => {
+    if (!habilitarGuiaGps || !modoSoloCaso || !autoIniciarGuia || !isLoaded) return;
+    if (autoGuiaPedidaRef.current || guiaActivaRef.current) return;
+    autoGuiaPedidaRef.current = true;
+    iniciarGuiaGps();
+  }, [habilitarGuiaGps, modoSoloCaso, autoIniciarGuia, isLoaded, iniciarGuiaGps]);
+
   const idleListenerRef = useRef(null);
   const dragStartListenerRef = useRef(null);
+  const dragListenerRef = useRef(null);
+  const centerChangedListenerRef = useRef(null);
   const dragEndListenerRef = useRef(null);
   const geocodeSeqRef = useRef(0);
 
@@ -1202,7 +2570,7 @@ const stopTouchPropagation = (event) => {
       if (seq !== geocodeSeqRef.current || showPopupRef.current) return;
       if (!forzar && bloquearAutoDireccionRef.current) return;
       if (texto) {
-        setDireccionPreview(texto);
+        setDireccionPreview((prev) => (prev === texto ? prev : texto));
         return;
       }
       setDireccionPreview((prev) => (
@@ -1213,18 +2581,18 @@ const stopTouchPropagation = (event) => {
 
   const onMapLoad = useCallback((map) => {
     mapRef.current = map;
-    if (idleListenerRef.current) {
-      window.google.maps.event.removeListener(idleListenerRef.current);
-    }
-    if (dragStartListenerRef.current) {
-      window.google.maps.event.removeListener(dragStartListenerRef.current);
-    }
-    if (dragEndListenerRef.current) {
-      window.google.maps.event.removeListener(dragEndListenerRef.current);
-    }
-    if (modoSoloCaso && window.google?.maps?.event) {
-      const recentrarCaso = () => {
-        window.google.maps.event.trigger(map, 'resize');
+    setMapaListoTick(0);
+    // Centro/zoom solo acá o con panTo/setZoom: NO props controlados (evitan saltos al click)
+    const centroInicial = mapCenterRef.current;
+    const zoomInicial = modoSoloCaso ? 18 : 14;
+    if (centroInicial?.lat != null) map.setCenter(centroInicial);
+    map.setZoom(zoomInicial);
+    // OverlayView usa mal la proyección si el lienzo aún no tiene tamaño final:
+    // resize + montar pines recién en el primer idle (proyección estable).
+    const corregirProyeccion = () => {
+      if (!mapRef.current || !window.google?.maps?.event) return;
+      window.google.maps.event.trigger(map, 'resize');
+      if (modoSoloCaso) {
         const lat = Number(focoCasoMapa?.lat);
         const lng = Number(focoCasoMapa?.lng);
         if (Number.isFinite(lat) && Number.isFinite(lng)) {
@@ -1232,23 +2600,105 @@ const stopTouchPropagation = (event) => {
           map.setCenter(centro);
           map.setZoom(18);
           setMapCenter(centro);
+        } else {
+          const c = map.getCenter?.();
+          if (c) map.setCenter(c);
         }
-      };
-      window.setTimeout(recentrarCaso, 80);
-      window.setTimeout(recentrarCaso, 300);
+      } else {
+        const c = map.getCenter?.();
+        if (c) map.setCenter(c);
+      }
+    };
+    let pinesMontados = false;
+    const montarPines = () => {
+      if (pinesMontados) return;
+      pinesMontados = true;
+      corregirProyeccion();
+      setMapaListoTick(1);
+      // Remount breve: OverlayView a veces queda con left/top del primer draw a medias
+      window.setTimeout(() => {
+        corregirProyeccion();
+        setMapaListoTick(2);
+      }, 80);
+    };
+    window.setTimeout(() => corregirProyeccion(), 0);
+    window.setTimeout(() => corregirProyeccion(), 100);
+    const onceIdle = map.addListener('idle', () => {
+      window.google.maps.event.removeListener(onceIdle);
+      montarPines();
+    });
+    window.setTimeout(montarPines, 900);
+    if (idleListenerRef.current) {
+      window.google.maps.event.removeListener(idleListenerRef.current);
     }
+    if (dragStartListenerRef.current) {
+      window.google.maps.event.removeListener(dragStartListenerRef.current);
+    }
+    if (dragListenerRef.current) {
+      window.google.maps.event.removeListener(dragListenerRef.current);
+    }
+    if (centerChangedListenerRef.current) {
+      window.google.maps.event.removeListener(centerChangedListenerRef.current);
+    }
+    if (dragEndListenerRef.current) {
+      window.google.maps.event.removeListener(dragEndListenerRef.current);
+    }
+    const setPinCentralMoviendo = (moviendo) => {
+      (pinCentralRefs.current || []).forEach((el) => {
+        if (!el) return;
+        el.classList.toggle('moviendo', moviendo);
+      });
+    };
+    // center_changed sigue el pan con inercia (más fluido que solo “drag”)
+    const sincronizarRadioConPuntero = () => {
+      if (!perdidasCercaActivoRef.current || ignorarDragCercaRef.current) return;
+      if (cercaOrigenRef.current !== 'mapa') return;
+      const c = map.getCenter?.();
+      if (!c) return;
+      mapCenterRef.current = { lat: c.lat(), lng: c.lng() };
+      const circulo = radioCercaCircleRef.current;
+      if (circulo) circulo.setCenter(c);
+    };
     dragStartListenerRef.current = map.addListener('dragstart', () => {
       bloquearAutoDireccionRef.current = false;
-      if (!showPopupRef.current) setPinMoviendo(true);
+      if (!showPopupRef.current) setPinCentralMoviendo(true);
+      if (!omitirRestaurarPunteroRef.current && !showPopupRef.current) {
+        if (ocultarPunteroMapaRef.current) setOcultarPunteroMapa(false);
+        if (highlightedMarkerIdRef.current != null) setHighlightedMarkerId(null);
+      }
+      // Azul (GPS) → naranja (otra zona) al empezar a mover
+      if (
+        perdidasCercaActivoRef.current
+        && !ignorarDragCercaRef.current
+        && cercaOrigenRef.current === 'gps'
+      ) {
+        const c = map.getCenter?.();
+        if (c) {
+          mapCenterRef.current = { lat: c.lat(), lng: c.lng() };
+          if (radioCercaCircleRef.current) {
+            radioCercaCircleRef.current.setCenter(c);
+            radioCercaCircleRef.current.setOptions({
+              strokeColor: '#ea580c',
+              fillColor: '#f97316',
+            });
+          }
+        }
+        // Sin setMapCenter acá: evita tirones del effect a mitad del drag
+        setCercaOrigen('mapa');
+      }
     });
+    centerChangedListenerRef.current = map.addListener('center_changed', sincronizarRadioConPuntero);
     dragEndListenerRef.current = map.addListener('dragend', () => {
-      setPinMoviendo(false);
-      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-      idleTimerRef.current = setTimeout(() => actualizarDireccionDelPin(true), 450);
+      setPinCentralMoviendo(false);
+      sincronizarRadioConPuntero();
+      if (perdidasCercaActivoRef.current && !ignorarDragCercaRef.current) {
+        programarReloadCercaDesdeMapa();
+      }
     });
     idleListenerRef.current = map.addListener('idle', () => {
-      setPinMoviendo(false);
       if (showPopupRef.current || omitirIdleRef.current || bloquearAutoDireccionRef.current || !mapRef.current) return;
+      // En Radar Cerca no geocodificar el pin de “publicar”
+      if (perdidasCercaActivoRef.current) return;
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
       idleTimerRef.current = setTimeout(() => {
         actualizarDireccionDelPin(true);
@@ -1257,7 +2707,7 @@ const stopTouchPropagation = (event) => {
     if (!modoSoloCaso) {
       setTimeout(() => actualizarDireccionDelPin(true), 600);
     }
-  }, [actualizarDireccionDelPin, modoSoloCaso, focoCasoMapa]);
+  }, [actualizarDireccionDelPin, modoSoloCaso, focoCasoMapa, programarReloadCercaDesdeMapa]);
 
   useEffect(() => {
     return () => {
@@ -1266,6 +2716,12 @@ const stopTouchPropagation = (event) => {
       }
       if (dragStartListenerRef.current) {
         window.google.maps.event.removeListener(dragStartListenerRef.current);
+      }
+      if (dragListenerRef.current) {
+        window.google.maps.event.removeListener(dragListenerRef.current);
+      }
+      if (centerChangedListenerRef.current) {
+        window.google.maps.event.removeListener(centerChangedListenerRef.current);
       }
       if (dragEndListenerRef.current) {
         window.google.maps.event.removeListener(dragEndListenerRef.current);
@@ -1344,11 +2800,15 @@ const stopTouchPropagation = (event) => {
     mapRef.current.panTo(userLocation);
     mapRef.current.setZoom(18);
     setMapCenter(userLocation);
+    if (modoSoloCaso) {
+      window.setTimeout(() => { omitirIdleRef.current = false; }, 400);
+      return;
+    }
     obtenerDireccionDesdePunto(userLocation.lat, userLocation.lng).then((texto) => {
       setDireccionPreview(texto);
       omitirIdleRef.current = false;
     });
-  }, [userLocation]);
+  }, [userLocation, modoSoloCaso]);
 
   const elegirDireccionBuscada = useCallback(({ direccion, lat, lng }) => {
     if (!mapRef.current) return;
@@ -1419,7 +2879,8 @@ const stopTouchPropagation = (event) => {
     setResolutionDescription('');
     setEditandoResolucion(false);
     setMostrarResolucion(false);
-    setRespuestaDatos(marker.description || '');
+    // Respuesta vacía: no precargar la descripción (evita el campo “sobrecargado”)
+    setRespuestaDatos('');
     setFotoRespuestaDatos(null);
     setPreviewRespuestaDatos(null);
     setMostrarOpcionesFotoRespuesta(false);
@@ -1447,11 +2908,28 @@ const stopTouchPropagation = (event) => {
       setCanEdit(false);
       setShowDeleteOnly(esDueno || Boolean(marker.caseId));
     }
-    if (mapRef.current) {
-      mapRef.current.panTo({ lat: marker.lat, lng: marker.lng });
-      mapRef.current.setZoom(18);
-    }
+    // Brillante + ocultar puntero; congelar vista (el re-render no debe mover el mapa)
+    const centroAntes = mapRef.current?.getCenter?.();
+    const zoomAntes = mapRef.current?.getZoom?.();
+    const vistaCongelada = centroAntes
+      ? { lat: centroAntes.lat(), lng: centroAntes.lng(), zoom: zoomAntes }
+      : null;
     setHighlightedMarkerId(marker._id);
+    setOcultarPunteroMapa(true);
+    if (vistaCongelada) {
+      omitirRestaurarPunteroRef.current = true;
+      omitirIdleRef.current = true;
+      window.requestAnimationFrame(() => {
+        if (mapRef.current) {
+          mapRef.current.setCenter({ lat: vistaCongelada.lat, lng: vistaCongelada.lng });
+          if (Number.isFinite(vistaCongelada.zoom)) mapRef.current.setZoom(vistaCongelada.zoom);
+        }
+        window.setTimeout(() => {
+          omitirRestaurarPunteroRef.current = false;
+          omitirIdleRef.current = false;
+        }, 120);
+      });
+    }
   }, [userId, normalizeCategoryValue, buildImageUrl]);
 
   // Admin / foco: abrir el mismo popup del proyecto en un caso concreto
@@ -1929,7 +3407,9 @@ const stopTouchPropagation = (event) => {
   const irAMiReporte = useCallback((marker) => {
     if (!marker) return;
     setMostrarMisReportes(false);
+    setMostrarCosasPerdidas(false);
     setMostrarNotificaciones(false);
+    setIdPerdidaDestacada(null);
     setMapCenter({ lat: Number(marker.lat), lng: Number(marker.lng) });
     if (mapRef.current) {
       mapRef.current.panTo({ lat: Number(marker.lat), lng: Number(marker.lng) });
@@ -1937,6 +3417,43 @@ const stopTouchPropagation = (event) => {
     }
     handleMarkerClick(marker);
   }, [handleMarkerClick]);
+
+  const irAPerdida = useCallback(async (marker, { abrirChat = false } = {}) => {
+    if (!marker) return;
+    await marcarPerdidasLeidas(
+      marker._id,
+      abrirChat ? ['chat', 'reclamo'] : ['cerca']
+    );
+    irAMiReporte(marker);
+    if (abrirChat) {
+      window.setTimeout(() => setMostrarChatReclamo(true), 60);
+    }
+  }, [marcarPerdidasLeidas, irAMiReporte]);
+
+  /** Actividad del aviso (chat/reclamo) vs aviso de cercanía: no se mezclan en el badge. */
+  const resumenAvisosPerdida = useCallback((markerId) => {
+    if (!markerId) return { chat: 0, cerca: 0 };
+    let chat = 0;
+    let cerca = 0;
+    notificaciones.forEach((n) => {
+      if (n.leida || String(n.markerId) !== String(markerId)) return;
+      if (n.tipo === 'chat' || n.tipo === 'reclamo') chat += 1;
+      else if (n.tipo === 'cerca') cerca += 1;
+    });
+    return { chat, cerca };
+  }, [notificaciones]);
+
+  const radarBadgeCerca = useMemo(() => (
+    notificaciones.reduce((acc, n) => (
+      (!n.leida && n.tipo === 'cerca') ? acc + 1 : acc
+    ), 0)
+  ), [notificaciones]);
+
+  const radarBadgeMios = useMemo(() => (
+    notificaciones.reduce((acc, n) => (
+      (!n.leida && (n.tipo === 'chat' || n.tipo === 'reclamo')) ? acc + 1 : acc
+    ), 0)
+  ), [notificaciones]);
 
   const verMisCasosEnElMapa = () => {
     setMostrarMisReportes(false);
@@ -1991,6 +3508,44 @@ const stopTouchPropagation = (event) => {
     }
   }, [renovandoId, userId, normalizeCategoryValue, editMode, irAMiReporte]);
 
+  const abrirCasoDesdeRegistro = useCallback(async (aviso) => {
+    if (!aviso?.markerId && !aviso?.caseId) return null;
+    const coincide = (item) => (
+      (aviso.markerId && String(item._id) === String(aviso.markerId))
+      || (aviso.caseId && Number(item.caseId) === Number(aviso.caseId))
+    );
+    const guardarYDevolver = (found) => {
+      if (!found) return null;
+      setMisReportesRegistro((prev) => {
+        if (prev.some((m) => m._id === found._id)) return prev;
+        return [found, ...prev];
+      });
+      setMisReportesSeccion('registro');
+      return found;
+    };
+    try {
+      // 1) Buscar por número de caso si viene
+      if (aviso.caseId) {
+        const { data } = await axios.get('http://localhost:5001/api/markers', {
+          headers: { 'x-user-id': userId },
+          params: { mine: '1', eliminados: '1', limit: 20, page: 1, q: String(aviso.caseId) },
+        });
+        const found = (data.items || []).map(normalizarMisItem).find(coincide);
+        if (found) return guardarYDevolver(found);
+      }
+      // 2) Últimos del registro propio (por id de marcador)
+      const { data } = await axios.get('http://localhost:5001/api/markers', {
+        headers: { 'x-user-id': userId },
+        params: { mine: '1', eliminados: '1', limit: 50, page: 1 },
+      });
+      const found = (data.items || []).map(normalizarMisItem).find(coincide);
+      return guardarYDevolver(found || null);
+    } catch (error) {
+      console.error('Error buscando caso en registro:', error);
+    }
+    return null;
+  }, [userId, normalizarMisItem]);
+
   const abrirDesdeNotificacion = useCallback(async (aviso) => {
     try {
       if (aviso && !aviso.leida && aviso._id) {
@@ -2002,26 +3557,199 @@ const stopTouchPropagation = (event) => {
         setNotificaciones((prev) =>
           prev.map((item) => (item._id === aviso._id ? { ...item, leida: true } : item))
         );
-        setNoLeidasLocal((prev) => {
-          const siguiente = Math.max(0, prev - 1);
-          if (onNoLeidasChange) onNoLeidasChange(siguiente);
-          return siguiente;
-        });
+        const esPerdida = aviso.tipo === 'reclamo' || aviso.tipo === 'chat' || aviso.tipo === 'cerca';
+        if (esPerdida) {
+          setPerdidasNoLeidasLocal((prev) => {
+            const siguiente = Math.max(0, prev - 1);
+            if (onPerdidasNoLeidasChange) onPerdidasNoLeidasChange(siguiente);
+            return siguiente;
+          });
+        } else {
+          setNoLeidasLocal((prev) => {
+            const siguiente = Math.max(0, prev - 1);
+            if (onNoLeidasChange) onNoLeidasChange(siguiente);
+            return siguiente;
+          });
+        }
       }
     } catch (error) {
       console.error('Error marcando aviso como leído:', error);
     }
+
+    // Admin en modo vecino → panel admin (no el registro / listas del vecino)
+    if (typeof onAbrirCasoAdmin === 'function' && aviso && (aviso.markerId || aviso.caseId)) {
+      if (TIPOS_NOTIF_PANEL_ADMIN.has(aviso.tipo)) {
+        const seccion = aviso.tipo === 'por_aprobar'
+          ? 'por_aprobar'
+          : (aviso.tipo === 'nueva_perdida' ? 'cosas_perdidas' : 'reportes');
+        setMostrarNotificaciones(false);
+        onAbrirCasoAdmin({
+          seccion,
+          casoId: aviso.markerId ? String(aviso.markerId) : null,
+          caseNumber: aviso.caseId != null ? Number(aviso.caseId) : null,
+          tenantId: aviso.tenantId ? String(aviso.tenantId) : '',
+          estado: aviso.tipo === 'por_aprobar' ? undefined : 'pendiente',
+        });
+        return;
+      }
+      if (notifApuntaAlRegistro(aviso) || aviso.tipo === 'resuelto' || aviso.tipo === 'rechazado') {
+        setMostrarNotificaciones(false);
+        onAbrirCasoAdmin({
+          seccion: 'registro',
+          casoId: aviso.markerId ? String(aviso.markerId) : null,
+          caseNumber: aviso.caseId != null ? Number(aviso.caseId) : null,
+          tenantId: aviso.tenantId ? String(aviso.tenantId) : '',
+          // Sin filtros: el buscador por #caso debe encontrar el aviso
+          registroTipo: '',
+          registroCategoria: '',
+          registroPeriodo: '',
+        });
+        return;
+      }
+      if (aviso.tipo === 'respuesta_datos') {
+        const seccion = String(aviso.mensaje || '').toLowerCase().includes('perdid')
+          ? 'cosas_perdidas'
+          : 'reportes';
+        setMostrarNotificaciones(false);
+        onAbrirCasoAdmin({
+          seccion,
+          casoId: aviso.markerId ? String(aviso.markerId) : null,
+          caseNumber: aviso.caseId != null ? Number(aviso.caseId) : null,
+          tenantId: aviso.tenantId ? String(aviso.tenantId) : '',
+          atencion: 'respuestas',
+        });
+        return;
+      }
+    }
+
     const marker = markers.find((item) =>
       String(item._id) === String(aviso.markerId)
       || (aviso.caseId && Number(item.caseId) === Number(aviso.caseId))
     );
-    if (marker) {
-      irAMiReporte(marker);
-    } else {
+
+    // Reclamo / chat → Míos + abrir ficha/chat. Cerca → mapa en el pin.
+    if (aviso?.tipo === 'reclamo' || aviso?.tipo === 'chat' || aviso?.tipo === 'cerca') {
       setMostrarNotificaciones(false);
-      mostrarAviso('Ese reporte ya no está disponible en el mapa.', true);
+      setMostrarMisReportes(false);
+      setMostrarFiltros(false);
+      if (aviso.tipo === 'cerca') {
+        setMostrarCosasPerdidas(true);
+        setPerdidasSeccion('cerca');
+        await cargarPerdidasLista('cerca', 1);
+        if (aviso.markerId) await marcarPerdidasLeidas(aviso.markerId);
+        if (marker) {
+          irAMiReporte(marker);
+          return;
+        }
+        const idDestacado = aviso.markerId ? String(aviso.markerId) : null;
+        setIdPerdidaDestacada(idDestacado);
+        if (idDestacado) {
+          window.setTimeout(() => {
+            const nodo = document.querySelector(`[data-perdida-id="${idDestacado}"]`);
+            if (nodo) nodo.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }, 180);
+          window.setTimeout(() => setIdPerdidaDestacada(null), 8000);
+        }
+        return;
+      }
+      setMostrarCosasPerdidas(true);
+      setPerdidasSeccion('activos');
+      await cargarPerdidasLista('activos', 1);
+      if (marker) {
+        await irAPerdida(marker, { abrirChat: true });
+        return;
+      }
+      if (aviso.markerId) await marcarPerdidasLeidas(aviso.markerId);
+      const idDestacado = aviso.markerId ? String(aviso.markerId) : null;
+      setIdPerdidaDestacada(idDestacado);
+      if (idDestacado) {
+        window.setTimeout(() => {
+          const nodo = document.querySelector(`[data-perdida-id="${idDestacado}"]`);
+          if (nodo) nodo.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 180);
+        window.setTimeout(() => setIdPerdidaDestacada(null), 8000);
+      }
+      return;
     }
-  }, [userId, markers, irAMiReporte, onNoLeidasChange]);
+
+    // Pedido de datos: abrir la ficha con el pedido fresco (aunque no esté en el mapa cargado)
+    if (aviso?.tipo === 'pedir_datos' && (aviso.markerId || aviso.caseId)) {
+      setMostrarNotificaciones(false);
+      let caso = marker;
+      if (!caso?.pideDatosMensaje) {
+        try {
+          const params = { mine: '1', limit: 50, page: 1 };
+          if (aviso.caseId) params.q = String(aviso.caseId);
+          const { data } = await axios.get('http://localhost:5001/api/markers', {
+            headers: { 'x-user-id': userId },
+            params,
+          });
+          const lista = (data.items || data || []).map((item) => ({
+            ...item,
+            isSaved: true,
+            category: normalizeCategoryValue(item.category),
+            createdBy: item.createdBy
+              ? String(item.createdBy).trim().toLowerCase()
+              : 'anonimo',
+            pideDatosAt: item.pideDatosAt || null,
+            pideDatosMensaje: item.pideDatosMensaje || '',
+          }));
+          const coincide = (item) => (
+            (aviso.markerId && String(item._id) === String(aviso.markerId))
+            || (aviso.caseId && Number(item.caseId) === Number(aviso.caseId))
+          );
+          caso = lista.find(coincide) || caso;
+          if (caso) {
+            setMarkers((prev) => (
+              prev.some((m) => String(m._id) === String(caso._id))
+                ? prev.map((m) => (String(m._id) === String(caso._id) ? { ...m, ...caso } : m))
+                : [...prev, caso]
+            ));
+          }
+        } catch (error) {
+          console.error('Error cargando caso del pedido de datos:', error);
+        }
+      }
+      if (caso) {
+        irAMiReporte(caso);
+        return;
+      }
+    }
+
+    // Casos resueltos / anulados: ir al Registro y sombrear el caso (sin abrir ficha)
+    if (notifApuntaAlRegistro(aviso) || !marker) {
+      setMostrarNotificaciones(false);
+      setMisReportesSeccion('registro');
+      setMostrarMisReportes(true);
+      await cargarMisLista('registro', 1);
+      const delRegistro = await abrirCasoDesdeRegistro(aviso);
+      const idDestacado = delRegistro?._id || aviso.markerId || null;
+      setIdRegistroDestacado(idDestacado ? String(idDestacado) : null);
+      if (idDestacado) {
+        window.setTimeout(() => {
+          const nodo = document.querySelector(`[data-registro-id="${String(idDestacado)}"]`);
+          if (nodo) nodo.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 180);
+        window.setTimeout(() => setIdRegistroDestacado(null), 8000);
+      }
+      return;
+    }
+
+    irAMiReporte(marker);
+  }, [
+    userId,
+    markers,
+    irAMiReporte,
+    irAPerdida,
+    onNoLeidasChange,
+    onPerdidasNoLeidasChange,
+    onAbrirCasoAdmin,
+    abrirCasoDesdeRegistro,
+    cargarMisLista,
+    cargarPerdidasLista,
+    marcarPerdidasLeidas,
+    normalizeCategoryValue,
+  ]);
 
   const marcarTodasLeidas = async () => {
     try {
@@ -2032,7 +3760,9 @@ const stopTouchPropagation = (event) => {
       );
       setNotificaciones((prev) => prev.map((item) => ({ ...item, leida: true })));
       setNoLeidasLocal(0);
+      setPerdidasNoLeidasLocal(0);
       if (onNoLeidasChange) onNoLeidasChange(0);
+      if (onPerdidasNoLeidasChange) onPerdidasNoLeidasChange(0);
     } catch (error) {
       console.error('Error marcando avisos:', error);
     }
@@ -2251,6 +3981,9 @@ const renderOficinas = (tipo, jurisdiccion) => {
 
   const renderBotonWhatsApp = () => {
     if (formData.category !== 'perros_gatos' || !contactoValido(formData.contacto)) return null;
+    const dueno = formData.createdBy ? String(formData.createdBy).trim().toLowerCase() : '';
+    // El dueño no se contacta a sí mismo; solo otros vecinos (o admin en el mapa)
+    if (!dueno || dueno === userId) return null;
     const tipo = ANIMAL_TIPOS[formData.animalTipo] || 'animal';
     const caso = formData.caseId ? ` #${formData.caseId}` : '';
     const url = whatsappUrl(
@@ -2258,15 +3991,26 @@ const renderOficinas = (tipo, jurisdiccion) => {
       `Hola, vi tu aviso de ${tipo}${caso} en CiudadAr y quiero ayudarte.`
     );
     if (!url) return null;
+    const digitos = digitosContacto(formData.contacto);
+    const telefonoVisible = digitos.length >= 4
+      ? `···${digitos.slice(-4)}`
+      : '';
     return (
-      <a
-        className="btn-whatsapp"
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
-        Contactar por WhatsApp
-      </a>
+      <div className="btn-whatsapp-wrap">
+        <a
+          className="btn-whatsapp"
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          WhatsApp a quien publicó el aviso
+        </a>
+        <small className="btn-whatsapp-nota">
+          Escribís al vecino que cargó este aviso
+          {telefonoVisible ? ` (${telefonoVisible})` : ''}
+          {caso ? ` · caso${caso}` : ''}.
+        </small>
+      </div>
     );
   };
 
@@ -2373,11 +4117,16 @@ const renderOficinas = (tipo, jurisdiccion) => {
 
   const renderAccionesCosasPerdidas = () => {
     if (formData.category !== 'cosas_perdidas' || !editMode) return null;
-    const esDueno = formData.createdBy && String(formData.createdBy).toLowerCase() === userId;
+    const esDueno = Boolean(
+      userId
+      && userId !== 'anonimo'
+      && formData.createdBy
+      && String(formData.createdBy).trim().toLowerCase() === String(userId).trim().toLowerCase()
+    );
     const publicado = formData.status === 'pendiente' || formData.status === 'en_proceso';
     if (!publicado && formData.status !== 'resuelto') return null;
-    const puedeAbrirChat = formData.canManage
-      || formData.claimedByMe
+    // Chat solo si hay reclamo real (o sos quien reclamó). Admin no abre chat “de vecino” acá.
+    const puedeAbrirChat = formData.claimedByMe
       || (esDueno && formData.claimCount > 0);
     const soyParte = esDueno || formData.claimedByMe;
     const abrioChat = !!formData.chatAbiertoPorMi;
@@ -2396,7 +4145,7 @@ const renderOficinas = (tipo, jurisdiccion) => {
 
     return (
       <div className="perdida-acciones">
-        {!esDueno && !formData.claimedByMe && !formData.canManage && publicado && (
+        {!esDueno && !formData.claimedByMe && publicado && (
           <button
             type="button"
             className="perdida-btn-reclamar"
@@ -2406,7 +4155,7 @@ const renderOficinas = (tipo, jurisdiccion) => {
             {textoReclamar}
           </button>
         )}
-        {esDueno && !formData.claimCount && !formData.canManage && (
+        {esDueno && !formData.claimCount && (
           <p className="perdida-espera">
             {textoEsperaDueno}
           </p>
@@ -2459,6 +4208,10 @@ const renderOficinas = (tipo, jurisdiccion) => {
 
   // Función para manejar la cancelación del formulario
   const handleCancel = () => {
+    // Si había un aviso abierto: al cerrar sigue brillante y sin puntero hasta mover el mapa
+    const idBrillo = (modoSoloCaso && focoCasoMapa?._id)
+      ? focoCasoMapa._id
+      : (editMode || highlightedMarkerId);
     setFormData({
       lat: 0,
       lng: 0,
@@ -2485,15 +4238,15 @@ const renderOficinas = (tipo, jurisdiccion) => {
     setCasosCercanos([]);
     setIsImageZoomed(false);
     setShowPopup(false);
-    setEditMode(null); // Salir del modo de edición
     setShowDeleteOnly(false);
     setRecienPublicado(false);
     setMostrarOpcionesFoto(false);
-    // En modo solo-caso el × cierra el popup y deja el pin brillando;
-    // "Volver a la ficha" del admin sale del mapa (onCerrarSoloCaso).
-    if (modoSoloCaso && focoCasoMapa?._id) {
-      setHighlightedMarkerId(focoCasoMapa._id);
-      setEditMode(focoCasoMapa._id);
+    if (idBrillo) {
+      setHighlightedMarkerId(idBrillo);
+      setOcultarPunteroMapa(true);
+      setEditMode(modoSoloCaso ? idBrillo : null);
+    } else {
+      setEditMode(null);
     }
   };
 
@@ -2507,12 +4260,22 @@ const renderOficinas = (tipo, jurisdiccion) => {
     const lng = Number(formData.lng);
     if (!mapRef.current || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
     const target = { lat, lng };
+    if (editMode) {
+      setHighlightedMarkerId(editMode);
+      setOcultarPunteroMapa(true);
+    }
+    omitirRestaurarPunteroRef.current = true;
+    omitirIdleRef.current = true;
     mapRef.current.panTo(target);
     mapRef.current.setZoom(18);
-    if (editMode) setHighlightedMarkerId(editMode);
+    window.setTimeout(() => {
+      omitirRestaurarPunteroRef.current = false;
+      omitirIdleRef.current = false;
+    }, 700);
     setIsImageZoomed(false);
     setShowPopup(false);
     setMostrarMisReportes(false);
+    setMostrarCosasPerdidas(false);
     setMostrarNotificaciones(false);
     setMostrarFiltros(false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -2530,7 +4293,7 @@ const renderOficinas = (tipo, jurisdiccion) => {
     } else {
       mapRef.current.setOptions({
         gestureHandling: 'greedy',
-        zoomControl: true,
+        zoomControl: false,
       });
     }
   }, [showPopup]);
@@ -2553,16 +4316,39 @@ const renderOficinas = (tipo, jurisdiccion) => {
       if (option.value === 'familias') {
         return isAdmin || hasFamiliesMarkers;
       }
-      return true; // Mostrar siempre: persona, perros_gatos, reparaciones
+      return true;
     });
     
     // Los filtros ya se aplican en el servidor; acá solo se muestran los ítems recibidos
     // Refuerzo: "Mi jurisdicción" = solo casos que este admin puede gestionar
-    const visibleMarkers = modoSoloCaso && focoCasoMapa?._id
+    const visibleMarkersBase = modoSoloCaso && focoCasoMapa?._id
       ? markers.filter((m) => String(m._id) === String(focoCasoMapa._id))
       : (soloMiJurisdiccion
         ? markers.filter((m) => m.canManage)
         : markers);
+    // Radar: Míos = tu lista. Cerca = pines del mapa general + búsqueda (si no, solo aparecen al “barrer” con el radio)
+    const visibleMarkers = (() => {
+      if (!mostrarCosasPerdidas || modoSoloCaso) return visibleMarkersBase;
+      const catRadar = radarModo === 'animales' ? 'perros_gatos' : 'cosas_perdidas';
+      const yo = String(userId || '').trim().toLowerCase();
+      const sirve = (m) => {
+        if (m.category !== catRadar) return false;
+        if (!Number.isFinite(Number(m.lat)) || !Number.isFinite(Number(m.lng))) return false;
+        if (perdidasSeccion === 'cerca' && yo && yo !== 'anonimo') {
+          const dueno = String(m.createdBy || '').trim().toLowerCase();
+          if (dueno === yo) return false;
+        }
+        return true;
+      };
+      if (perdidasSeccion === 'activos') {
+        return perdidasLista.filter(sirve);
+      }
+      // Cerca: no reemplazar el mapa por la búsqueda; unir mapa cargado + resultados del radio
+      const byId = new Map();
+      visibleMarkersBase.filter(sirve).forEach((m) => byId.set(String(m._id), m));
+      pinesCercaMapa.filter(sirve).forEach((m) => byId.set(String(m._id), m));
+      return Array.from(byId.values());
+    })();
     const misReportes = misReportesSeccion === 'registro'
       ? misReportesRegistro
       : misReportesActivos;
@@ -2601,20 +4387,23 @@ const renderOficinas = (tipo, jurisdiccion) => {
     }).sort((a, b) => Number(casoEsUrgente(b)) - Number(casoEsUrgente(a)));
     const currentStatus = formData.status || 'pendiente';
     const statusBadgeStyle = getStatusBadgeStyle(currentStatus);
-    const statusLabel = statusLabels[currentStatus] || currentStatus;
+    const statusLabel = etiquetaEstadoPopup(currentStatus, formData);
     const renderStatusInfo = (withLabel = true) => {
       if (esCasoFamilia(formData.category) && !isAdmin) {
         if (!editMode) return null;
         const avisado = formData.avisadoAt
           ? new Date(formData.avisadoAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })
           : null;
+        const enRevision = currentStatus === 'pendiente_aprobacion';
+        let textoFamilia = 'Tu aviso fue aceptado. No se publica para otros vecinos: el administrador lo gestiona con la oficina. Cuando avise, vas a ver la confirmación acá.';
+        if (avisado) {
+          textoFamilia = 'El administrador ya contactó a la oficina correspondiente. Este aviso quedó registrado y es anónimo: tu nombre no se muestra en el mapa.';
+        } else if (enRevision) {
+          textoFamilia = 'Tu aviso está en revisión. No se publica en el mapa de vecinos; solo lo ve el administrador.';
+        }
         return (
           <div className={`familias-aviso-vecino${avisado ? ' listo' : ''}`}>
-            <p>
-              {avisado
-                ? 'El administrador ya contactó a la oficina correspondiente. Este aviso es anónimo: tu nombre no se muestra en el mapa.'
-                : 'Tu aviso ya llegó al administrador. Cuando contacte a la oficina, vas a ver la confirmación acá. Este aviso es anónimo: tu nombre no se muestra en el mapa.'}
-            </p>
+            <p>{textoFamilia}</p>
             {avisado && <small>{avisado}</small>}
           </div>
         );
@@ -2649,10 +4438,28 @@ const renderOficinas = (tipo, jurisdiccion) => {
                 Tu aviso está por aprobar. Un administrador lo va a revisar y, cuando lo apruebe, va a aparecer en el mapa.
               </div>
             )}
+            {currentStatus === 'pendiente_cierre' && editMode && (
+              <div className="popup-aviso-pendiente">
+                La cuadrilla marcó el trabajo como hecho. El municipio está confirmando para cerrar el caso.
+              </div>
+            )}
+            {(currentStatus === 'rechazado' || (formData.eliminadoAt && String(formData.motivoEliminacion || '').toLowerCase().includes('anulado')))
+              && !isAdmin && editMode && (
+              <div className="popup-aviso-pendiente popup-aviso-anulado">
+                {(() => {
+                  const motivo = String(formData.motivoEliminacion || '')
+                    .replace(/^Anulado:\s*/i, '')
+                    .trim();
+                  return motivo
+                    ? `Este caso fue anulado. Motivo: ${motivo}`
+                    : 'Este caso fue anulado por el administrador.';
+                })()}
+              </div>
+            )}
             {formData.category === 'perros_gatos' && formData.animalTipo === 'abandonado' && !isAdmin && editMode && (
               <small className={formData.avisadoAt ? 'familias-aviso-vecino listo' : 'familias-nota'}>
                 {formData.avisadoAt
-                  ? `El administrador ya avisó al área de animales. ${new Date(formData.avisadoAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })}`
+                  ? `El municipio ya avisó al área de animales. El aviso sigue visible en el mapa. ${new Date(formData.avisadoAt).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })}`
                   : 'Cuando el administrador avise al área de animales, lo vas a ver acá.'}
               </small>
             )}
@@ -2773,6 +4580,12 @@ const renderOficinas = (tipo, jurisdiccion) => {
           imageUrl: imagen || data.imageUrl,
           pideDatosAt: null,
           pideDatosMensaje: '',
+          pideDatosPor: null,
+          ultimoPedidoDatosMensaje: data.ultimoPedidoDatosMensaje || '',
+          ultimoPedidoDatosAt: data.ultimoPedidoDatosAt || null,
+          ultimoPedidoDatosPor: data.ultimoPedidoDatosPor || null,
+          respuestaDatosMensaje: data.respuestaDatosMensaje || '',
+          respuestaDatosImageUrl: data.respuestaDatosImageUrl || '',
           respuestaDatosAt: data.respuestaDatosAt || new Date().toISOString(),
           ultimaRespuestaDatosAt: data.ultimaRespuestaDatosAt || new Date().toISOString(),
         };
@@ -2799,8 +4612,9 @@ const renderOficinas = (tipo, jurisdiccion) => {
       const esDueno = formData.createdBy && String(formData.createdBy).toLowerCase() === userId;
       if (!esDueno || !formData.pideDatosAt || isAdmin) return null;
       return (
-        <div className="popup-pedido-datos">
-          <p className="popup-pedido-datos-titulo">El administrador pide más datos</p>
+        <div className="popup-pedido-datos popup-pedido-datos-foco">
+          <p className="popup-pedido-datos-titulo">Te piden más datos</p>
+          <p className="popup-pedido-datos-etiqueta">Pedido del municipio</p>
           <p className="popup-pedido-datos-msg">
             {formData.pideDatosMensaje || 'Actualizá la descripción o la foto del caso.'}
           </p>
@@ -2809,12 +4623,12 @@ const renderOficinas = (tipo, jurisdiccion) => {
             <textarea
               value={respuestaDatos}
               onChange={(e) => setRespuestaDatos(e.target.value)}
-              rows={3}
-              placeholder="Completá o aclará lo que te pidieron…"
+              rows={4}
+              placeholder="Respondé a lo que te pidieron…"
+              autoFocus
             />
           </label>
           <div className="popup-pedido-datos-foto">
-            <span>Foto (opcional)</span>
             <input
               ref={inputGaleriaRespuestaRef}
               type="file"
@@ -2856,11 +4670,10 @@ const renderOficinas = (tipo, jurisdiccion) => {
                 className="popup-pedido-datos-agregar-foto"
                 onClick={() => setMostrarOpcionesFotoRespuesta(true)}
               >
-                Agregar o cambiar foto
+                + Foto opcional
               </button>
             ) : (
               <div className="popup-pedido-datos-opciones">
-                <p>¿Cómo querés cargar la foto?</p>
                 <div className="popup-foto-botones">
                   <button
                     type="button"
@@ -2876,25 +4689,37 @@ const renderOficinas = (tipo, jurisdiccion) => {
                   >
                     Cámara
                   </button>
+                  <button
+                    type="button"
+                    className="popup-foto-opcion"
+                    onClick={() => setMostrarOpcionesFotoRespuesta(false)}
+                  >
+                    Cancelar
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="popup-foto-volver-opciones"
-                  onClick={() => setMostrarOpcionesFotoRespuesta(false)}
-                >
-                  Volver
-                </button>
               </div>
             )}
           </div>
-          <button
-            type="button"
-            className="popup-btn-publicar"
-            onClick={enviarRespuestaDatos}
-            disabled={enviandoRespuestaDatos}
-          >
-            {enviandoRespuestaDatos ? 'Enviando…' : 'Enviar respuesta'}
-          </button>
+          <div className="popup-pedido-datos-acciones">
+            <button
+              type="button"
+              className="popup-btn-publicar"
+              onClick={enviarRespuestaDatos}
+              disabled={enviandoRespuestaDatos}
+            >
+              {enviandoRespuestaDatos ? 'Enviando…' : 'Enviar respuesta'}
+            </button>
+            {!modoSoloCaso && Number.isFinite(Number(formData.lat)) && Number.isFinite(Number(formData.lng)) && (
+              <button
+                type="button"
+                className="popup-btn-secundario"
+                onClick={handleViewOnMap}
+                disabled={enviandoRespuestaDatos}
+              >
+                Ver en el mapa
+              </button>
+            )}
+          </div>
         </div>
       );
     };
@@ -3099,19 +4924,142 @@ const renderOficinas = (tipo, jurisdiccion) => {
       );
     };
 
+    // Puntero de “confirmar lugar”: oculto con popup, paneles, o mientras un marcador brilla
     const mostrarSelectorPunto = !modoSoloCaso && !showPopup && !mostrarCercanos && !mostrarMisReportes
-      && !mostrarFiltros && !mostrarNotificaciones;
+      && !mostrarCosasPerdidas && !mostrarFiltros && !mostrarNotificaciones
+      && !ocultarPunteroMapa
+      && !highlightedMarkerId;
+    const mostrarMapaCerca = mostrarCosasPerdidas && perdidasSeccion === 'cerca';
+    const perdidasTotalPaginas = Math.max(1, Math.ceil((misMeta.total || 0) / (misMeta.limit || MIS_PAGE_SIZE)));
+    const radarBusquedaActiva = Boolean(normalizarBusquedaRadar(radarBusqueda));
+    const yoRadar = String(userId || '').trim().toLowerCase();
+    const perdidasListaBase = perdidasSeccion === 'cerca'
+      ? perdidasLista.filter((m) => {
+        if (yoRadar && yoRadar !== 'anonimo'
+          && String(m.createdBy || '').trim().toLowerCase() === yoRadar) {
+          return false;
+        }
+        return true;
+      })
+      : perdidasLista;
+    const perdidasListaFiltrada = radarBusquedaActiva
+      ? perdidasListaBase.filter((m) => coincideBusquedaRadar(m, radarBusqueda))
+      : perdidasListaBase;
     const tituloPopup = !editMode
       ? 'Publicar aviso'
       : (recienPublicado ? 'Aviso enviado' : 'Aviso');
+    const esMiAvisoPopup = Boolean(
+      editMode
+      && !isAdmin
+      && userId
+      && userId !== 'anonimo'
+      && formData.createdBy
+      && String(formData.createdBy).trim().toLowerCase() === userId
+    );
     const textoCategoriaPublicada = formData.category === 'cosas_perdidas'
       ? `${categoryLabels.cosas_perdidas}${formData.perdidaTipo ? ` · ${perdidaLabels[formData.perdidaTipo]}` : ''}`
       : (categoryLabels[formData.category] || formData.category || '—');
     const puedeEditarAviso = Boolean(editMode && canEdit && !showDeleteOnly);
 
     return (
-      <div className={`mapa-envoltorio${modoSoloCaso ? ' mapa-envoltorio-embebido' : ''}`}>
-        {!modoSoloCaso && (soloMisReportes || soloMiJurisdiccion || categoryFilter !== 'todas' || markersMeta.hasMore || markersMeta.total > 0) && (
+      <div className={`mapa-envoltorio${modoSoloCaso ? ' mapa-envoltorio-embebido' : ''}${guiaActiva ? ' mapa-con-guia' : ''}${mostrarCosasPerdidas ? ' mapa-con-perdidas' : ''}${mostrarCosasPerdidas && radarVistaAmpliada ? ' mapa-radar-ampliado' : ''}`}>
+        {modoSoloCaso && habilitarGuiaGps && (() => {
+          const paso = guiaActiva ? guiaPasos[guiaPasoIdx] : null;
+          const maniobra = guiaLlego ? 'llegada' : tipoManiobra(paso?.instruction);
+          const rumboAlPaso = (userLocation && paso?.end)
+            ? rumboEntre(userLocation, paso.end)
+            : null;
+          const flechaRelativa = (rumboAlPaso != null && userHeading != null)
+            ? ((rumboAlPaso - userHeading + 540) % 360) - 180
+            : 0;
+          return (
+          <div className="mapa-guia-barra">
+            <div className={`mapa-guia-maniobra mapa-guia-maniobra-${maniobra}`} aria-hidden="true">
+              {maniobra === 'izquierda' && (
+                <svg viewBox="0 0 24 24"><path fill="currentColor" d="M14 6v4h5v8h-2v-6h-5v4l-6-5 6-5z" /></svg>
+              )}
+              {maniobra === 'derecha' && (
+                <svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6v4H5v8h2v-6h5v4l6-5-6-5z" /></svg>
+              )}
+              {maniobra === 'uturn' && (
+                <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 7v3l-4-4 4-4v3c4.4 0 8 3.6 8 8v7h-2v-7c0-3.3-2.7-6-6-6z" /></svg>
+              )}
+              {(maniobra === 'recto' || maniobra === 'llegada') && (
+                <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2 6 10h4v10h4V10h4L12 2z" /></svg>
+              )}
+            </div>
+            {guiaLlego ? (
+              <div className="mapa-guia-indicacion mapa-guia-llego">
+                <strong>Llegaste al lugar</strong>
+                <span>Ya podés atender el caso</span>
+              </div>
+            ) : guiaRecalculando ? (
+              <div className="mapa-guia-indicacion">
+                <strong>Recalculando ruta…</strong>
+                <span>Te desviaste · buscando calles nuevas</span>
+              </div>
+            ) : guiaActiva && paso ? (
+              <div className="mapa-guia-indicacion">
+                <strong>{paso.instruction || 'Seguí la ruta'}</strong>
+                <span>
+                  {[paso.distance, guiaResumen].filter(Boolean).join(' · ')}
+                </span>
+              </div>
+            ) : (
+              <div className="mapa-guia-indicacion">
+                <strong>{guiaCargando ? 'Calculando ruta…' : 'Guía al caso'}</strong>
+                <span>
+                  {guiaError
+                    || (guiaResumen || 'Ruta en el mapa de CiudadAr, sin salir de la app')}
+                </span>
+              </div>
+            )}
+            {guiaActiva && !guiaLlego && (
+              <div
+                className="mapa-guia-brujula"
+                title="Dirección hacia el próximo punto"
+                style={{ transform: `rotate(${flechaRelativa}deg)` }}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path fill="currentColor" d="M12 2 4 20 12 16 20 20 12 2z" />
+                </svg>
+              </div>
+            )}
+            <div className="mapa-guia-acciones">
+              {!guiaActiva ? (
+                <button
+                  type="button"
+                  className="admin-dash-btn primario"
+                  disabled={guiaCargando}
+                  onClick={iniciarGuiaGps}
+                >
+                  {guiaCargando ? 'Calculando…' : 'Iniciar guía'}
+                </button>
+              ) : (
+                <>
+                  {!guiaLlego && (
+                    <button
+                      type="button"
+                      className="admin-dash-btn primario"
+                      onClick={guiaSimulando ? detenerSimulacionGuia : simularRecorridoGuia}
+                    >
+                      {guiaSimulando ? 'Pausar prueba' : 'Simular recorrido'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="admin-dash-btn"
+                    onClick={detenerGuiaGps}
+                  >
+                    Detener guía
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+          );
+        })()}
+        {!modoSoloCaso && !mostrarCosasPerdidas && (soloMisReportes || soloMiJurisdiccion || categoryFilter !== 'todas' || markersMeta.hasMore || markersMeta.total > 0) && (
           <div className="mapa-acciones">
             <div className="chip-filtros-activos">
               {soloMisReportes && <span>Solo mis reportes</span>}
@@ -3147,98 +5095,204 @@ const renderOficinas = (tipo, jurisdiccion) => {
             </div>
           </div>
         )}
-        <div className="mapa-lienzo">
+        <div className="mapa-lienzo" ref={mapaLienzoRef}>
           <GoogleMap
             mapContainerClassName="mapa-ciudad"
-            mapContainerStyle={{ width: '100%', height: '100%' }}
-            center={mapCenter}
-            zoom={modoSoloCaso || userLocation ? 18 : 15}
+            mapContainerStyle={mapaContainerStyle}
             onLoad={onMapLoad}
-            options={{
-              mapTypeId: 'roadmap',
-              streetViewControl: false,
-              mapTypeControl: false,
-              fullscreenControl: false,
-              // Sin íconos de negocios/POI: no se confunden con los pines de CiudadAr
-              styles: [
-                { featureType: 'poi', stylers: [{ visibility: 'off' }] },
-                { featureType: 'poi.business', stylers: [{ visibility: 'off' }] },
-                { featureType: 'transit', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
-              ],
-            }}
+            options={mapaOpciones}
           >
-          {userLocation && (
+          {mapaListoTick > 0 && userLocation && (
             <OverlayView
               position={userLocation}
-              mapPaneName={OverlayView.OVERLAY_LAYER}
+              mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
             >
-              <div className="ubicacion-actual">
+              <div className={`ubicacion-actual${guiaActiva ? ' ubicacion-actual-guia' : ''}`}>
+                <span className="ubicacion-halo" />
+                {guiaActiva ? (
+                  <span
+                    className="ubicacion-flecha"
+                    style={{
+                      transform: `translate(-50%, -50%) rotate(${userHeading != null ? userHeading : 0}deg)`,
+                    }}
+                    aria-label="Tu dirección"
+                  >
+                    <svg viewBox="0 0 48 48" aria-hidden="true">
+                      <path
+                        d="M24 4 L40 42 L24 34 L8 42 Z"
+                        fill="#2F6FDB"
+                        stroke="#fff"
+                        strokeWidth="3"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </span>
+                ) : (
+                  <span className="ubicacion-punto" />
+                )}
+              </div>
+            </OverlayView>
+          )}
+          {guiaActiva && guiaPath.length > 1 && (
+            <>
+              <Polyline
+                path={guiaPath}
+                options={{
+                  strokeColor: '#ffffff',
+                  strokeOpacity: 0.95,
+                  strokeWeight: 10,
+                  geodesic: true,
+                  zIndex: 1,
+                }}
+              />
+              <Polyline
+                path={guiaPath}
+                options={{
+                  strokeColor: '#2F6FDB',
+                  strokeOpacity: 1,
+                  strokeWeight: 6,
+                  geodesic: true,
+                  zIndex: 2,
+                }}
+              />
+            </>
+          )}
+          {guiaActiva && guiaDestino && (
+            <OverlayView
+              position={guiaDestino}
+              mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+            >
+              <div
+                className="mapa-guia-destino"
+                style={{ transform: 'translate(-18px, -36px)' }}
+                aria-label="Destino del caso"
+              >
+                <svg viewBox="0 0 36 36" aria-hidden="true">
+                  <path
+                    fill="#e11d48"
+                    stroke="#fff"
+                    strokeWidth="2"
+                    d="M18 2c-6 0-11 5-11 11 0 8.5 11 21 11 21s11-12.5 11-21c0-6-5-11-11-11zm0 15a4 4 0 1 1 0-8 4 4 0 0 1 0 8z"
+                  />
+                </svg>
+              </div>
+            </OverlayView>
+          )}
+          <CapaPinesMapa
+            markers={visibleMarkers}
+            mapaListoTick={mapaListoTick}
+            userId={userId}
+            isAdmin={isAdmin}
+            highlightedMarkerId={highlightedMarkerId}
+            modoSoloCaso={modoSoloCaso}
+            focoCasoId={focoCasoMapa?._id || null}
+            soloMisReportes={soloMisReportes}
+            onMarkerClick={handleMarkerClick}
+          />
+          {/* Radio Radar: un solo google.maps.Circle vía radioCercaCircleRef (no <Circle/> React) */}
+          {/* Punto verde de zona vigilada (mismo estilo que el azul GPS) */}
+          {mapaListoTick > 0 && mostrarMapaCerca && zonaAlerta
+            && Number.isFinite(Number(zonaAlerta.lat))
+            && Number.isFinite(Number(zonaAlerta.lng)) && (
+            <OverlayView
+              position={{ lat: Number(zonaAlerta.lat), lng: Number(zonaAlerta.lng) }}
+              mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+            >
+              <div
+                className={`ubicacion-actual ubicacion-vigilada${cercaOrigen === 'vigilada' ? ' activa' : ''}`}
+                title="Zona vigilada"
+                aria-hidden="true"
+              >
                 <span className="ubicacion-halo" />
                 <span className="ubicacion-punto" />
               </div>
             </OverlayView>
           )}
-          {visibleMarkers.map((marker, index) => {
-            const posicion = { lat: Number(marker.lat), lng: Number(marker.lng) };
-            const clave = marker._id || `nuevo-${index}`;
-            const esMio = (marker.createdBy
-              ? String(marker.createdBy).trim().toLowerCase()
-              : 'anonimo') === userId;
-            const destacar = (
-              (highlightedMarkerId != null && String(highlightedMarkerId) === String(marker._id))
-              || (modoSoloCaso && focoCasoMapa?._id && String(focoCasoMapa._id) === String(marker._id))
-              || (soloMisReportes && esMio)
-            );
-            if (destacar) {
-              return (
-                <OverlayView
-                  key={clave}
-                  position={posicion}
-                  mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
-                  getPixelPositionOffset={() => ({ x: -PUNTA_LUZ_X, y: -PUNTA_LUZ_Y })}
-                >
-                  <button
-                    type="button"
-                    className="pin-elegido"
-                    style={{ width: ANCHO_LUZ, height: ALTO_LUZ }}
-                    onMouseDown={(event) => event.stopPropagation()}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      handleMarkerClick(marker);
-                    }}
-                    aria-label="Reporte seleccionado"
-                  >
-                    <img src={marcadorCiudadLuz} alt="" className="pin-elegido-luz" />
-                    <img
-                      src={marcadorCiudad}
-                      alt=""
-                      className="pin-elegido-cuerpo"
-                      style={{
-                        width: ANCHO_PIN,
-                        height: ALTO_PIN,
-                        left: PUNTA_LUZ_X - ANCHO_PIN / 2,
-                        top: PUNTA_LUZ_Y - PUNTA_PIN_Y,
-                      }}
-                    />
-                  </button>
-                </OverlayView>
-              );
-            }
-            return (
-              <Marker
-                key={clave}
-                position={posicion}
-                onClick={() => handleMarkerClick(marker)}
-                options={{ icon: iconoReporte(), zIndex: 1 }}
-              />
-            );
-          })}
           </GoogleMap>
+
+          {!isImageZoomed && (
+            <div className={`mapa-zoom-controles${mostrarMapaCerca ? ' con-radar' : ''}`} role="group" aria-label="Zoom del mapa">
+              <button
+                type="button"
+                className="mapa-btn-zoom"
+                onClick={() => {
+                  const map = mapRef.current;
+                  if (!map?.getZoom) return;
+                  const z = map.getZoom();
+                  if (!Number.isFinite(z)) return;
+                  map.setZoom(Math.min(21, z + 1));
+                }}
+                aria-label="Acercar mapa"
+                title="Acercar"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="mapa-btn-zoom"
+                onClick={() => {
+                  const map = mapRef.current;
+                  if (!map?.getZoom) return;
+                  const z = map.getZoom();
+                  if (!Number.isFinite(z)) return;
+                  map.setZoom(Math.max(3, z - 1));
+                }}
+                aria-label="Alejar mapa"
+                title="Alejar"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path fill="currentColor" d="M19 13H5v-2h14v2z" />
+                </svg>
+              </button>
+            </div>
+          )}
+
+          {!modoSoloCaso && !isImageZoomed && !radarVistaAmpliada && (
+            <div
+              className={`mapa-leyenda-pines${mostrarSelectorPunto ? ' con-barra' : ''}`}
+              role="region"
+              aria-label="Leyenda de pines"
+            >
+              <ul className="panel-pin-leyenda">
+                {LEYENDA_PINES.map((item) => (
+                  <li key={item.key}>
+                    <span className="leyenda-punto" style={{ background: item.color }} />
+                    {item.label}
+                  </li>
+                ))}
+                <li>
+                  <span className="leyenda-punto leyenda-punto-mio" aria-hidden="true" />
+                  Publicado por vos
+                </li>
+              </ul>
+            </div>
+          )}
+
+          {modoSoloCaso && habilitarGuiaGps && (
+            <button
+              type="button"
+              className={`mapa-btn-ubicacion mapa-btn-ubicacion-flotante${userLocation ? '' : ' desactivado'}`}
+              onClick={irAMiUbicacion}
+              disabled={!userLocation}
+              aria-label="Volver a mi ubicación"
+              title="Mi ubicación"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M12 8a4 4 0 1 0 4 4 4 4 0 0 0-4-4zm8.94 3A8.99 8.99 0 0 0 13 3.06V1h-2v2.06A8.99 8.99 0 0 0 3.06 11H1v2h2.06A8.99 8.99 0 0 0 11 20.94V23h2v-2.06A8.99 8.99 0 0 0 20.94 13H23v-2zM12 19a7 7 0 1 1 7-7 7 7 0 0 1-7 7z"
+                />
+              </svg>
+            </button>
+          )}
 
           {mostrarSelectorPunto && (
             <>
               <div
-                className={`pin-central${pinMoviendo ? ' moviendo' : ''}`}
+                ref={(el) => { pinCentralRefs.current[0] = el; }}
+                className="pin-central"
                 aria-hidden="true"
               >
                 <img src={marcadorCiudad} alt="" />
@@ -3279,6 +5333,137 @@ const renderOficinas = (tipo, jurisdiccion) => {
               </div>
             </>
           )}
+
+          {mostrarMapaCerca && cercaOrigen === 'mapa' && (
+            <div
+              ref={(el) => { pinCentralRefs.current[1] = el; }}
+              className="pin-central pin-central-cerca pin-cerca-mapa"
+              aria-hidden="true"
+            >
+              <span className="pin-cerca-radar" />
+              <img src={marcadorCiudad} alt="" />
+            </div>
+          )}
+
+          {mostrarMapaCerca && (
+            <div className={`mapa-radar-controles${cercaOrigen === 'mapa' ? ' modo-mapa' : (cercaOrigen === 'vigilada' ? ' modo-vigilada' : ' modo-gps')}${zonaAlerta ? ' con-vigilancia' : ''}`}>
+              <div className="mapa-radar-origen" role="group" aria-label="Origen del radio">
+                <button
+                  type="button"
+                  className={cercaOrigen === 'gps' ? 'activo activo-gps' : ''}
+                  disabled={!userLocation}
+                  onClick={() => {
+                    ignorarDragCercaRef.current = true;
+                    if (userLocation) {
+                      setMapCenter(userLocation);
+                      if (mapRef.current) mapRef.current.panTo(userLocation);
+                    }
+                    setCercaOrigen('gps');
+                    cargarPerdidasLista('cerca', 1, 'gps');
+                    window.setTimeout(() => { ignorarDragCercaRef.current = false; }, 600);
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M12 8a4 4 0 1 0 4 4 4 4 0 0 0-4-4zm8.94 3A8.99 8.99 0 0 0 13 3.06V1h-2v2.06A8.99 8.99 0 0 0 3.06 11H1v2h2.06A8.99 8.99 0 0 0 11 20.94V23h2v-2.06A8.99 8.99 0 0 0 20.94 13H23v-2zM12 19a7 7 0 1 1 7-7 7 7 0 0 1-7 7z"
+                    />
+                  </svg>
+                  Cerca de mí
+                </button>
+                <button
+                  type="button"
+                  className={cercaOrigen === 'mapa' ? 'activo activo-mapa' : ''}
+                  onClick={() => {
+                    setCercaOrigen('mapa');
+                    programarReloadCercaDesdeMapa();
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z"
+                    />
+                  </svg>
+                  Otra zona
+                </button>
+              </div>
+              <label className="mapa-radar-radio">
+                <span>
+                  Radio
+                  {' '}
+                  <strong>
+                    {cercaRadioMetros < 1000
+                      ? `${cercaRadioMetros} m`
+                      : `${(cercaRadioMetros / 1000).toFixed(1)} km`}
+                  </strong>
+                </span>
+                <input
+                  type="range"
+                  min={500}
+                  max={8000}
+                  step={100}
+                  value={cercaRadioMetros}
+                  onChange={(e) => setCercaRadioMetros(Number(e.target.value))}
+                  aria-label="Radio de búsqueda"
+                />
+              </label>
+              <div className="mapa-radar-vigilancia" role="group" aria-label="Zona vigilada">
+                <button
+                  type="button"
+                  className="mapa-radar-vigilancia-btn primario"
+                  disabled={guardandoZonaAlerta}
+                  onClick={() => {
+                    guardarZonaAlerta(false);
+                  }}
+                >
+                  {guardandoZonaAlerta ? 'Guardando…' : (zonaAlerta ? 'Actualizar zona vigilada' : 'Vigilar esta zona')}
+                </button>
+                {zonaAlerta && (
+                  <>
+                    <button
+                      type="button"
+                      className={`mapa-radar-vigilancia-btn${cercaOrigen === 'vigilada' ? ' activo' : ''}`}
+                      onClick={() => {
+                        const punto = {
+                          lat: Number(zonaAlerta.lat),
+                          lng: Number(zonaAlerta.lng),
+                        };
+                        ignorarDragCercaRef.current = true;
+                        setMapCenter(punto);
+                        setCercaOrigen('vigilada');
+                        if (zonaAlerta.radio) setCercaRadioMetros(Number(zonaAlerta.radio));
+                        if (mapRef.current) mapRef.current.panTo(punto);
+                        cargarPerdidasLista('cerca', 1, 'vigilada');
+                        window.setTimeout(() => { ignorarDragCercaRef.current = false; }, 600);
+                      }}
+                    >
+                      Ver vigilada
+                    </button>
+                    <button
+                      type="button"
+                      className="mapa-radar-vigilancia-btn"
+                      disabled={guardandoZonaAlerta}
+                      onClick={() => guardarZonaAlerta(true)}
+                    >
+                      Dejar de vigilar
+                    </button>
+                  </>
+                )}
+              </div>
+              <p className="mapa-radar-ayuda">
+                {geoError
+                  ? geoError
+                  : (cercaOrigen === 'vigilada'
+                    ? 'Verde: zona vigilada. Te avisamos si publican ahí.'
+                    : (cercaOrigen === 'gps'
+                      ? (userLocation
+                        ? 'Azul: cerca de vos. Al mover el mapa pasa a naranja.'
+                        : 'Buscando tu ubicación…')
+                      : 'Naranja: otra zona. Mové el mapa para elegir el centro.'))}
+              </p>
+            </div>
+          )}
         </div>
 
         {showPopup && (
@@ -3302,7 +5487,10 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     <path fill="currentColor" d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z" />
                   </svg>
                 </button>
-                <strong>{tituloPopup}</strong>
+                <strong className={esMiAvisoPopup ? 'popup-titulo-con-etiqueta' : undefined}>
+                  {tituloPopup}
+                  {esMiAvisoPopup && <em className="popup-etiqueta-mio">Tu aviso</em>}
+                </strong>
                 <button
                   type="button"
                   className="popup-nav-btn"
@@ -3437,6 +5625,53 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     </form>
                   ) : (
                     <div className="popup-formulario popup-form-publicar">
+                      {(() => {
+                        const esDuenoPedido = formData.createdBy
+                          && String(formData.createdBy).toLowerCase() === userId
+                          && formData.pideDatosAt
+                          && !isAdmin;
+                        if (esDuenoPedido) {
+                          const detalleTipo = formData.category === 'perros_gatos' && formData.animalTipo
+                            ? (ANIMAL_TIPOS[formData.animalTipo] || formData.animalTipo)
+                            : (formData.category === 'cosas_perdidas' && formData.objeto
+                              ? formData.objeto
+                              : '');
+                          return (
+                            <>
+                              <div className="popup-pedido-resumen">
+                                <p className="popup-pedido-resumen-caso">
+                                  {formData.caseId ? `Caso #${formData.caseId}` : 'Tu aviso'}
+                                  {' · '}
+                                  {textoCategoriaPublicada}
+                                  {detalleTipo ? ` · ${detalleTipo}` : ''}
+                                </p>
+                                {selectedImage && (
+                                  <img
+                                    className="popup-pedido-resumen-foto"
+                                    src={selectedImage}
+                                    alt="Foto de tu aviso"
+                                    onError={handleImageError}
+                                  />
+                                )}
+                                {formData.description && (
+                                  <p className="popup-pedido-resumen-texto">
+                                    <span className="popup-pedido-resumen-label">Tu publicación</span>
+                                    {formData.description}
+                                  </p>
+                                )}
+                                {formData.direccion && (
+                                  <p className="popup-pedido-resumen-zona">
+                                    <IconoUbicacion />
+                                    <span>{formData.direccion}</span>
+                                  </p>
+                                )}
+                              </div>
+                              {renderPedidoDatosVecino()}
+                            </>
+                          );
+                        }
+                        return (
+                          <>
                       {recienPublicado && (
                         <h3 className="popup-pregunta">Tu aviso quedó registrado</h3>
                       )}
@@ -3548,6 +5783,9 @@ const renderOficinas = (tipo, jurisdiccion) => {
                           Listo
                         </button>
                       )}
+                          </>
+                        );
+                      })()}
                     </div>
                   )}
                 </div>
@@ -3806,6 +6044,14 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     ))}
                   </select>
                 </label>
+                <ul className="panel-pin-leyenda" aria-label="Colores de los pines">
+                  {LEYENDA_PINES.map((item) => (
+                    <li key={item.key}>
+                      <span className="leyenda-punto" style={{ background: item.color }} />
+                      {item.label}
+                    </li>
+                  ))}
+                </ul>
                 {categoryFilter === 'perros_gatos' && (
                   <label>
                     De qué se trata
@@ -3813,10 +6059,10 @@ const renderOficinas = (tipo, jurisdiccion) => {
                       value={animalFilter}
                       onChange={(e) => setAnimalFilter(e.target.value)}
                     >
-                      <option value="todos">Todos</option>
                       {Object.entries(ANIMAL_TIPOS).map(([value, label]) => (
                         <option key={value} value={value}>{label}</option>
                       ))}
+                      <option value="todos">Todos</option>
                     </select>
                   </label>
                 )}
@@ -3854,11 +6100,25 @@ const renderOficinas = (tipo, jurisdiccion) => {
         )}
 
         {mostrarMisReportes && (
-          <div className="panel-vecino-fondo" onClick={() => setMostrarMisReportes(false)}>
+          <div
+            className="panel-vecino-fondo"
+            onClick={() => {
+              setMostrarMisReportes(false);
+              setIdRegistroDestacado(null);
+            }}
+          >
             <div className="panel-vecino" onClick={(event) => event.stopPropagation()}>
               <div className="panel-vecino-cabecera">
                 <h3>Mis reportes</h3>
-                <button type="button" onClick={() => setMostrarMisReportes(false)}>Cerrar</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMostrarMisReportes(false);
+                    setIdRegistroDestacado(null);
+                  }}
+                >
+                  Cerrar
+                </button>
               </div>
               <div className="panel-mis-tabs" role="tablist">
                 <button
@@ -3941,26 +6201,35 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     const enRegistro = Boolean(marker.eliminadoAt)
                       || marker.status === 'resuelto'
                       || marker.status === 'rechazado';
+                    const vencida = esPublicacionVencida(marker);
+                    const motivoBaja = String(marker.motivoEliminacion || '').toLowerCase();
                     const estadoTexto = enRegistro
-                      ? (marker.status === 'rechazado'
-                        ? 'Anulado'
-                        : (String(marker.motivoEliminacion || '').toLowerCase().includes('vencimiento')
-                          ? 'Vencido'
-                          : (statusLabels[marker.status] || 'En registro')))
-                      : (statusLabels[marker.status] || marker.status);
+                      ? (motivoBaja.includes('vencimiento') || vencida
+                        ? 'Vencido'
+                        : (marker.status === 'resuelto'
+                          || motivoBaja.includes('resuelto')
+                          || motivoBaja.includes('recuper')
+                          || motivoBaja.includes('cierre del administrador')
+                          ? 'Resuelto'
+                          : 'Anulado'))
+                      : etiquetaEstadoPopup(marker.status || 'pendiente', marker);
                     const actividad = marker.pideDatosAt
                       ? 'Te pidieron más datos'
                       : (marker.ultimaRespuestaDatosAt
                         ? `Respondiste datos el ${new Date(marker.ultimaRespuestaDatosAt).toLocaleDateString('es-AR')}`
                         : null);
-                    const vencida = esPublicacionVencida(marker);
+                    const destacado = idRegistroDestacado
+                      && String(marker._id) === String(idRegistroDestacado);
                     return (
-                      <li key={marker._id}>
-                        <div className="tarjeta-mi-reporte-wrap">
+                      <li key={marker._id} data-registro-id={marker._id}>
+                        <div className={`tarjeta-mi-reporte-wrap${destacado ? ' tarjeta-mi-reporte-destacada' : ''}`}>
                           <button
                             type="button"
-                            className="tarjeta-mi-reporte"
-                            onClick={() => irAMiReporte(marker)}
+                            className={`tarjeta-mi-reporte${destacado ? ' tarjeta-mi-reporte-sombra' : ''}`}
+                            onClick={() => {
+                              setIdRegistroDestacado(null);
+                              irAMiReporte(marker);
+                            }}
                           >
                             {foto ? (
                               <img
@@ -3992,6 +6261,11 @@ const renderOficinas = (tipo, jurisdiccion) => {
                               </span>
                               {actividad && (
                                 <span className="tarjeta-mi-reporte-actividad">{actividad}</span>
+                              )}
+                              {enRegistro && marker.status === 'rechazado' && marker.motivoEliminacion && (
+                                <span className="tarjeta-mi-reporte-actividad">
+                                  {`Motivo: ${String(marker.motivoEliminacion).replace(/^Anulado:\s*/i, '')}`}
+                                </span>
                               )}
                               {direccion && (
                                 <span className="tarjeta-mi-reporte-direccion">{direccion}</span>
@@ -4050,6 +6324,460 @@ const renderOficinas = (tipo, jurisdiccion) => {
           </div>
         )}
 
+        {mostrarCosasPerdidas && (
+          <aside className={`perdidas-panel-lateral${radarVistaAmpliada ? ' ampliado' : ''}`} aria-label="Radar">
+              {radarVistaAmpliada ? (
+                <div className="panel-vecino-cabecera panel-radar-cabecera-ampliada">
+                  <button
+                    type="button"
+                    className="panel-radar-volver"
+                    onClick={() => {
+                      setRadarVistaAmpliada(false);
+                      setMisPage(1);
+                      cargarPerdidasLista(
+                        perdidasSeccion,
+                        1,
+                        perdidasSeccion === 'cerca' ? cercaOrigen : null,
+                        radarModo,
+                        animalFiltroRadar,
+                        MIS_PAGE_SIZE
+                      );
+                    }}
+                  >
+                    ← Volver
+                  </button>
+                  <h3>
+                    {perdidasSeccion === 'cerca'
+                      ? (cercaOrigen === 'gps'
+                        ? 'Cerca de mí'
+                        : (cercaOrigen === 'vigilada'
+                          ? 'Zona vigilada'
+                          : 'Esta zona'))
+                      : (radarModo === 'animales' ? 'Mis animales' : 'Mis cosas')}
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRadarVistaAmpliada(false);
+                      setMostrarCosasPerdidas(false);
+                      setIdPerdidaDestacada(null);
+                    }}
+                  >
+                    Cerrar
+                  </button>
+                </div>
+              ) : (
+                <div className="panel-vecino-cabecera">
+                  <h3>
+                    Radar
+                    {perdidasNoLeidasLocal > 0 ? ` (${perdidasNoLeidasLocal})` : ''}
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMostrarCosasPerdidas(false);
+                      setIdPerdidaDestacada(null);
+                    }}
+                  >
+                    Cerrar
+                  </button>
+                </div>
+              )}
+              {radarVistaAmpliada && perdidasSeccion === 'cerca' && (
+                <p className="panel-radar-zona-meta">
+                  {cercaOrigen === 'gps'
+                    ? 'Avisos del radio azul (cerca de vos).'
+                    : (cercaOrigen === 'vigilada'
+                      ? 'Avisos del radio verde vigilado.'
+                      : 'Avisos del radio naranja de esta zona.')}
+                  {' '}
+                  <strong>
+                    {cercaRadioMetros < 1000
+                      ? `${cercaRadioMetros} m`
+                      : `${(cercaRadioMetros / 1000).toFixed(1)} km`}
+                  </strong>
+                  {radarModo === 'animales' ? ' · Animales' : ' · Cosas'}
+                </p>
+              )}
+              {!radarVistaAmpliada && (
+                <>
+              {/* Radar = Cosas + Animales (reparaciones quedan en el mapa / Mis reportes) */}
+              <div className="panel-mis-tabs panel-radar-modos" role="tablist" aria-label="Tipo de radar">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={radarModo === 'cosas'}
+                  className={radarModo === 'cosas' ? 'activo' : ''}
+                  onClick={() => {
+                    setRadarModo('cosas');
+                    setMisPage(1);
+                    cargarPerdidasLista(perdidasSeccion, 1, null, 'cosas');
+                  }}
+                >
+                  <span
+                    className="leyenda-punto"
+                    style={{ background: COLOR_PIN_CATEGORIA.cosas_perdidas }}
+                    aria-hidden="true"
+                  />
+                  Cosas
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={radarModo === 'animales'}
+                  className={radarModo === 'animales' ? 'activo' : ''}
+                  onClick={() => {
+                    setRadarModo('animales');
+                    setMisPage(1);
+                    cargarPerdidasLista(perdidasSeccion, 1, null, 'animales');
+                  }}
+                >
+                  <span
+                    className="leyenda-punto"
+                    style={{ background: COLOR_PIN_CATEGORIA.perros_gatos }}
+                    aria-hidden="true"
+                  />
+                  Animales
+                </button>
+              </div>
+              <div className="panel-mis-tabs" role="tablist" aria-label="Sección">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={perdidasSeccion === 'cerca'}
+                  className={perdidasSeccion === 'cerca' ? 'activo' : ''}
+                  onClick={() => {
+                    setPerdidasSeccion('cerca');
+                    setMisPage(1);
+                    cargarPerdidasLista('cerca', 1);
+                  }}
+                >
+                  Cerca
+                  {radarBadgeCerca > 0 && perdidasSeccion !== 'cerca' && (
+                    <em className="panel-tab-badge">{radarBadgeCerca > 9 ? '9+' : radarBadgeCerca}</em>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={perdidasSeccion === 'activos'}
+                  className={perdidasSeccion === 'activos' ? 'activo' : ''}
+                  onClick={() => {
+                    setPerdidasSeccion('activos');
+                    setMisPage(1);
+                    cargarPerdidasLista('activos', 1);
+                  }}
+                >
+                  Míos
+                  {radarBadgeMios > 0 && (
+                    <em className="panel-tab-badge">{radarBadgeMios > 9 ? '9+' : radarBadgeMios}</em>
+                  )}
+                </button>
+              </div>
+              {radarModo === 'animales' && (
+                <div className="panel-cerca-origen panel-radar-animal-filtros" role="group" aria-label="Tipo de animal">
+                  {[
+                    { value: 'todos', label: 'Todos' },
+                    { value: 'perdido', label: 'Perdidos' },
+                    { value: 'abandonado', label: 'Abandonados' },
+                    { value: 'adopcion', label: 'Adopción' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      className={animalFiltroRadar === opt.value ? 'activo' : ''}
+                      onClick={() => {
+                        setAnimalFiltroRadar(opt.value);
+                        setMisPage(1);
+                        cargarPerdidasLista(perdidasSeccion, 1, null, 'animales', opt.value);
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <label className="panel-radar-busqueda">
+                <span className="sr-only">Buscar en avisos</span>
+                <input
+                  type="search"
+                  value={radarBusqueda}
+                  onChange={(e) => setRadarBusqueda(e.target.value)}
+                  placeholder={radarModo === 'animales'
+                    ? 'Buscar: perdido, calle, color…'
+                    : 'Buscar: llaves, DNI, mochila…'}
+                  aria-label="Buscar coincidencias en los avisos del Radar"
+                  autoComplete="off"
+                />
+                {radarBusquedaActiva && (
+                  <button
+                    type="button"
+                    className="panel-radar-busqueda-limpiar"
+                    onClick={() => setRadarBusqueda('')}
+                    aria-label="Limpiar búsqueda"
+                  >
+                    ×
+                  </button>
+                )}
+              </label>
+                </>
+              )}
+              {cargandoMisLista ? (
+                <p className="panel-vecino-vacio">Cargando…</p>
+              ) : perdidasLista.length === 0 ? (
+                <p className="panel-vecino-vacio">
+                  {perdidasSeccion === 'cerca'
+                    ? (userLocation || mapCenter
+                      ? (radarModo === 'animales'
+                        ? 'No hay avisos de animales cerca de este punto.'
+                        : 'No hay avisos de cosas perdidas cerca de este punto.')
+                      : 'Activá la ubicación o mové el mapa para buscar.')
+                    : (radarModo === 'animales'
+                      ? 'No tenés avisos activos de animales.'
+                      : 'No tenés avisos activos de cosas perdidas.')}
+                </p>
+              ) : perdidasListaFiltrada.length === 0 ? (
+                <p className="panel-vecino-vacio">
+                  Ningún aviso coincide con “{radarBusqueda.trim()}”. Probá otras palabras.
+                </p>
+              ) : (
+                <>
+                <p className="panel-mis-meta">
+                  {radarBusquedaActiva
+                    ? `${perdidasListaFiltrada.length} coincidencia${perdidasListaFiltrada.length === 1 ? '' : 's'} de ${perdidasLista.length} en esta página`
+                    : `Mostrando ${perdidasLista.length} de ${misMeta.total} · página ${misPage} de ${perdidasTotalPaginas}`}
+                </p>
+                <ul className={`panel-vecino-lista panel-mis-reportes${radarVistaAmpliada ? ' panel-radar-lista-ampliada' : ''}`}>
+                  {perdidasListaFiltrada.map((marker) => {
+                    const esAnimal = marker.category === 'perros_gatos';
+                    const tituloObjeto = (marker.objeto || '').trim()
+                      || (esAnimal ? (ANIMAL_TIPOS[marker.animalTipo] || 'Animal') : '');
+                    const subtipo = marker.perdidaTipo
+                      ? (perdidaLabels[marker.perdidaTipo] || marker.perdidaTipo)
+                      : (esAnimal && ANIMAL_TIPOS[marker.animalTipo]
+                        ? ANIMAL_TIPOS[marker.animalTipo]
+                        : null);
+                    const creado = marker.createdAt
+                      ? new Date(marker.createdAt).toLocaleString('es-AR', {
+                        dateStyle: 'short',
+                        timeStyle: 'short',
+                      })
+                      : (marker.date
+                        ? `${marker.date}${marker.time ? ` · ${marker.time}` : ''}`
+                        : null);
+                    const foto = marker.imageUrl ? buildImageUrl(marker.imageUrl) : null;
+                    const descripcion = (marker.description || '').trim();
+                    const direccion = (marker.direccion || '').trim();
+                    const enRegistro = Boolean(marker.eliminadoAt)
+                      || marker.status === 'resuelto'
+                      || marker.status === 'rechazado';
+                    const vencida = esPublicacionVencida(marker);
+                    const motivoBaja = String(marker.motivoEliminacion || '').toLowerCase();
+                    const estadoTexto = enRegistro
+                      ? (motivoBaja.includes('vencimiento') || vencida
+                        ? 'Vencido'
+                        : (marker.status === 'resuelto'
+                          || motivoBaja.includes('resuelto')
+                          || motivoBaja.includes('recuper')
+                          ? 'Resuelto'
+                          : 'Anulado'))
+                      : etiquetaEstadoPopup(marker.status || 'pendiente', marker);
+                    const soyDuenio = String(marker.createdBy || '').toLowerCase() === userId;
+                    const { chat: chatSinLeer, cerca: cercaSinLeer } = resumenAvisosPerdida(marker._id);
+                    const enCerca = perdidasSeccion === 'cerca';
+                    const badgeChat = !enCerca && chatSinLeer > 0;
+                    const badgeCercaNuevo = enCerca && cercaSinLeer > 0;
+                    const tarjetaNueva = badgeChat || badgeCercaNuevo;
+                    const destacado = idPerdidaDestacada
+                      && String(marker._id) === String(idPerdidaDestacada);
+                    const metros = Number(marker.distanciaMetros);
+                    const etiquetaRol = soyDuenio
+                      ? 'Tu aviso'
+                      : (enCerca
+                        ? (radarModo === 'animales'
+                          ? (ANIMAL_TIPOS[marker.animalTipo] || 'Animales')
+                          : 'Cosas perdidas')
+                        : (radarModo === 'animales' ? 'Tu aviso' : 'Tu reclamo'));
+                    const textoDistancia = Number.isFinite(metros)
+                      ? (metros < 1000 ? `${Math.round(metros)} m` : `${(metros / 1000).toFixed(1)} km`)
+                      : null;
+                    const claseDistancia = !Number.isFinite(metros)
+                      ? ''
+                      : (metros <= 300
+                        ? 'dist-muy-cerca'
+                        : (metros <= 1000
+                          ? 'dist-cerca'
+                          : (metros <= 2500 ? 'dist-media' : 'dist-lejos')));
+                    return (
+                      <li key={marker._id} data-perdida-id={marker._id}>
+                        <div className={`tarjeta-mi-reporte-wrap${destacado ? ' tarjeta-mi-reporte-destacada' : ''}`}>
+                          <button
+                            type="button"
+                            className={`tarjeta-mi-reporte${destacado ? ' tarjeta-mi-reporte-sombra' : ''}${tarjetaNueva ? ' tarjeta-mi-reporte-nueva' : ''}${badgeCercaNuevo ? ' tarjeta-mi-reporte-cerca-nueva' : ''}`}
+                            onClick={() => {
+                              setIdPerdidaDestacada(null);
+                              if (radarVistaAmpliada) {
+                                setRadarVistaAmpliada(false);
+                                cargarPerdidasLista(perdidasSeccion, 1, null, null, null, MIS_PAGE_SIZE);
+                              }
+                              // En Cerca solo chat si no es tuyo; los tuyos se ven en Míos
+                              if (soyDuenio) {
+                                irAMiReporte(marker);
+                                return;
+                              }
+                              irAPerdida(marker, { abrirChat: badgeChat });
+                            }}
+                          >
+                            <span className="tarjeta-mi-reporte-media">
+                              {badgeChat && (
+                                <span
+                                  className="tarjeta-mi-reporte-badge"
+                                  title={`${chatSinLeer} mensaje${chatSinLeer === 1 ? '' : 's'} o reclamo${chatSinLeer === 1 ? '' : 's'} sin leer`}
+                                >
+                                  {chatSinLeer > 9 ? '9+' : chatSinLeer}
+                                  <em>chat</em>
+                                </span>
+                              )}
+                              {badgeCercaNuevo && (
+                                <span className="tarjeta-mi-reporte-badge-nuevo" title="Aviso nuevo cerca de vos">
+                                  Nuevo
+                                </span>
+                              )}
+                              {foto ? (
+                                <img
+                                  src={foto}
+                                  alt=""
+                                  className="tarjeta-mi-reporte-foto"
+                                />
+                              ) : (
+                                <span className="tarjeta-mi-reporte-sin-foto" aria-hidden="true">
+                                  Sin foto
+                                </span>
+                              )}
+                            </span>
+                            <span className="tarjeta-mi-reporte-info">
+                              <strong className="tarjeta-mi-reporte-titulo-fila">
+                                <span>
+                                  {tituloObjeto || `Caso #${marker.caseId || '-'}`}
+                                </span>
+                                {textoDistancia && (
+                                  <span className={`badge-distancia ${claseDistancia}`}>
+                                    {textoDistancia}
+                                  </span>
+                                )}
+                              </strong>
+                              <span className="tarjeta-mi-reporte-meta">
+                                {tituloObjeto
+                                  ? `${etiquetaRol}${subtipo ? ` · ${subtipo}` : ''} · #${marker.caseId || '-'}`
+                                  : `${etiquetaRol}${subtipo ? ` · ${subtipo}` : ''}`}
+                              </span>
+                              {badgeChat && (
+                                <span className="tarjeta-mi-reporte-actividad">
+                                  {chatSinLeer === 1
+                                    ? '1 mensaje o reclamo sin leer'
+                                    : `${chatSinLeer} mensajes/reclamos sin leer`}
+                                </span>
+                              )}
+                              <span
+                                className="panel-vecino-estado"
+                                style={getStatusBadgeStyle(
+                                  vencida
+                                    ? 'rechazado'
+                                    : (enRegistro && marker.status !== 'rechazado' && marker.status !== 'resuelto'
+                                      ? 'resuelto'
+                                      : (marker.status || 'pendiente'))
+                                )}
+                              >
+                                {vencida ? 'Vencido' : estadoTexto}
+                              </span>
+                              {direccion && (
+                                <span className="tarjeta-mi-reporte-direccion">{direccion}</span>
+                              )}
+                              {descripcion && (
+                                <span className="tarjeta-mi-reporte-desc">{descripcion}</span>
+                              )}
+                              <small>
+                                {marker.jurisdictionName || 'Sin municipio'}
+                                {creado ? ` · ${creado}` : ''}
+                              </small>
+                            </span>
+                          </button>
+                          {vencida && soyDuenio && (
+                            <button
+                              type="button"
+                              className="btn-renovar-publicacion"
+                              disabled={renovandoId === marker._id}
+                              onClick={() => renovarPublicacion(marker)}
+                            >
+                              {renovandoId === marker._id ? 'Renovando…' : 'Renovar 15 días'}
+                            </button>
+                          )}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+                {!radarVistaAmpliada && (
+                  <button
+                    type="button"
+                    className="panel-radar-ver-mas panel-radar-ver-mas-abajo"
+                    onClick={() => {
+                      // Amplía solo las publicaciones de la zona/sección activa (mismo radio y origen)
+                      setRadarVistaAmpliada(true);
+                      setMisPage(1);
+                      const origen = perdidasSeccion === 'cerca' ? cercaOrigen : null;
+                      cargarPerdidasLista(perdidasSeccion, 1, origen, radarModo, animalFiltroRadar, 50);
+                    }}
+                  >
+                    {perdidasSeccion === 'cerca'
+                      ? (cercaOrigen === 'gps'
+                        ? 'Ver más cerca de mí'
+                        : (cercaOrigen === 'vigilada'
+                          ? 'Ver más de la zona vigilada'
+                          : 'Ver más de esta zona'))
+                      : 'Ver más'}
+                  </button>
+                )}
+                {perdidasTotalPaginas > 1 && (
+                  <div className="panel-mis-paginacion">
+                    <button
+                      type="button"
+                      className="popup-btn-secundario"
+                      disabled={misPage <= 1 || cargandoMisLista}
+                      onClick={() => cargarPerdidasLista(
+                        perdidasSeccion,
+                        misPage - 1,
+                        perdidasSeccion === 'cerca' ? cercaOrigen : null,
+                        radarModo,
+                        animalFiltroRadar,
+                        radarVistaAmpliada ? 50 : MIS_PAGE_SIZE
+                      )}
+                    >
+                      Anterior
+                    </button>
+                    <span>{misPage} / {perdidasTotalPaginas}</span>
+                    <button
+                      type="button"
+                      className="popup-btn-secundario"
+                      disabled={!misMeta.hasMore || cargandoMisLista}
+                      onClick={() => cargarPerdidasLista(
+                        perdidasSeccion,
+                        misPage + 1,
+                        perdidasSeccion === 'cerca' ? cercaOrigen : null,
+                        radarModo,
+                        animalFiltroRadar,
+                        radarVistaAmpliada ? 50 : MIS_PAGE_SIZE
+                      )}
+                    >
+                      Siguiente
+                    </button>
+                  </div>
+                )}
+                </>
+              )}
+          </aside>
+        )}
+
         {mostrarNotificaciones && (
           <div className="panel-vecino-fondo" onClick={() => setMostrarNotificaciones(false)}>
             <div className="panel-vecino" onClick={(event) => event.stopPropagation()}>
@@ -4074,6 +6802,13 @@ const renderOficinas = (tipo, jurisdiccion) => {
                         onClick={() => abrirDesdeNotificacion(aviso)}
                       >
                         <strong>{aviso.mensaje}</strong>
+                        {notifApuntaAlRegistro(aviso) && (
+                          <em className="aviso-ir-registro">
+                            {typeof onAbrirCasoAdmin === 'function'
+                              ? 'Ver en el registro del municipio'
+                              : 'Ver en el registro'}
+                          </em>
+                        )}
                         <small>
                           {aviso.createdAt
                             ? new Date(aviso.createdAt).toLocaleString('es-AR', {
@@ -4097,15 +6832,23 @@ const renderOficinas = (tipo, jurisdiccion) => {
             role="status"
           >
             <span>{avisoVecino}</span>
-            <button
-              type="button"
-              onClick={() => {
-                setAvisoVecino('');
-                setAvisoEsAlerta(false);
-              }}
-            >
-              Cerrar
-            </button>
+            <div className="aviso-vecino-acciones">
+              {avisoAccion?.label && (
+                <button
+                  type="button"
+                  className="aviso-vecino-accion"
+                  onClick={() => {
+                    const fn = avisoAccion.onClick;
+                    if (typeof fn === 'function') fn();
+                  }}
+                >
+                  {avisoAccion.label}
+                </button>
+              )}
+              <button type="button" onClick={cerrarAvisoVecino}>
+                Cerrar
+              </button>
+            </div>
           </div>
         )}
 

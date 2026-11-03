@@ -14,7 +14,20 @@ const datosPublicos = (usuario) => ({
   nombre: usuario.nombre || '',
   telefono: usuario.telefono || '',
   proveedor: usuario.proveedor,
+  ultimaLat: usuario.ultimaLat,
+  ultimaLng: usuario.ultimaLng,
+  ubicacionAt: usuario.ubicacionAt,
+  zonaAlertaLat: usuario.zonaAlertaLat,
+  zonaAlertaLng: usuario.zonaAlertaLng,
+  zonaAlertaRadio: usuario.zonaAlertaRadio || 2500,
+  zonaAlertaAt: usuario.zonaAlertaAt,
 });
+
+const coordValida = (lat, lng) => (
+  Number.isFinite(lat) && Number.isFinite(lng)
+  && lat >= -90 && lat <= 90
+  && lng >= -180 && lng <= 180
+);
 
 router.get('/me', async (req, res) => {
   try {
@@ -98,6 +111,97 @@ router.patch('/me', async (req, res) => {
       { email },
       { $set: { nombre, telefono } },
       { new: true, runValidators: true }
+    );
+    if (!usuario) {
+      return res.status(404).json({ message: 'No hay una cuenta registrada con ese correo.' });
+    }
+    res.json(datosPublicos(usuario));
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
+/** Guarda la ubicación GPS actual del vecino (throttled desde el cliente). */
+router.patch('/me/ubicacion', async (req, res) => {
+  try {
+    const email = normalizeUserId(req.headers['x-user-id'] || '');
+    if (!email || email === 'anonimo') {
+      return res.status(401).json({ message: 'Falta el correo de la cuenta' });
+    }
+    const lat = Number(req.body.lat);
+    const lng = Number(req.body.lng);
+    if (!coordValida(lat, lng)) {
+      return res.status(400).json({ message: 'Ubicación inválida' });
+    }
+    const usuario = await Usuario.findOneAndUpdate(
+      { email },
+      {
+        $set: {
+          ultimaLat: lat,
+          ultimaLng: lng,
+          ubicacionAt: new Date(),
+        },
+      },
+      { new: true, upsert: false }
+    );
+    if (!usuario) {
+      return res.status(404).json({ message: 'No hay una cuenta registrada con ese correo.' });
+    }
+    res.json({
+      ok: true,
+      ultimaLat: usuario.ultimaLat,
+      ultimaLng: usuario.ultimaLng,
+      ubicacionAt: usuario.ubicacionAt,
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
+/**
+ * Zona del mapa donde el vecino quiere recibir avisos
+ * (si busca / perdió algo lejos de su ubicación habitual).
+ */
+router.patch('/me/zona-alerta', async (req, res) => {
+  try {
+    const email = normalizeUserId(req.headers['x-user-id'] || '');
+    if (!email || email === 'anonimo') {
+      return res.status(401).json({ message: 'Falta el correo de la cuenta' });
+    }
+    if (req.body.quitar === true || req.body.quitar === '1') {
+      const usuario = await Usuario.findOneAndUpdate(
+        { email },
+        {
+          $set: {
+            zonaAlertaLat: null,
+            zonaAlertaLng: null,
+            zonaAlertaAt: null,
+          },
+        },
+        { new: true }
+      );
+      if (!usuario) {
+        return res.status(404).json({ message: 'No hay una cuenta registrada con ese correo.' });
+      }
+      return res.json(datosPublicos(usuario));
+    }
+    const lat = Number(req.body.lat);
+    const lng = Number(req.body.lng);
+    const radio = Math.min(8000, Math.max(500, Number(req.body.radio) || 2500));
+    if (!coordValida(lat, lng)) {
+      return res.status(400).json({ message: 'Elegí un punto válido en el mapa.' });
+    }
+    const usuario = await Usuario.findOneAndUpdate(
+      { email },
+      {
+        $set: {
+          zonaAlertaLat: lat,
+          zonaAlertaLng: lng,
+          zonaAlertaRadio: radio,
+          zonaAlertaAt: new Date(),
+        },
+      },
+      { new: true }
     );
     if (!usuario) {
       return res.status(404).json({ message: 'No hay una cuenta registrada con ese correo.' });

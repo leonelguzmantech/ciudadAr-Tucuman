@@ -42,6 +42,21 @@ const IconoNotificaciones = () => (
   </svg>
 );
 
+/** Radar / cercanía (cosas perdidas) */
+const IconoPerdidas = () => (
+  <svg className="sidebar-icono" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.8" opacity="0.35" />
+    <circle cx="12" cy="12" r="5.5" stroke="currentColor" strokeWidth="1.8" opacity="0.65" />
+    <circle cx="12" cy="12" r="2.2" fill="currentColor" />
+    <path
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      d="M12 3v2.2M21 12h-2.2M12 21v-2.2M3 12h2.2"
+    />
+  </svg>
+);
+
 const IconoPerfil = () => (
   <svg className="sidebar-icono" viewBox="0 0 24 24" aria-hidden="true">
     <path
@@ -63,9 +78,12 @@ const IconoSalir = () => (
 const Barra = ({
   usuario,
   noLeidas = 0,
+  perdidasNoLeidas = 0,
   conSidebar = false,
   esAdmin = false,
+  esOperario = false,
   onMisReportes,
+  onCosasPerdidas,
   onFiltros,
   onNotificaciones,
   onDashboardAdmin,
@@ -109,8 +127,13 @@ const Barra = ({
     <>
       <aside className={`sidebar${menuMovilAbierto ? ' abierta' : ''}`}>
         <div className="sidebar-marca">
-          <img src={logoCiudad} alt="CiudadAr" className="barra-logo sidebar-logo-grande" />
-          <small className="sidebar-marca-sub">Reportes Tucumán</small>
+          <span className="sidebar-marca-logo-wrap" aria-hidden="true">
+            <img src={logoCiudad} alt="" className="sidebar-marca-logo" />
+          </span>
+          <div className="sidebar-marca-texto">
+            <strong className="sidebar-marca-nombre">CiudadAr</strong>
+            <small className="sidebar-marca-sub">Reportes Tucumán</small>
+          </div>
         </div>
 
         <nav className="sidebar-nav" aria-label="Menú principal">
@@ -145,6 +168,22 @@ const Barra = ({
             className="sidebar-item"
             onClick={() => {
               setMenuMovilAbierto(false);
+              if (onCosasPerdidas) onCosasPerdidas();
+            }}
+          >
+            <span className="sidebar-item-contenido">
+              <IconoPerdidas />
+              Radar
+            </span>
+            {perdidasNoLeidas > 0 && (
+              <span className="sidebar-badge">{perdidasNoLeidas > 9 ? '9+' : perdidasNoLeidas}</span>
+            )}
+          </button>
+          <button
+            type="button"
+            className="sidebar-item"
+            onClick={() => {
+              setMenuMovilAbierto(false);
               if (onNotificaciones) onNotificaciones();
             }}
           >
@@ -170,7 +209,7 @@ const Barra = ({
             >
               <span className="sidebar-item-contenido">
                 <IconoDashboard />
-                Dashboard admin
+                {esOperario ? 'Panel cuadrilla' : 'Dashboard admin'}
               </span>
             </button>
           )}

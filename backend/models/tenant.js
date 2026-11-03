@@ -23,6 +23,8 @@ const tenantSchema = new mongoose.Schema(
     },
     // Emails de quienes administran los reportes de esta jurisdicción
     admins: [{ type: String, lowercase: true, trim: true }],
+    // Cuadrilla / operarios de campo (en proceso, proponer cierre, pedir datos)
+    operarios: [{ type: String, lowercase: true, trim: true }],
     status: {
       type: String,
       enum: ['active', 'inactive', 'pending'],

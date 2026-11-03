@@ -28,13 +28,35 @@ const markerSchema = new mongoose.Schema({
   direccion: { type: String, default: '' }, // Dirección del punto (auto o manual)
   status: {
     type: String,
-    enum: ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto', 'rechazado'],
+    enum: [
+      'pendiente_aprobacion',
+      'pendiente',
+      'en_proceso',
+      'pendiente_cierre',
+      'resuelto',
+      'rechazado',
+    ],
     default: 'pendiente_aprobacion',
   },
+  // Quién de la cuadrilla tomó / atendió el caso
+  atendidoPor: { type: String, default: null, index: true },
+  atendidoAt: { type: Date, default: null },
+  // Quién de la cuadrilla propuso el cierre (antes de confirmar el admin)
+  cierrePropuestoPor: { type: String, default: null },
+  cierrePropuestoAt: { type: Date, default: null },
+  // Mensaje del admin hacia la cuadrilla (pedido de info / instrucción)
+  notaCuadrilla: { type: String, default: '' },
+  notaCuadrillaAt: { type: Date, default: null },
+  notaCuadrillaPor: { type: String, default: null },
+  // Respuesta de la cuadrilla al último aviso del admin
+  respuestaCuadrilla: { type: String, default: '' },
+  respuestaCuadrillaAt: { type: Date, default: null },
+  respuestaCuadrillaPor: { type: String, default: null },
   category: {
     type: String,
+    // "persona" se mantiene en el enum solo para leer docs viejos; al guardar se normaliza a familias
     enum: ['familias', 'persona', 'perros_gatos', 'reparaciones', 'cosas_perdidas'],
-    default: 'persona',
+    default: 'reparaciones',
   },
   visibility: {
     type: String,
@@ -74,15 +96,28 @@ const markerSchema = new mongoose.Schema({
   },
   objeto: { type: String, default: '' },
   avisadoAt: { type: Date, default: null },
-  // Pedido de más datos al vecino (no cambia el estado del caso)
+  // Pedido de más datos al vecino (activo mientras espera respuesta)
   pideDatosMensaje: { type: String, default: '' },
   pideDatosAt: { type: Date, default: null },
+  pideDatosPor: { type: String, default: null },
+  // Historial del último intercambio (queda en la ficha tras responder)
+  ultimoPedidoDatosMensaje: { type: String, default: '' },
+  ultimoPedidoDatosAt: { type: Date, default: null },
+  ultimoPedidoDatosPor: { type: String, default: null },
+  respuestaDatosMensaje: { type: String, default: '' },
+  respuestaDatosImage: {
+    data: Buffer,
+    contentType: String,
+  },
+  respuestaDatosImageUrl: { type: String, default: '' },
   // El vecino respondió; el admin aún no abrió la ficha
   respuestaDatosAt: { type: Date, default: null, index: true },
   // Historial permanente: última vez que el vecino respondió un pedido de datos
   ultimaRespuestaDatosAt: { type: Date, default: null },
   // Tras aprobar / respuesta: el admin aún no lo vio en Reportes / Cosas perdidas
   nuevoParaAdmin: { type: Boolean, default: false, index: true },
+  // Tras avisar oficina (abandonados): pendiente de ver en Derivados
+  nuevoDerivadoParaAdmin: { type: Boolean, default: false, index: true },
   // Cosas perdidas: abrieron el chat (habilita botones de cierre)
   chatAbiertoPor: [{ type: String, lowercase: true, trim: true }],
   // Confirmaciones de las partes (hace falta dueño + reclamante)

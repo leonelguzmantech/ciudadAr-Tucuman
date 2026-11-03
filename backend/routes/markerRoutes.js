@@ -4,11 +4,14 @@ const multer = require('multer');
 const Marker = require('../models/marker');
 const ChatMensaje = require('../models/chatMensaje');
 const Usuario = require('../models/usuario');
-const { normalizeUserId, getRequestUser } = require('../utils/users');
+const { normalizeUserId, getRequestUser, isAdminUser } = require('../utils/users');
+const Tenant = require('../models/tenant');
 const {
   findJurisdictionForPoint,
   getAdminScope,
   isScopeAdmin,
+  isScopeOperario,
+  isScopeStaff,
   canManageMarker,
   buildManagedMarkersFilter,
 } = require('../utils/jurisdictions');
@@ -20,16 +23,37 @@ const {
   crearNotificacion,
   avisarAdminsPorAprobar,
   avisarAdminsCasoAprobado,
+  avisarVecinosCercanos,
   avisarPartesCaso,
   listarAdminsDelCaso,
+  avisarOperariosDelCaso,
+  RADIO_CERCA_DEFAULT_M,
 } = require('../utils/notificaciones');
+
+const distanciaMetrosGeo = (lat1, lng1, lat2, lng2) => {
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2
+    + Math.cos((lat1 * Math.PI) / 180)
+      * Math.cos((lat2 * Math.PI) / 180)
+      * Math.sin(dLng / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
 const router = express.Router();
 
 // Configuración de multer para almacenar los archivos en memoria
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-const STATUS_VALUES = ['pendiente_aprobacion', 'pendiente', 'en_proceso', 'resuelto', 'rechazado'];
+const STATUS_VALUES = [
+  'pendiente_aprobacion',
+  'pendiente',
+  'en_proceso',
+  'pendiente_cierre',
+  'resuelto',
+  'rechazado',
+];
 const CATEGORY_VALUES = ['familias', 'persona', 'perros_gatos', 'reparaciones', 'cosas_perdidas'];
 const FAMILIAS_TIPOS = ['violencia', 'hijos', 'calle'];
 const ANIMAL_TIPOS = ['abandonado', 'perdido', 'adopcion'];
@@ -64,11 +88,30 @@ const buildListQuery = ({
   periodoDias,
   fechaDesde,
   fechaHasta,
+  sinTenant = false,
+  tenantId = null,
+  soloCaseId = false,
   soloAdminScope = false,
   incluirEliminados = false,
   soloEliminados = false,
+  excludeAvisados = false,
 }) => {
   const and = [];
+
+  if (sinTenant) {
+    and.push({
+      $or: [
+        { tenant: null },
+        { tenant: { $exists: false } },
+      ],
+    });
+  } else if (tenantId) {
+    try {
+      and.push({ tenant: new mongoose.Types.ObjectId(String(tenantId)) });
+    } catch {
+      and.push({ tenant: String(tenantId) });
+    }
+  }
 
   if (soloEliminados) {
     // Registro: bajas lógicas + resueltos/anulados (por si quedó alguno sin eliminadoAt)
@@ -138,7 +181,25 @@ const buildListQuery = ({
   } else if (atencion === 'respuestas') {
     and.push({
       respuestaDatosAt: { $ne: null },
-      status: { $nin: ['resuelto', 'rechazado'] },
+      status: { $nin: ['resuelto', 'rechazado', 'pendiente_cierre'] },
+    });
+  } else if (atencion === 'cierres') {
+    and.push({ status: 'pendiente_cierre' });
+  } else if (atencion === 'derivados') {
+    // Oficina avisada, siguen en el mapa (no Registro)
+    and.push({
+      avisadoAt: { $ne: null },
+      status: { $nin: ['resuelto', 'rechazado', 'pendiente_aprobacion'] },
+    });
+  }
+
+  // Reportes / Cosas perdidas activos: no mezclar derivados a oficina
+  if (excludeAvisados && atencion !== 'derivados') {
+    and.push({
+      $or: [
+        { avisadoAt: null },
+        { avisadoAt: { $exists: false } },
+      ],
     });
   }
 
@@ -194,35 +255,36 @@ const buildListQuery = ({
   }
 
   if (status && status !== 'todos' && STATUS_VALUES.includes(status)) {
-    // En el panel admin, no esconder casos con novedad (respuesta de datos / nuevo)
-    // aunque el filtro de estado no coincida (p. ej. quedó en_proceso).
-    if (soloAdminScope) {
-      and.push({
-        $or: [
-          { status },
-          { respuestaDatosAt: { $ne: null } },
-          { nuevoParaAdmin: true },
-        ],
-      });
-    } else {
-      and.push({ status });
-    }
+    // Filtro de estado estricto (las novedades se ven por atencion=respuestas / badge)
+    and.push({ status });
   }
 
   const texto = String(q || '').trim().replace(/^#/, '');
   if (texto) {
-    const orTexto = [
-      { description: { $regex: texto, $options: 'i' } },
-      { direccion: { $regex: texto, $options: 'i' } },
-      { objeto: { $regex: texto, $options: 'i' } },
-      { createdBy: { $regex: texto, $options: 'i' } },
-      { motivoEliminacion: { $regex: texto, $options: 'i' } },
-      { resolutionDescription: { $regex: texto, $options: 'i' } },
-    ];
-    if (/^\d+$/.test(texto)) {
-      orTexto.push({ caseId: Number(texto) });
+    if (soloCaseId) {
+      if (/^\d+$/.test(texto)) {
+        and.push({ caseId: Number(texto) });
+      } else {
+        // Texto no numérico: no matchea ningún caso
+        and.push({ _id: { $exists: false } });
+      }
+    } else {
+      const orTexto = [
+        { description: { $regex: texto, $options: 'i' } },
+        { direccion: { $regex: texto, $options: 'i' } },
+        { objeto: { $regex: texto, $options: 'i' } },
+        { createdBy: { $regex: texto, $options: 'i' } },
+        { motivoEliminacion: { $regex: texto, $options: 'i' } },
+        { resolutionDescription: { $regex: texto, $options: 'i' } },
+      ];
+      if (/^\d+$/.test(texto)) {
+        orTexto.push({ caseId: Number(texto) });
+      }
+      if (mongoose.Types.ObjectId.isValid(texto) && String(texto).length === 24) {
+        orTexto.push({ _id: new mongoose.Types.ObjectId(texto) });
+      }
+      and.push({ $or: orTexto });
     }
-    and.push({ $or: orTexto });
   }
 
   if (!and.length) return {};
@@ -285,16 +347,30 @@ const normalizeStatus = (value, fallback = 'pendiente_aprobacion') => {
   return STATUS_VALUES.includes(normalized) ? normalized : fallback;
 };
 
-const normalizeCategory = (value, fallback = 'persona') => {
-  if (!value) return fallback;
-  const normalized = String(value).trim().toLowerCase();
+// "persona" es legado (= situación de calle). Siempre canónico: familias.
+const normalizeCategory = (value, fallback = 'reparaciones') => {
+  const raw = (value != null && String(value).trim() !== '') ? value : fallback;
+  const normalized = String(raw || 'reparaciones').trim().toLowerCase();
+  if (normalized === 'persona' || normalized.includes('persona')) return 'familias';
   if (CATEGORY_VALUES.includes(normalized)) return normalized;
-  // Mapeo flexible para compatibilidad
   if (normalized.includes('familia')) return 'familias';
   if (normalized.includes('perro') || normalized.includes('gato')) return 'perros_gatos';
   if (normalized.includes('repar')) return 'reparaciones';
   if (normalized.includes('perdid') || normalized.includes('encontr')) return 'cosas_perdidas';
-  return fallback;
+  const fb = String(fallback || 'reparaciones').trim().toLowerCase();
+  if (fb === 'persona') return 'familias';
+  return CATEGORY_VALUES.includes(fb) ? fb : 'reparaciones';
+};
+
+/** Si venía category=persona (o familias sin tipo), tipificar calle cuando corresponde */
+const resolverFamiliasTipoAlGuardar = (categoryRaw, categoryCanon, familiasTipo) => {
+  const raw = String(categoryRaw || '').trim().toLowerCase();
+  const eraPersona = raw === 'persona' || raw.includes('persona');
+  const tipo = normalizeFamiliasTipo(categoryCanon, familiasTipo);
+  if (categoryCanon !== 'familias') return null;
+  if (tipo) return tipo;
+  if (eraPersona) return 'calle';
+  return null;
 };
 
 const computeResolvedAt = (status, currentResolvedAt = null) => {
@@ -337,11 +413,25 @@ const sanitizeMarkerResponse = (markerDoc, scope = null, requester = null) => {
   if (!marker.imageUrl && marker.image && marker._id) {
     marker.imageUrl = `/api/markers/${marker._id}/image`;
   }
+  if (!marker.resolutionImageUrl && marker.resolutionImage && marker._id) {
+    marker.resolutionImageUrl = `/api/markers/${marker._id}/resolution-image`;
+  }
+  if (!marker.respuestaDatosImageUrl && marker.respuestaDatosImage && marker._id) {
+    marker.respuestaDatosImageUrl = `/api/markers/${marker._id}/respuesta-datos-image`;
+  }
   if (marker.image) {
     delete marker.image;
   }
   if (marker.resolutionImage) {
     delete marker.resolutionImage;
+  }
+  if (marker.respuestaDatosImage) {
+    delete marker.respuestaDatosImage;
+  }
+  // API nunca expone category "persona": unificar a familias (calle)
+  if (marker.category === 'persona') {
+    marker.category = 'familias';
+    if (!marker.familiasTipo) marker.familiasTipo = 'calle';
   }
   const confirmations = Array.isArray(marker.confirmations) ? marker.confirmations : [];
   const puedeVerVecinos = scope && canManageMarker(scope, marker);
@@ -413,6 +503,13 @@ const requireJurisdictionAdmin = (req, res, next) => {
   next();
 };
 
+const requireStaff = (req, res, next) => {
+  if (!isScopeStaff(req.adminScope)) {
+    return res.status(403).json({ message: 'Acceso de personal municipal requerido' });
+  }
+  next();
+};
+
 const rejectIfEliminado = (marker, res) => {
   if (marker && marker.eliminadoAt) {
     res.status(400).json({
@@ -434,40 +531,148 @@ router.get('/', async (req, res) => {
     const { page, limit, skip } = parsePageLimit(req.query, LIMITE_MAPA_DEFAULT);
     const myJurisdictionOn = req.query.myJurisdiction === '1' || req.query.myJurisdiction === 'true';
     const mineOn = req.query.mine === '1' || req.query.mine === 'true';
+    const misPerdidas = req.query.misPerdidas === '1' || req.query.misPerdidas === 'true';
+    const cercaOn = req.query.cerca === '1' || req.query.cerca === 'true';
+    const nearLat = Number(req.query.lat);
+    const nearLng = Number(req.query.lng);
+    const nearRadius = Math.min(
+      8000,
+      Math.max(500, parseInt(req.query.radius, 10) || RADIO_CERCA_DEFAULT_M)
+    );
+    const cercaValido = cercaOn
+      && Number.isFinite(nearLat)
+      && Number.isFinite(nearLng)
+      && nearLat >= -90 && nearLat <= 90
+      && nearLng >= -180 && nearLng <= 180;
     // Registro del vecino: solo sus propias bajas (resueltos / anulados / vencidos)
-    const registroPropio = mineOn && (
+    const registroPropio = mineOn && !misPerdidas && !cercaOn && (
       req.query.eliminados === '1'
       || req.query.eliminados === 'true'
       || req.query.registro === '1'
     );
-    const filtro = buildListQuery({
+    const registroPerdidas = misPerdidas && (
+      req.query.eliminados === '1'
+      || req.query.eliminados === 'true'
+      || req.query.registro === '1'
+    );
+
+    // Cerca (Radar): categoría según query (cosas_perdidas | perros_gatos)
+    let filtro = buildListQuery({
       requester,
       adminScope,
-      category: req.query.category,
-      excludeCategory: req.query.excludeCategory,
-      animalTipo: req.query.animalTipo,
+      category: cercaValido
+        ? undefined
+        : (misPerdidas ? 'cosas_perdidas' : req.query.category),
+      excludeCategory: (misPerdidas || cercaValido) ? undefined : req.query.excludeCategory,
+      animalTipo: cercaValido ? undefined : req.query.animalTipo,
       perdidaTipo: req.query.perdidaTipo,
-      status: req.query.status,
-      mine: req.query.mine,
+      status: cercaValido ? undefined : req.query.status,
+      mine: (misPerdidas || cercaValido) ? undefined : req.query.mine,
       myJurisdiction: req.query.myJurisdiction,
       q: req.query.q,
       soloAdminScope: false,
-      soloEliminados: registroPropio,
+      soloEliminados: registroPropio || registroPerdidas,
     });
 
-    const [total, markers] = await Promise.all([
-      Marker.countDocuments(filtro),
-      Marker.find(filtro)
-        .select('-image -resolutionImage -confirmations.image')
-        .populate('tenant', JURISDICTION_FIELDS)
-        .sort(registroPropio ? { eliminadoAt: -1, createdAt: -1 } : { createdAt: -1 })
+    if (cercaValido) {
+      const deltaLat = nearRadius / 111320;
+      const deltaLng = nearRadius / (111320 * Math.max(0.2, Math.cos((nearLat * Math.PI) / 180)));
+      const animalTiposOk = ['perdido', 'abandonado', 'adopcion'];
+      const animalTipoQ = String(req.query.animalTipo || '').trim();
+      let cercaCategoriaFiltro;
+      if (req.query.category === 'cosas_perdidas') {
+        cercaCategoriaFiltro = { category: 'cosas_perdidas' };
+      } else if (req.query.category === 'perros_gatos') {
+        cercaCategoriaFiltro = animalTiposOk.includes(animalTipoQ)
+          ? { category: 'perros_gatos', animalTipo: animalTipoQ }
+          : { category: 'perros_gatos', animalTipo: { $in: animalTiposOk } };
+      } else {
+        // Compat: ambos mundos si no mandan categoría
+        cercaCategoriaFiltro = {
+          $or: [
+            { category: 'cosas_perdidas' },
+            { category: 'perros_gatos', animalTipo: { $in: animalTiposOk } },
+          ],
+        };
+      }
+      const yoCerca = normalizeUserId(requester);
+      filtro = {
+        $and: [
+          filtro,
+          cercaCategoriaFiltro,
+          { status: { $in: ['pendiente', 'en_proceso'] } },
+          { eliminadoAt: null },
+          // Cerca = avisos de otros (comparación case-insensitive); los propios van en Míos
+          ...(yoCerca && yoCerca !== 'anonimo'
+            ? [{
+              $expr: {
+                $ne: [
+                  { $toLower: { $ifNull: ['$createdBy', ''] } },
+                  yoCerca,
+                ],
+              },
+            }]
+            : []),
+          { lat: { $gte: nearLat - deltaLat, $lte: nearLat + deltaLat } },
+          { lng: { $gte: nearLng - deltaLng, $lte: nearLng + deltaLng } },
+        ],
+      };
+    }
+
+    // Vecino: avisos propios o donde reclamó
+    if (misPerdidas) {
+      const yo = normalizeUserId(requester);
+      filtro = {
+        $and: [
+          filtro,
+          {
+            $or: [
+              { createdBy: yo },
+              { 'claims.userId': yo },
+            ],
+          },
+        ],
+      };
+    }
+
+    let markersQuery = Marker.find(filtro)
+      .select('-image -resolutionImage -respuestaDatosImage -confirmations.image')
+      .populate('tenant', JURISDICTION_FIELDS);
+
+    if (cercaValido) {
+      // Traemos un poco de más y ordenamos por distancia en memoria
+      markersQuery = markersQuery.limit(Math.min(LIMITE_MAX, limit * 3));
+    } else {
+      markersQuery = markersQuery
+        .sort((registroPropio || registroPerdidas) ? { eliminadoAt: -1, createdAt: -1 } : { createdAt: -1 })
         .skip(skip)
-        .limit(limit),
+        .limit(limit);
+    }
+
+    const [totalRaw, markers] = await Promise.all([
+      cercaValido ? Promise.resolve(0) : Marker.countDocuments(filtro),
+      markersQuery,
     ]);
 
     // Seguridad extra por si el filtro no alcanzó (p. ej. admin de jurisdicción)
-    const visibles = markers.filter((marker) => {
+    let visibles = markers.filter((marker) => {
       const markerOwner = normalizeUserId(marker.createdBy);
+      if (cercaValido) {
+        // Nunca listar el propio aviso en Cerca (aunque el $ne falle por casing raro)
+        if (markerOwner && markerOwner === requester) return false;
+        if (marker.status === 'pendiente_aprobacion' || marker.status === 'rechazado') {
+          return false;
+        }
+        if (marker.category === 'familias' || marker.category === 'persona') return false;
+        const d = distanciaMetrosGeo(nearLat, nearLng, Number(marker.lat), Number(marker.lng));
+        marker._distanciaMetros = d;
+        return d <= nearRadius;
+      }
+      if (misPerdidas) {
+        const yo = normalizeUserId(requester);
+        if (markerOwner === yo) return true;
+        return (marker.claims || []).some((c) => normalizeUserId(c.userId) === yo);
+      }
       if (registroPropio) {
         return markerOwner === requester;
       }
@@ -485,12 +690,31 @@ router.get('/', async (req, res) => {
       return true;
     });
 
+    if (cercaValido) {
+      visibles.sort((a, b) => (a._distanciaMetros || 0) - (b._distanciaMetros || 0));
+      const totalCerca = visibles.length;
+      visibles = visibles.slice(skip, skip + limit);
+      return res.json({
+        items: visibles.map((marker) => ({
+          ...sanitizeMarkerResponse(marker, adminScope, requester),
+          distanciaMetros: Math.round(marker._distanciaMetros || 0),
+        })),
+        total: totalCerca,
+        page,
+        limit,
+        hasMore: skip + limit < totalCerca,
+        lat: nearLat,
+        lng: nearLng,
+        radius: nearRadius,
+      });
+    }
+
     res.json({
       items: visibles.map((marker) => sanitizeMarkerResponse(marker, adminScope, requester)),
-      total,
+      total: totalRaw,
       page,
       limit,
-      hasMore: skip + limit < total,
+      hasMore: skip + limit < totalRaw,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -506,6 +730,7 @@ router.post('/', upload.single('image'), async (req, res) => {
   } = req.body;
   const { requester: createdBy, adminScope } = req;
   const normalizedCategory = normalizeCategory(category);
+  const familiasTipoCanon = resolverFamiliasTipoAlGuardar(category, normalizedCategory, familiasTipo);
 
   try {
     // Los vecinos tienen un tope diario. Los admins no, para poder gestionar.
@@ -564,7 +789,7 @@ router.post('/', upload.single('image'), async (req, res) => {
       direccion: String(direccion || '').trim(),
       status: finalStatus,
       category: normalizedCategory,
-      familiasTipo: normalizeFamiliasTipo(normalizedCategory, familiasTipo),
+      familiasTipo: familiasTipoCanon,
       animalTipo: normalizeAnimalTipo(normalizedCategory, animalTipo),
       perdidaTipo: normalizePerdidaTipo(normalizedCategory, perdidaTipo),
       objeto: normalizedCategory === 'cosas_perdidas' ? String(objeto || '').trim().slice(0, 120) : '',
@@ -586,6 +811,10 @@ router.post('/', upload.single('image'), async (req, res) => {
     if (savedMarker.status === 'pendiente_aprobacion') {
       avisarAdminsPorAprobar(savedMarker).catch((err) => {
         console.error('No se pudo notificar a admins del nuevo caso:', err.message);
+      });
+    } else if (savedMarker.status === 'pendiente') {
+      avisarVecinosCercanos(savedMarker).catch((err) => {
+        console.error('No se pudo avisar vecinos cerca:', err.message);
       });
     }
     res.status(201).json(sanitizeMarkerResponse(savedMarker, adminScope, createdBy));
@@ -624,6 +853,11 @@ router.put('/:id', upload.single('image'), async (req, res) => {
 
     const normalizedStatus = normalizeStatus(status, existingMarker.status);
     const normalizedCategory = normalizeCategory(category, existingMarker.category);
+    const familiasTipoCanon = resolverFamiliasTipoAlGuardar(
+      category != null ? category : existingMarker.category,
+      normalizedCategory,
+      familiasTipo != null ? familiasTipo : existingMarker.familiasTipo
+    );
     if (normalizedCategory === 'cosas_perdidas' && !normalizePerdidaTipo(normalizedCategory, perdidaTipo || existingMarker.perdidaTipo)) {
       return res.status(400).json({ message: 'Elegí si perdiste o encontraste algo.' });
     }
@@ -647,7 +881,7 @@ router.put('/:id', upload.single('image'), async (req, res) => {
       direccion: String(direccion || '').trim(),
       status: normalizedStatus,
       category: normalizedCategory,
-      familiasTipo: normalizeFamiliasTipo(normalizedCategory, familiasTipo),
+      familiasTipo: familiasTipoCanon,
       animalTipo: normalizeAnimalTipo(normalizedCategory, animalTipo),
       perdidaTipo: normalizePerdidaTipo(normalizedCategory, perdidaTipo || existingMarker.perdidaTipo),
       objeto: normalizedCategory === 'cosas_perdidas'
@@ -715,6 +949,10 @@ router.delete('/:id', async (req, res) => {
       || (esAdminDelCaso && markerOwner !== requester
         ? 'Eliminado por administrador (baja lógica)'
         : 'Eliminado por el vecino (baja lógica)');
+    // Si no estaba cerrado, queda como anulado para el Registro / filtros
+    if (existingMarker.status !== 'resuelto' && existingMarker.status !== 'rechazado') {
+      existingMarker.status = 'rechazado';
+    }
     await existingMarker.save();
     await existingMarker.populate('tenant', JURISDICTION_FIELDS);
 
@@ -742,17 +980,20 @@ router.delete('/:id', async (req, res) => {
 });
 
 // Contadores livianos para el dashboard (sin traer los documentos)
-router.get('/admin/stats', requireJurisdictionAdmin, async (req, res) => {
+router.get('/admin/stats', requireStaff, async (req, res) => {
   try {
     const geo = buildManagedMarkersFilter(req.adminScope);
+    const esOperario = isScopeOperario(req.adminScope);
     const conGeo = (extra) => (
       req.adminScope.isSuperAdmin ? extra : { $and: [geo, extra] }
     );
-    // Reportes / Cosas perdidas / Activos: solo casos ya aprobados (no pendientes ni rechazados)
+    // Reportes / Cosas perdidas activos (sin por aprobar / cierre pendiente / rechazados)
     const publicados = {
       eliminadoAt: null,
-      status: { $nin: ['pendiente_aprobacion', 'rechazado'] },
+      status: { $nin: ['pendiente_aprobacion', 'rechazado', 'pendiente_cierre'] },
     };
+    // Cuadrilla: contadores solo de reparaciones
+    const soloReparaciones = esOperario ? { category: 'reparaciones' } : {};
     const urgentesFiltro = conGeo({
       eliminadoAt: null,
       category: 'reparaciones',
@@ -769,16 +1010,12 @@ router.get('/admin/stats', requireJurisdictionAdmin, async (req, res) => {
       respuestaDatosAt: { $ne: null },
       status: { $nin: ['resuelto', 'rechazado'] },
     });
-    const recientesFiltro = conGeo({
-      eliminadoAt: null,
-      status: { $ne: 'rechazado' },
-    });
-
     const [
       total,
       reportes,
       perdidas,
       porAprobar,
+      pendientes,
       enProceso,
       registro,
       nuevosReportes,
@@ -786,13 +1023,16 @@ router.get('/admin/stats', requireJurisdictionAdmin, async (req, res) => {
       urgentes,
       resueltosVecino,
       respuestasDatos,
-      recientesDocs,
+      cierresPendientes,
+      derivados,
+      nuevosDerivados,
     ] = await Promise.all([
       Marker.countDocuments(conGeo({ ...publicados })),
       Marker.countDocuments(conGeo({ ...publicados, category: { $ne: 'cosas_perdidas' } })),
       Marker.countDocuments(conGeo({ ...publicados, category: 'cosas_perdidas' })),
       Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente_aprobacion' })),
-      Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'en_proceso' })),
+      Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente', ...soloReparaciones })),
+      Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'en_proceso', ...soloReparaciones })),
       Marker.countDocuments(conGeo({ eliminadoAt: { $ne: null } })),
       Marker.countDocuments(conGeo({
         ...publicados,
@@ -807,22 +1047,27 @@ router.get('/admin/stats', requireJurisdictionAdmin, async (req, res) => {
       Marker.countDocuments(urgentesFiltro),
       Marker.countDocuments(resolucionFiltro),
       Marker.countDocuments(respuestasFiltro),
-      Marker.find(recientesFiltro)
-        .select('-image -resolutionImage -confirmations.image')
-        .populate('tenant', JURISDICTION_FIELDS)
-        .sort({ createdAt: -1 })
-        .limit(5),
+      Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente_cierre', ...soloReparaciones })),
+      Marker.countDocuments(conGeo({
+        eliminadoAt: null,
+        avisadoAt: { $ne: null },
+        status: { $nin: ['resuelto', 'rechazado', 'pendiente_aprobacion'] },
+      })),
+      // Badge Derivados: solo no vistos (flag explícito)
+      Marker.countDocuments(conGeo({
+        eliminadoAt: null,
+        avisadoAt: { $ne: null },
+        status: { $nin: ['resuelto', 'rechazado', 'pendiente_aprobacion'] },
+        nuevoDerivadoParaAdmin: true,
+      })),
     ]);
-
-    const recientes = recientesDocs
-      .filter((marker) => canManageMarker(req.adminScope, marker))
-      .map((marker) => sanitizeMarkerResponse(marker, req.adminScope, req.requester));
 
     res.json({
       total,
       reportes,
       perdidas,
       porAprobar,
+      pendientes,
       enProceso,
       registro,
       nuevosReportes,
@@ -830,7 +1075,9 @@ router.get('/admin/stats', requireJurisdictionAdmin, async (req, res) => {
       urgentes,
       resueltosVecino,
       respuestasDatos,
-      recientes,
+      cierresPendientes,
+      derivados,
+      nuevosDerivados,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -838,10 +1085,29 @@ router.get('/admin/stats', requireJurisdictionAdmin, async (req, res) => {
 });
 
 // Marca como vistos los casos nuevos del admin (limpia el badge al abrir la sección)
-router.patch('/admin/marcar-vistos', requireJurisdictionAdmin, async (req, res) => {
+router.patch('/admin/marcar-vistos', requireStaff, async (req, res) => {
   try {
     const seccion = String(req.body?.seccion || req.query?.seccion || '').trim();
     const geo = buildManagedMarkersFilter(req.adminScope);
+    if (seccion === 'derivados') {
+      // Todos los derivados activos pasan a “vistos” (limpia badge, incl. legacy sin flag)
+      const baseDerivados = {
+        eliminadoAt: null,
+        avisadoAt: { $ne: null },
+        status: { $nin: ['resuelto', 'rechazado', 'pendiente_aprobacion'] },
+      };
+      const filtroDerivados = req.adminScope.isSuperAdmin
+        ? baseDerivados
+        : { $and: [geo, baseDerivados] };
+      const resultDerivados = await Marker.updateMany(
+        filtroDerivados,
+        { $set: { nuevoDerivadoParaAdmin: false } }
+      );
+      return res.json({
+        message: 'Derivados marcados como vistos',
+        modificados: resultDerivados.modifiedCount || 0,
+      });
+    }
     const base = {
       eliminadoAt: null,
       nuevoParaAdmin: true,
@@ -852,7 +1118,7 @@ router.patch('/admin/marcar-vistos', requireJurisdictionAdmin, async (req, res) 
     } else if (seccion === 'reportes') {
       base.category = { $ne: 'cosas_perdidas' };
     } else {
-      return res.status(400).json({ message: 'Indicá la sección: reportes o cosas_perdidas' });
+      return res.status(400).json({ message: 'Indicá la sección: reportes, cosas_perdidas o derivados' });
     }
     const filtro = req.adminScope.isSuperAdmin ? base : { $and: [geo, base] };
     const result = await Marker.updateMany(filtro, { $set: { nuevoParaAdmin: false } });
@@ -865,12 +1131,26 @@ router.patch('/admin/marcar-vistos', requireJurisdictionAdmin, async (req, res) 
   }
 });
 
-router.get('/admin', requireJurisdictionAdmin, async (req, res) => {
+router.get('/admin', requireStaff, async (req, res) => {
   try {
     const { page, limit, skip } = parsePageLimit(req.query, LIMITE_ADMIN_DEFAULT);
     const soloEliminados = req.query.eliminados === '1' || req.query.eliminados === 'true'
       || req.query.soloEliminados === '1';
     const atencion = String(req.query.atencion || '').trim();
+    const esOperario = isScopeOperario(req.adminScope);
+    let statusQuery = (
+      atencion === 'urgentes'
+      || atencion === 'resolucion'
+      || atencion === 'respuestas'
+      || atencion === 'cierres'
+      || atencion === 'derivados'
+    )
+      ? undefined
+      : req.query.status;
+    // Operario: por defecto solo cola operativa (no por aprobar)
+    if (esOperario && !statusQuery && !atencion) {
+      statusQuery = undefined; // se acota abajo con $in
+    }
     const filtro = buildListQuery({
       requester: req.requester,
       adminScope: req.adminScope,
@@ -878,10 +1158,7 @@ router.get('/admin', requireJurisdictionAdmin, async (req, res) => {
       excludeCategory: req.query.excludeCategory,
       animalTipo: req.query.animalTipo,
       perdidaTipo: req.query.perdidaTipo,
-      // Los atajos de atención ya filtran por estado
-      status: (atencion === 'urgentes' || atencion === 'resolucion' || atencion === 'respuestas')
-        ? undefined
-        : req.query.status,
+      status: statusQuery,
       mine: req.query.mine,
       q: req.query.q,
       atencion,
@@ -889,18 +1166,65 @@ router.get('/admin', requireJurisdictionAdmin, async (req, res) => {
       periodoDias: req.query.periodoDias,
       fechaDesde: req.query.fechaDesde,
       fechaHasta: req.query.fechaHasta,
+      sinTenant: req.query.sinTenant === '1' || req.query.sinTenant === 'true',
+      tenantId: req.query.tenantId || null,
+      soloCaseId: req.query.soloCaseId === '1' || req.query.soloCaseId === 'true',
       soloAdminScope: true,
       soloEliminados,
+      excludeAvisados: req.query.excludeAvisados === '1' || req.query.excludeAvisados === 'true',
     });
 
-    const orden = soloEliminados
-      ? { eliminadoAt: -1, createdAt: -1 }
-      : { nuevoParaAdmin: -1, createdAt: -1 };
+    // Operario · solo reparaciones. Registro: su trabajo ya cerrado/anulado por el admin
+    let filtroFinal = filtro;
+    if (esOperario) {
+      const yo = normalizeUserId(req.requester);
+      const soloMios = req.query.mios === '1' || req.query.mios === 'true';
+      if (soloEliminados) {
+        filtroFinal = {
+          $and: [
+            filtro,
+            { category: 'reparaciones' },
+            { status: { $in: ['resuelto', 'rechazado'] } },
+            {
+              $or: [
+                { atendidoPor: yo },
+                { cierrePropuestoPor: yo },
+              ],
+            },
+          ],
+        };
+      } else {
+        const andOps = [
+          filtro,
+          { category: 'reparaciones' },
+        ];
+        if (!statusQuery && atencion !== 'cierres') {
+          andOps.push({ status: { $in: ['pendiente', 'en_proceso', 'pendiente_cierre'] } });
+        }
+        if (soloMios) {
+          andOps.push({ atendidoPor: yo });
+        }
+        filtroFinal = { $and: andOps };
+      }
+    }
+
+    // Cola FIFO (más antiguos primero). En bandejas activas: no vistos arriba, luego FIFO.
+    // Registro: los cierres más recientes primero.
+    let orden;
+    if (soloEliminados) {
+      orden = { eliminadoAt: -1, createdAt: -1 };
+    } else if (statusQuery === 'pendiente_aprobacion') {
+      orden = { createdAt: 1 };
+    } else if (atencion === 'derivados') {
+      orden = { nuevoDerivadoParaAdmin: -1, createdAt: 1 };
+    } else {
+      orden = { nuevoParaAdmin: -1, createdAt: 1 };
+    }
 
     const [total, markers] = await Promise.all([
-      Marker.countDocuments(filtro),
-      Marker.find(filtro)
-        .select('-image -resolutionImage -confirmations.image')
+      Marker.countDocuments(filtroFinal),
+      Marker.find(filtroFinal)
+        .select('-image -resolutionImage -respuestaDatosImage -confirmations.image')
         .populate('tenant', JURISDICTION_FIELDS)
         .sort(orden)
         .skip(skip)
@@ -923,13 +1247,14 @@ router.get('/admin', requireJurisdictionAdmin, async (req, res) => {
   }
 });
 
-router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => {
+router.patch('/admin/:id/status', requireStaff, async (req, res) => {
   const { status } = req.body;
   if (!status) {
     return res.status(400).json({ message: 'Estado requerido' });
   }
   const normalizedStatus = normalizeStatus(status);
   const descripcionCierre = String(req.body.descripcion || req.body.motivo || '').trim();
+  const esOperario = isScopeOperario(req.adminScope);
   try {
     const marker = await Marker.findById(req.params.id);
     if (!marker) {
@@ -939,7 +1264,36 @@ router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => 
     if (!canManageMarker(req.adminScope, marker)) {
       return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
-    // Cerrar caso: descripción obligatoria + pasa al registro de inmediato
+
+    // Operario: solo reparaciones; pendiente → en_proceso (tomar el caso)
+    if (esOperario) {
+      if (marker.category !== 'reparaciones') {
+        return res.status(403).json({
+          message: 'La cuadrilla solo atiende casos de reparación urbana',
+        });
+      }
+      if (normalizedStatus !== 'en_proceso') {
+        return res.status(403).json({
+          message: 'La cuadrilla solo puede poner el caso en proceso. Para cerrar usá “Proponer cierre”.',
+        });
+      }
+      if (!['pendiente', 'en_proceso'].includes(marker.status)) {
+        return res.status(400).json({ message: 'Solo podés tomar casos publicados o ya en proceso' });
+      }
+      const estadoAnterior = marker.status;
+      marker.status = 'en_proceso';
+      marker.resolvedAt = null;
+      if (!marker.atendidoPor) {
+        marker.atendidoPor = req.requester;
+        marker.atendidoAt = new Date();
+      }
+      await marker.save();
+      await marker.populate('tenant', JURISDICTION_FIELDS);
+      await avisarCambioEstado(marker, estadoAnterior, 'en_proceso').catch(() => {});
+      return res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+    }
+
+    // Admin: cierre directo → registro
     if (normalizedStatus === 'resuelto') {
       if (descripcionCierre.length < 5) {
         return res.status(400).json({
@@ -953,14 +1307,22 @@ router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => 
       marker.eliminadoPor = req.requester;
       marker.motivoEliminacion = `Cierre del administrador: ${descripcionCierre}`;
       marker.nuevoParaAdmin = false;
+      marker.cierrePropuestoPor = null;
+      marker.cierrePropuestoAt = null;
       await marker.save();
       await marker.populate('tenant', JURISDICTION_FIELDS);
       const caso = marker.caseId ? `#${marker.caseId}` : '';
       await avisarPartesCaso(
         marker,
-        `Tu caso ${caso} fue cerrado por el administrador y pasó al registro. ${descripcionCierre}`
+        `Tu caso ${caso} fue resuelto. ${descripcionCierre}`
       ).catch(() => {});
       return res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+    }
+
+    if (normalizedStatus === 'pendiente_cierre') {
+      return res.status(400).json({
+        message: 'Usá la acción de proponer o confirmar cierre',
+      });
     }
 
     const estadoAnterior = marker.status;
@@ -983,6 +1345,376 @@ router.patch('/admin/:id/status', requireJurisdictionAdmin, async (req, res) => 
   }
 });
 
+// Cuadrilla propone cierre → admin debe confirmar
+router.patch('/admin/:id/proponer-cierre', requireStaff, upload.single('image'), async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (marker.category !== 'reparaciones') {
+      return res.status(403).json({
+        message: 'La cuadrilla solo propone cierre en reparaciones urbanas',
+      });
+    }
+    if (!['pendiente', 'en_proceso'].includes(marker.status)) {
+      return res.status(400).json({ message: 'Solo se puede proponer cierre de casos abiertos' });
+    }
+    const descripcion = String(req.body.descripcion || req.body.description || '').trim();
+    if (descripcion.length < 5) {
+      return res.status(400).json({ message: 'Contá qué se hizo en el lugar (mínimo unas palabras)' });
+    }
+    if (req.file && !String(req.file.mimetype || '').startsWith('image/')) {
+      return res.status(400).json({ message: 'El archivo tiene que ser una imagen' });
+    }
+
+    const estadoAnterior = marker.status;
+    marker.status = 'pendiente_cierre';
+    marker.resolutionDescription = descripcion;
+    marker.cierrePropuestoPor = req.requester;
+    marker.cierrePropuestoAt = new Date();
+    if (!marker.atendidoPor) {
+      marker.atendidoPor = req.requester;
+      marker.atendidoAt = new Date();
+    }
+    marker.nuevoParaAdmin = true;
+    if (req.file) {
+      marker.resolutionImage = {
+        data: req.file.buffer,
+        contentType: req.file.mimetype || 'application/octet-stream',
+      };
+      marker.resolutionImageUrl = `/api/markers/${marker._id}/resolution-image`;
+    }
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+
+    await avisarCambioEstado(marker, estadoAnterior, 'pendiente_cierre').catch(() => {});
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    const admins = await listarAdminsDelCaso(marker, { soloJurisdiccion: true });
+    for (const admin of admins) {
+      if (admin === req.requester) continue;
+      await crearNotificacion({
+        userId: admin,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tenantId: marker.tenant,
+        tipo: 'estado',
+        mensaje: `La cuadrilla propuso cierre del caso ${caso}. Revisá y confirmá.`,
+      }).catch(() => {});
+    }
+
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Admin confirma el cierre propuesto por la cuadrilla → Registro
+router.patch('/admin/:id/confirmar-cierre', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (marker.status !== 'pendiente_cierre') {
+      return res.status(400).json({ message: 'Este caso no está pendiente de cierre' });
+    }
+    const quienPropuso = marker.cierrePropuestoPor;
+    const nota = String(req.body.descripcion || req.body.motivo || marker.resolutionDescription || '').trim();
+    marker.status = 'resuelto';
+    marker.resolvedAt = new Date();
+    marker.eliminadoAt = new Date();
+    marker.eliminadoPor = req.requester;
+    marker.motivoEliminacion = `Cierre confirmado: ${nota || 'reparación verificada'}`;
+    marker.nuevoParaAdmin = false;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    await avisarPartesCaso(
+      marker,
+      `Tu caso ${caso} fue resuelto.${nota ? ` ${nota}` : ''}`
+    ).catch(() => {});
+    if (quienPropuso) {
+      await crearNotificacion({
+        userId: quienPropuso,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tenantId: marker.tenant,
+        tipo: 'cuadrilla',
+        mensaje: `El admin confirmó tu cierre del caso ${caso}. Ya está en Registro.`,
+      }).catch(() => {});
+    } else {
+      await avisarOperariosDelCaso(
+        marker,
+        `El admin confirmó el cierre del caso ${caso}. Ya está en Registro.`,
+        'cuadrilla',
+        req.requester
+      ).catch(() => {});
+    }
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Admin reopen: vuelve a en_proceso
+router.patch('/admin/:id/reabrir-cierre', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (marker.status !== 'pendiente_cierre') {
+      return res.status(400).json({ message: 'Este caso no está pendiente de cierre' });
+    }
+    const quienPropuso = marker.cierrePropuestoPor;
+    const notaAdmin = String(req.body.mensaje || req.body.motivo || '').trim();
+    const estadoAnterior = marker.status;
+    marker.status = 'en_proceso';
+    marker.cierrePropuestoPor = null;
+    marker.cierrePropuestoAt = null;
+    marker.nuevoParaAdmin = false;
+    if (notaAdmin.length >= 5) {
+      marker.notaCuadrilla = notaAdmin.slice(0, 500);
+      marker.notaCuadrillaAt = new Date();
+      marker.notaCuadrillaPor = req.requester;
+      marker.respuestaCuadrilla = '';
+      marker.respuestaCuadrillaAt = null;
+      marker.respuestaCuadrillaPor = null;
+    }
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    await avisarCambioEstado(marker, estadoAnterior, 'en_proceso').catch(() => {});
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    const msg = notaAdmin.length >= 5
+      ? `El admin reabrió el caso ${caso}: ${notaAdmin}`
+      : `El admin reabrió el caso ${caso}. Revisalo de nuevo.`;
+    if (quienPropuso) {
+      await crearNotificacion({
+        userId: quienPropuso,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tenantId: marker.tenant,
+        tipo: 'cuadrilla',
+        mensaje: msg,
+      }).catch(() => {});
+    } else {
+      await avisarOperariosDelCaso(marker, msg, 'cuadrilla', req.requester).catch(() => {});
+    }
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Admin → cuadrilla: instrucción o pedido de info (campanita al operario)
+router.patch('/admin/:id/avisar-cuadrilla', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (marker.category !== 'reparaciones') {
+      return res.status(400).json({
+        message: 'La cuadrilla solo recibe avisos de reparaciones urbanas',
+      });
+    }
+    if (['resuelto', 'rechazado', 'pendiente_aprobacion'].includes(marker.status)) {
+      return res.status(400).json({ message: 'Este caso no admite aviso a la cuadrilla' });
+    }
+    const mensaje = String(req.body.mensaje || '').trim().slice(0, 500);
+    if (mensaje.length < 5) {
+      return res.status(400).json({ message: 'Escribí el mensaje para la cuadrilla' });
+    }
+    marker.notaCuadrilla = mensaje;
+    marker.notaCuadrillaAt = new Date();
+    marker.notaCuadrillaPor = req.requester;
+    // Nuevo pedido: limpia la respuesta anterior
+    marker.respuestaCuadrilla = '';
+    marker.respuestaCuadrillaAt = null;
+    marker.respuestaCuadrillaPor = null;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    const enviadas = await avisarOperariosDelCaso(
+      marker,
+      `Admin · caso ${caso}: ${mensaje}`,
+      'cuadrilla',
+      req.requester
+    );
+    if (!enviadas.length) {
+      return res.status(400).json({
+        message: 'No hay operarios asignados en este municipio. Sumalos en Cuadrilla.',
+      });
+    }
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Cuadrilla responde al aviso del admin
+router.patch('/admin/:id/responder-cuadrilla', requireStaff, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (!isScopeOperario(req.adminScope) && !isScopeAdmin(req.adminScope)) {
+      return res.status(403).json({ message: 'Solo la cuadrilla o el admin pueden registrar esta respuesta' });
+    }
+    if (marker.category !== 'reparaciones') {
+      return res.status(400).json({ message: 'Solo aplica a reparaciones urbanas' });
+    }
+    if (!marker.notaCuadrillaAt || !String(marker.notaCuadrilla || '').trim()) {
+      return res.status(400).json({ message: 'No hay un aviso del admin para responder' });
+    }
+    const mensaje = String(req.body.mensaje || '').trim().slice(0, 1000);
+    if (mensaje.length < 5) {
+      return res.status(400).json({ message: 'Escribí la respuesta (mínimo unas palabras)' });
+    }
+    marker.respuestaCuadrilla = mensaje;
+    marker.respuestaCuadrillaAt = new Date();
+    marker.respuestaCuadrillaPor = req.requester;
+    if (isScopeOperario(req.adminScope) && !marker.atendidoPor) {
+      marker.atendidoPor = req.requester;
+      marker.atendidoAt = new Date();
+    }
+    marker.nuevoParaAdmin = true;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    const tenantId = marker.tenant && marker.tenant._id ? marker.tenant._id : marker.tenant;
+    const admins = await listarAdminsDelCaso(marker, { soloJurisdiccion: true });
+    if (marker.notaCuadrillaPor) admins.push(normalizeUserId(marker.notaCuadrillaPor));
+    const vistos = new Set();
+    for (const admin of admins) {
+      const uid = normalizeUserId(admin);
+      if (!uid || uid === 'anonimo' || uid === req.requester || vistos.has(uid)) continue;
+      vistos.add(uid);
+      await crearNotificacion({
+        userId: uid,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tenantId,
+        tipo: 'estado',
+        mensaje: `Cuadrilla respondió al aviso del caso ${caso}.`,
+      }).catch(() => {});
+    }
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Alta / baja de operarios (admin municipal o super)
+router.get('/admin/operarios', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const filtro = req.adminScope.isSuperAdmin
+      ? { type: { $in: ['municipality', 'commune'] }, status: 'active' }
+      : { _id: { $in: req.adminScope.tenantIds }, status: 'active' };
+    const tenants = await Tenant.find(filtro).select('name type operarios admins').sort({ name: 1 });
+    const items = [];
+    tenants.forEach((t) => {
+      (t.operarios || []).forEach((email) => {
+        items.push({
+          email,
+          tenantId: String(t._id),
+          tenantName: t.name,
+          tenantType: t.type,
+        });
+      });
+    });
+    items.sort((a, b) => a.email.localeCompare(b.email) || a.tenantName.localeCompare(b.tenantName));
+    res.json({
+      items,
+      tenants: tenants.map((t) => ({
+        id: String(t._id),
+        name: t.name,
+        type: t.type,
+        operarios: t.operarios || [],
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.post('/admin/operarios', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const email = normalizeUserId(req.body.email || '');
+    const tenantId = String(req.body.tenantId || '').trim();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ message: 'Indicá un email válido' });
+    }
+    if (isAdminUser(email)) {
+      return res.status(400).json({ message: 'Ese email es super administrador' });
+    }
+    const tenant = await Tenant.findById(tenantId);
+    if (!tenant || !['municipality', 'commune'].includes(tenant.type)) {
+      return res.status(404).json({ message: 'Jurisdicción no encontrada' });
+    }
+    if (!req.adminScope.isSuperAdmin && !req.adminScope.tenantIds.includes(String(tenant._id))) {
+      return res.status(403).json({ message: 'No administrás esa jurisdicción' });
+    }
+    if ((tenant.admins || []).includes(email)) {
+      return res.status(400).json({ message: 'Ese email ya es administrador municipal' });
+    }
+    const antes = (tenant.operarios || []).length;
+    tenant.operarios = Array.from(new Set([...(tenant.operarios || []), email]));
+    await tenant.save();
+    res.json({
+      message: tenant.operarios.length === antes ? 'Ya era operario' : 'Operario asignado',
+      tenantId: String(tenant._id),
+      operarios: tenant.operarios,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.delete('/admin/operarios', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const email = normalizeUserId(req.body.email || req.query.email || '');
+    const tenantId = String(req.body.tenantId || req.query.tenantId || '').trim();
+    if (!email || !tenantId) {
+      return res.status(400).json({ message: 'Faltan email o jurisdicción' });
+    }
+    const tenant = await Tenant.findById(tenantId);
+    if (!tenant) {
+      return res.status(404).json({ message: 'Jurisdicción no encontrada' });
+    }
+    if (!req.adminScope.isSuperAdmin && !req.adminScope.tenantIds.includes(String(tenant._id))) {
+      return res.status(403).json({ message: 'No administrás esa jurisdicción' });
+    }
+    tenant.operarios = (tenant.operarios || []).filter((a) => a !== email);
+    await tenant.save();
+    res.json({ message: 'Operario quitado', operarios: tenant.operarios });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Ruta para aprobar un marcador (cambiar de pendiente_aprobacion a pendiente)
 router.patch('/admin/:id/avisar', requireJurisdictionAdmin, async (req, res) => {
   try {
@@ -994,17 +1726,37 @@ router.patch('/admin/:id/avisar', requireJurisdictionAdmin, async (req, res) => 
     if (!canManageMarker(req.adminScope, marker)) {
       return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
-    const puedeAvisar = marker.category === 'familias'
-      || marker.category === 'persona'
+    const esFamilia = marker.category === 'familias' || marker.category === 'persona';
+    const puedeAvisar = esFamilia
       || (marker.category === 'perros_gatos' && marker.animalTipo === 'abandonado');
     if (!puedeAvisar) {
       return res.status(400).json({ message: 'Este aviso es solo para familias o animales abandonados' });
     }
+    if (marker.status === 'pendiente_aprobacion') {
+      return res.status(400).json({
+        message: 'Primero aprobá el aviso y después podés avisar a la oficina',
+      });
+    }
+    if (['rechazado', 'resuelto'].includes(marker.status)) {
+      return res.status(400).json({ message: 'Este caso ya está cerrado' });
+    }
     const eraNuevoAviso = !marker.avisadoAt;
     if (!marker.avisadoAt) {
       marker.avisadoAt = new Date();
-      await marker.save();
     }
+    // Sale de la bandeja “nuevos” (Reportes / Cosas)
+    marker.nuevoParaAdmin = false;
+    // Familias: tras avisar a la oficina, sale de Reportes → Registro (no van al mapa)
+    if (esFamilia && !marker.eliminadoAt) {
+      marker.eliminadoAt = new Date();
+      marker.eliminadoPor = req.requester;
+      marker.motivoEliminacion = 'Oficina correspondiente avisada';
+      marker.nuevoDerivadoParaAdmin = false;
+    } else if (!esFamilia) {
+      // Abandonados: siguen en el mapa; badge + sombreado en Derivados
+      marker.nuevoDerivadoParaAdmin = true;
+    }
+    await marker.save();
     if (eraNuevoAviso) {
       await avisarOficina(marker).catch(() => {});
     }
@@ -1047,6 +1799,9 @@ router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) =>
     avisarAdminsCasoAprobado(updatedMarker).catch((err) => {
       console.error('No se pudo notificar admins del caso aprobado:', err.message);
     });
+    avisarVecinosCercanos(updatedMarker).catch((err) => {
+      console.error('No se pudo avisar vecinos cerca:', err.message);
+    });
     res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -1071,20 +1826,24 @@ router.patch('/admin/:id/rechazar', requireJurisdictionAdmin, async (req, res) =
       return res.status(400).json({ message: 'No se puede anular un caso ya resuelto' });
     }
     const motivo = String(req.body.motivo || '').trim().slice(0, 400);
+    if (motivo.length < 5) {
+      return res.status(400).json({
+        message: 'Escribí el motivo de la anulación (al menos unas palabras)',
+      });
+    }
     const estadoAnterior = marker.status;
+    const eraPorAprobar = estadoAnterior === 'pendiente_aprobacion';
     marker.status = 'rechazado';
     marker.resolvedAt = null;
     // Anulado: sale del mapa y pasa al Registro
     marker.eliminadoAt = new Date();
     marker.eliminadoPor = req.requester;
-    marker.motivoEliminacion = motivo
-      ? `Anulado: ${motivo}`
-      : 'Anulado por el administrador';
+    marker.motivoEliminacion = `Anulado: ${motivo}`;
     marker.nuevoParaAdmin = false;
     await marker.save();
     await marker.populate('tenant', JURISDICTION_FIELDS);
     try {
-      await avisarRechazo(marker, motivo);
+      await avisarRechazo(marker, motivo, { eraPorAprobar });
     } catch (errorNotif) {
       console.error('No se pudo notificar el rechazo:', errorNotif.message);
       try {
@@ -1122,6 +1881,21 @@ router.get('/:id/resolution-image', async (req, res) => {
     res.set('Content-Type', marker.resolutionImage.contentType || 'application/octet-stream');
     res.set('Cache-Control', 'private, max-age=3600');
     res.send(marker.resolutionImage.data);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Foto de la respuesta al pedido de datos
+router.get('/:id/respuesta-datos-image', async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id).select('respuestaDatosImage');
+    if (!marker || !marker.respuestaDatosImage || !marker.respuestaDatosImage.data) {
+      return res.status(404).json({ message: 'Imagen no encontrada' });
+    }
+    res.set('Content-Type', marker.respuestaDatosImage.contentType || 'application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.send(marker.respuestaDatosImage.data);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -1561,7 +2335,7 @@ router.post('/:id/chat', upload.single('image'), async (req, res) => {
   }
 });
 
-router.patch('/admin/:id/pedir-datos', requireJurisdictionAdmin, async (req, res) => {
+router.patch('/admin/:id/pedir-datos', requireStaff, async (req, res) => {
   try {
     const marker = await Marker.findById(req.params.id);
     if (!marker) {
@@ -1571,8 +2345,8 @@ router.patch('/admin/:id/pedir-datos', requireJurisdictionAdmin, async (req, res
     if (!canManageMarker(req.adminScope, marker)) {
       return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
     }
-    if (marker.status === 'resuelto' || marker.status === 'rechazado') {
-      return res.status(400).json({ message: 'Este caso ya está cerrado' });
+    if (['resuelto', 'rechazado', 'pendiente_cierre'].includes(marker.status)) {
+      return res.status(400).json({ message: 'Este caso ya no admite pedido de datos' });
     }
     const caso = marker.caseId ? `#${marker.caseId}` : '';
     const nota = String(req.body.mensaje || '').trim().slice(0, 500);
@@ -1584,6 +2358,11 @@ router.patch('/admin/:id/pedir-datos', requireJurisdictionAdmin, async (req, res
     // No cambia el estado: En proceso es solo cuando el municipio actúa
     marker.pideDatosMensaje = nota;
     marker.pideDatosAt = new Date();
+    marker.pideDatosPor = req.requester;
+    if (isScopeOperario(req.adminScope) && !marker.atendidoPor) {
+      marker.atendidoPor = req.requester;
+      marker.atendidoAt = new Date();
+    }
     await marker.save();
     await crearNotificacion({
       userId: marker.createdBy,
@@ -1622,31 +2401,48 @@ router.patch('/:id/responder-datos', upload.single('image'), async (req, res) =>
         message: 'Agregá una descripción o una foto para responder',
       });
     }
+
+    // Conservar el pedido en la ficha (admin / operario)
+    marker.ultimoPedidoDatosMensaje = marker.pideDatosMensaje || '';
+    marker.ultimoPedidoDatosAt = marker.pideDatosAt || new Date();
+    marker.ultimoPedidoDatosPor = marker.pideDatosPor || null;
+
     if (descripcion.length >= 5) {
+      marker.respuestaDatosMensaje = descripcion.slice(0, 2000);
       marker.description = descripcion.slice(0, 2000);
+    } else {
+      marker.respuestaDatosMensaje = '';
     }
     if (req.file) {
-      marker.image = {
+      const img = {
         data: req.file.buffer,
         contentType: req.file.mimetype || 'application/octet-stream',
       };
+      marker.respuestaDatosImage = img;
+      marker.respuestaDatosImageUrl = `/api/markers/${marker._id}/respuesta-datos-image`;
+      marker.image = img;
       marker.imageUrl = `/api/markers/${marker._id}/image`;
     }
+
     marker.pideDatosMensaje = '';
     marker.pideDatosAt = null;
+    marker.pideDatosPor = null;
     marker.respuestaDatosAt = new Date();
     marker.ultimaRespuestaDatosAt = marker.respuestaDatosAt;
     marker.nuevoParaAdmin = true;
     await marker.save();
     const caso = marker.caseId ? `#${marker.caseId}` : '';
-    const admins = await listarAdminsDelCaso(marker);
-    for (const admin of admins) {
+    const destinatarios = new Set(await listarAdminsDelCaso(marker));
+    if (marker.atendidoPor) destinatarios.add(normalizeUserId(marker.atendidoPor));
+    if (marker.ultimoPedidoDatosPor) destinatarios.add(normalizeUserId(marker.ultimoPedidoDatosPor));
+    for (const userId of destinatarios) {
+      if (!userId || userId === 'anonimo') continue;
       await crearNotificacion({
-        userId: admin,
+        userId,
         markerId: marker._id,
         caseId: marker.caseId,
         tipo: 'respuesta_datos',
-        mensaje: `El vecino respondió al pedido de datos del caso ${caso}. Revisalo en Reportes.`,
+        mensaje: `Nueva respuesta del vecino${caso ? ` · caso ${caso}` : ''}.`,
       }).catch(() => {});
     }
     await marker.populate('tenant', JURISDICTION_FIELDS);

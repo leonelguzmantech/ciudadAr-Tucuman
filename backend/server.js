@@ -9,8 +9,10 @@ const publicRoutes = require('./routes/publicRoutes');
 const usuarioRoutes = require('./routes/usuarioRoutes');
 const notificacionRoutes = require('./routes/notificacionRoutes');
 const geocodeRoutes = require('./routes/geocodeRoutes');
+const rutasRoutes = require('./routes/rutasRoutes');
+const superRoutes = require('./routes/superRoutes');
 const { normalizeUserId } = require('./utils/users');
-const { getAdminScope, isScopeAdmin } = require('./utils/jurisdictions');
+const { getAdminScope, isScopeAdmin, isScopeOperario } = require('./utils/jurisdictions');
 
 const app = express();
 
@@ -33,16 +35,19 @@ app.get('/api/auth/me', async (req, res) => {
     const userId = normalizeUserId(req.headers['x-user-id'] || '');
     const scope = await getAdminScope(userId);
     const isAdmin = isScopeAdmin(scope);
+    const isOperario = isScopeOperario(scope);
 
     let role = 'PUBLIC_USER';
     if (scope.isSuperAdmin) role = 'SUPER_ADMIN';
     else if (isAdmin) role = 'JURISDICTION_ADMIN';
+    else if (isOperario) role = 'OPERARIO';
 
     res.json({
       userId,
-      isAdmin,
+      isAdmin: isAdmin || isOperario,
+      isOperario,
       role,
-      jurisdictions: scope.jurisdictions,
+      jurisdictions: isOperario ? scope.operarioJurisdictions : scope.jurisdictions,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -54,6 +59,8 @@ app.use('/api/public', publicRoutes);
 app.use('/api/usuarios', usuarioRoutes);
 app.use('/api/notificaciones', notificacionRoutes);
 app.use('/api/geocode', geocodeRoutes);
+app.use('/api/rutas', rutasRoutes);
+app.use('/api/super', superRoutes);
 
 const PORT = process.env.PORT || 5001;
 

@@ -17,8 +17,20 @@ router.get('/', async (req, res) => {
     const notificaciones = await Notificacion.find({ userId: req.requester })
       .sort({ createdAt: -1 })
       .limit(40);
-    const noLeidas = await Notificacion.countDocuments({ userId: req.requester, leida: false });
-    res.json({ notificaciones, noLeidas });
+    const tiposPerdidas = ['reclamo', 'chat', 'cerca'];
+    const [noLeidas, perdidasNoLeidas] = await Promise.all([
+      Notificacion.countDocuments({
+        userId: req.requester,
+        leida: false,
+        tipo: { $nin: tiposPerdidas },
+      }),
+      Notificacion.countDocuments({
+        userId: req.requester,
+        leida: false,
+        tipo: { $in: tiposPerdidas },
+      }),
+    ]);
+    res.json({ notificaciones, noLeidas, perdidasNoLeidas });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -31,6 +43,36 @@ router.patch('/leer-todas', async (req, res) => {
       { leida: true }
     );
     res.json({ message: 'Avisos marcados como leídos' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Marca como leídos avisos del Radar (reclamo / chat / cerca)
+router.patch('/perdidas/leer', async (req, res) => {
+  try {
+    const tiposPerdidas = ['reclamo', 'chat', 'cerca'];
+    const tiposPedidos = Array.isArray(req.body?.tipos)
+      ? req.body.tipos.filter((t) => tiposPerdidas.includes(t))
+      : [];
+    const filtro = {
+      userId: req.requester,
+      leida: false,
+      tipo: { $in: tiposPedidos.length ? tiposPedidos : tiposPerdidas },
+    };
+    const markerId = req.body?.markerId || req.query?.markerId;
+    if (markerId) filtro.markerId = markerId;
+    const result = await Notificacion.updateMany(filtro, { leida: true });
+    const perdidasNoLeidas = await Notificacion.countDocuments({
+      userId: req.requester,
+      leida: false,
+      tipo: { $in: tiposPerdidas },
+    });
+    res.json({
+      message: 'Avisos de cosas perdidas marcados como leídos',
+      modificados: result.modifiedCount || 0,
+      perdidasNoLeidas,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

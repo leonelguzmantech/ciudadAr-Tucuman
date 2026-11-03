@@ -43,28 +43,61 @@ const findJurisdictionForPoint = async (lat, lng) => {
   };
 };
 
+const mapJuris = (rows) =>
+  (rows || []).map((t) => ({ id: t._id, name: t.name, type: t.type }));
+
 const getAdminScope = async (userId) => {
   if (isAdminUser(userId)) {
-    return { isSuperAdmin: true, tenantIds: [], provinceIds: [], jurisdictions: [] };
+    return {
+      isSuperAdmin: true,
+      isOperario: false,
+      tenantIds: [],
+      provinceIds: [],
+      operarioTenantIds: [],
+      jurisdictions: [],
+      operarioJurisdictions: [],
+    };
   }
 
-  const managed = await Tenant.find({ admins: userId, status: 'active' }).select('_id name type');
+  const [managed, crew] = await Promise.all([
+    Tenant.find({ admins: userId, status: 'active' }).select('_id name type'),
+    Tenant.find({ operarios: userId, status: 'active' }).select('_id name type'),
+  ]);
+
+  const tenantIds = managed
+    .filter((t) => LOCAL_TYPES.includes(t.type))
+    .map((t) => String(t._id));
+  const provinceIds = managed
+    .filter((t) => t.type === 'province')
+    .map((t) => String(t._id));
+  const operarioTenantIds = crew
+    .filter((t) => LOCAL_TYPES.includes(t.type))
+    .map((t) => String(t._id));
+
+  const esAdmin = tenantIds.length > 0 || provinceIds.length > 0;
+
   return {
     isSuperAdmin: false,
-    tenantIds: managed.filter((t) => LOCAL_TYPES.includes(t.type)).map((t) => String(t._id)),
-    provinceIds: managed.filter((t) => t.type === 'province').map((t) => String(t._id)),
-    jurisdictions: managed.map((t) => ({ id: t._id, name: t.name, type: t.type })),
+    isOperario: !esAdmin && operarioTenantIds.length > 0,
+    tenantIds,
+    provinceIds,
+    operarioTenantIds,
+    jurisdictions: mapJuris(managed),
+    operarioJurisdictions: mapJuris(crew),
   };
 };
 
 const isScopeAdmin = (scope) =>
   !!(scope && (scope.isSuperAdmin || scope.tenantIds.length > 0 || scope.provinceIds.length > 0));
 
+const isScopeOperario = (scope) =>
+  !!(scope && scope.isOperario && (scope.operarioTenantIds || []).length > 0);
+
+const isScopeStaff = (scope) => isScopeAdmin(scope) || isScopeOperario(scope);
+
 /**
  * ¿Puede gestionar este marcador?
- * - Super admin: sí
- * - Admin de municipio/comuna: solo si el caso pertenece a ese tenant local
- * - Admin de provincia: si el caso está en esa provincia (o en un tenant que administra)
+ * - Super / admin municipal / operario del mismo tenant
  */
 const canManageMarker = (scope, marker) => {
   if (!scope) return false;
@@ -76,10 +109,8 @@ const canManageMarker = (scope, marker) => {
   const provinceStr = provinceId ? String(provinceId) : '';
 
   if (tenantStr && scope.tenantIds.includes(tenantStr)) return true;
+  if (tenantStr && (scope.operarioTenantIds || []).includes(tenantStr)) return true;
 
-  // Solo los admins de provincia amplían por province.
-  // Un admin solo de municipio NO debe ver casos de otros municipios
-  // aunque compartan la misma provincia.
   if (scope.provinceIds.length && provinceStr && scope.provinceIds.includes(provinceStr)) {
     return true;
   }
@@ -87,16 +118,12 @@ const canManageMarker = (scope, marker) => {
   return false;
 };
 
-/**
- * Filtro Mongo para listados/stats del dashboard admin.
- * Nunca usa `$in: []` (evita comportamientos raros) y no abre el alcance
- * de un admin municipal a toda la provincia.
- */
 const buildManagedMarkersFilter = (scope) => {
   if (!scope || scope.isSuperAdmin) return {};
 
   const localIds = toObjectIds(scope.tenantIds);
   const provinceIds = toObjectIds(scope.provinceIds);
+  const operarioIds = toObjectIds(scope.operarioTenantIds);
   const or = [];
 
   if (localIds.length) {
@@ -105,8 +132,10 @@ const buildManagedMarkersFilter = (scope) => {
   if (provinceIds.length) {
     or.push({ province: { $in: provinceIds } });
   }
+  if (operarioIds.length) {
+    or.push({ tenant: { $in: operarioIds } });
+  }
 
-  // Admin sin jurisdicciones asignadas: no ve nada
   if (!or.length) return { _id: { $exists: false } };
   if (or.length === 1) return or[0];
   return { $or: or };
@@ -116,6 +145,8 @@ module.exports = {
   findJurisdictionForPoint,
   getAdminScope,
   isScopeAdmin,
+  isScopeOperario,
+  isScopeStaff,
   canManageMarker,
   buildManagedMarkersFilter,
 };

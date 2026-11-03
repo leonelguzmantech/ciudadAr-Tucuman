@@ -6,6 +6,8 @@ const Home = ({
   panelVecino,
   onPanelVecinoVisto,
   onNoLeidasChange,
+  onPerdidasNoLeidasChange,
+  onAbrirCasoAdmin = null,
   focoCasoMapa = null,
   onFocoCasoVisto,
 }) => {
@@ -20,6 +22,8 @@ const Home = ({
           panelVecino={panelVecino}
           onPanelVecinoVisto={onPanelVecinoVisto}
           onNoLeidasChange={onNoLeidasChange}
+          onPerdidasNoLeidasChange={onPerdidasNoLeidasChange}
+          onAbrirCasoAdmin={onAbrirCasoAdmin}
           focoCasoMapa={focoCasoMapa}
           onFocoCasoVisto={onFocoCasoVisto}
         />
