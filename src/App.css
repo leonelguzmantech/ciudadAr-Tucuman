@@ -91,6 +91,11 @@ body{
   background: transparent;
   cursor: pointer;
   line-height: 0;
+  isolation: isolate;
+}
+/* Animales: recorta la huella al silueta del pin (el brillo sí puede sobresalir) */
+.pin-elegido.pin-animal:not(.pin-elegido-brillo){
+  overflow: hidden;
 }
 
 .pin-elegido-luz,
@@ -103,12 +108,17 @@ body{
 
 /* Patita del pack (PNG) centrada en la cabeza del pin */
 .pin-elegido-patita{
-  left: 22%;
-  top: 12%;
-  width: 56%;
-  height: 42%;
+  left: 24%;
+  top: 14%;
+  width: 52%;
+  height: 38%;
   object-fit: contain;
   z-index: 2;
+}
+
+.pin-animal .pin-elegido-cuerpo{
+  /* Menos halo: con zoom lejos el glow + huella se leían por encima de otros pines */
+  filter: drop-shadow(0 1px 3px rgba(15, 23, 42, 0.28));
 }
 
 .pin-elegido-luz{
@@ -236,15 +246,26 @@ body{
 }
 
 .pin-central.moviendo img{
-  transform: translateY(-6px);
-  filter: drop-shadow(0 6px 8px rgba(18, 49, 92, 0.2));
+  /* Elevación media: se nota al arrastrar sin el fantasma del -6px */
+  transform: translateY(-4px);
+  filter: drop-shadow(0 5px 6px rgba(18, 49, 92, 0.22));
 }
 
 .pin-central.moviendo::after{
-  width: 7px;
+  width: 8px;
   height: 3px;
-  opacity: 0.45;
-  transform: translateX(-50%) scale(0.75);
+  opacity: 0.48;
+  transform: translateX(-50%) scale(0.8);
+}
+
+/* Durante el pan: sin transitions en pines OverlayView (evita flash/fantasma) */
+.mapa-lienzo.mapa-arrastrando .pin-elegido,
+.mapa-lienzo.mapa-arrastrando .pin-elegido-cuerpo,
+.mapa-lienzo.mapa-arrastrando .pin-elegido-luz,
+.mapa-lienzo.mapa-arrastrando .pin-elegido-patita,
+.mapa-lienzo.mapa-arrastrando .ubicacion-actual{
+  transition: none !important;
+  animation: none !important;
 }
 
 .mapa-barra-inferior{
@@ -2120,6 +2141,53 @@ body{
   font-size: 11px;
 }
 
+/* Mis reportes: pantalla completa (sin mapa), misma visualización que admin */
+.perdidas-panel-lateral.mis-reportes-panel{
+  padding: 14px 18px 20px;
+}
+.mis-reportes-panel .mis-reportes-tabs{
+  margin: 4px 0 12px;
+  padding: 4px;
+  gap: 6px;
+  border-radius: 12px;
+}
+.mis-reportes-panel .mis-reportes-tabs button{
+  padding: 8px 12px;
+  font-size: 13px;
+  border-radius: 10px;
+}
+.mis-reportes-lista-wrap{
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+.mis-reportes-panel .admin-dash-lista-cabecera{
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+.mis-reportes-panel .admin-dash-lista-cabecera h1{
+  margin: 0 0 4px;
+  font-size: 22px;
+  color: #12315c;
+}
+.mis-reportes-panel .admin-dash-sub{
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+}
+.mis-reportes-panel .admin-dash-vacio{
+  margin: 24px 0;
+  color: #64748b;
+  text-align: center;
+}
+.mis-reportes-panel .tarjeta-mi-reporte-wrap{
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .panel-mis-tabs{
   display: flex;
   gap: 6px;
@@ -2484,6 +2552,40 @@ body{
   color: #0f172a;
   font-weight: 700;
   font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Radar Míos: resaltar Tu aviso / Tu reclamo */
+.etiqueta-rol-radar{
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 1.25;
+}
+.etiqueta-rol-radar.rol-aviso{
+  background: #ccfbf1;
+  color: #0f766e;
+}
+.etiqueta-rol-radar.rol-reclamo{
+  background: #ffedd5;
+  color: #c2410c;
+}
+.tarjeta-mi-reporte.tarjeta-mi-reporte-propia{
+  border-left: 3px solid #0f766e;
+  background: linear-gradient(90deg, rgba(204, 251, 241, 0.45), transparent 42%);
+}
+.tarjeta-mi-reporte.tarjeta-mi-reporte-reclamo{
+  border-left: 3px solid #ea580c;
+  background: linear-gradient(90deg, rgba(255, 237, 213, 0.55), transparent 42%);
 }
 
 .tarjeta-mi-reporte-direccion{
@@ -5002,6 +5104,19 @@ body{
 }
 .admin-dash-stats button.admin-dash-stat-alerta strong{
   color: #c2410c;
+}
+/* Resumen → Reportes: foco del día (azul, no alarma) */
+.admin-dash-stats button.admin-dash-stat-principal{
+  background: linear-gradient(135deg, #eff6ff 0%, #f8fbff 70%);
+  border-color: #93c5fd;
+  box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12);
+}
+.admin-dash-stats button.admin-dash-stat-principal strong{
+  color: #1d4ed8;
+}
+.admin-dash-stats button.admin-dash-stat-principal span{
+  color: #1e40af;
+  font-weight: 700;
 }
 .admin-dash-stats strong{
   display: block;

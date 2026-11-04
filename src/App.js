@@ -61,6 +61,17 @@ function App() {
         setRolAdmin('');
         setRolListo(false);
         setVistaAdmin('dashboard');
+        // No heredar vistas/filtros entre sesiones (admin arranca en Inicio)
+        try {
+          sessionStorage.removeItem('ciudadar-mis-reportes-vista');
+          sessionStorage.removeItem('ciudadar-radar-vista');
+          sessionStorage.removeItem('ciudadar-admin-seccion');
+          sessionStorage.removeItem('ciudadar-super-seccion');
+          sessionStorage.removeItem('ciudadar-super-casos-foco');
+          sessionStorage.setItem('ciudadar-vista-admin', 'dashboard');
+        } catch {
+          /* ignore */
+        }
       }
     });
 
@@ -237,6 +248,7 @@ function App() {
           esAdmin={esAdmin}
           esOperario={esSoloOperario}
           onFiltros={() => setPanelVecino('filtros')}
+          onReportar={() => setPanelVecino('reportar')}
           onMisReportes={() => setPanelVecino('mis-reportes')}
           onCosasPerdidas={() => setPanelVecino('cosas-perdidas')}
           onNotificaciones={() => setPanelVecino('notificaciones')}

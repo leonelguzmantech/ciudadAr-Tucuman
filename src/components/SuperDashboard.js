@@ -7,7 +7,7 @@ import logoCiudad from '../assets/ciudadar-logo-circulo-estilo.jpg';
 const auth = getAuth(appFirebase);
 const API = 'http://localhost:5001';
 const SUPER_VISTA_KEY = 'ciudadar-super-seccion';
-const SECCIONES = new Set(['inicio', 'jurisdicciones', 'admins', 'sin_jurisdiccion']);
+const SECCIONES = new Set(['inicio', 'jurisdicciones', 'admins', 'cuadrillas', 'sin_jurisdiccion']);
 
 const CATEGORY_LABEL = {
   reparaciones: 'Reparación',
@@ -24,6 +24,9 @@ const IconoJuris = () => (
 );
 const IconoAdmins = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0 2c-4 0-8 2-8 4v2h16v-2c0-2-4-4-8-4z" /></svg>
+);
+const IconoCuadrilla = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16 11c1.7 0 3-1.3 3-3s-1.3-3-3-3-3 1.3-3 3 1.3 3 3 3zM8 11c1.7 0 3-1.3 3-3S9.7 5 8 5 5 6.3 5 8s1.3 3 3 3zm0 2c-2.3 0-7 1.2-7 3.5V19h14v-2.5C15 14.2 10.3 13 8 13zm8 0c-.3 0-.7 0-1 .1 1.2.9 2 2 2 3.4V19h7v-2.5c0-2.3-4.7-3.5-8-3.5z" /></svg>
 );
 const IconoCasos = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 2h9l5 5v15H6V2zm8 1.5V8h4.5L14 3.5zM8 12h8v2H8v-2zm0 4h8v2H8v-2z" /></svg>
@@ -74,6 +77,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
   const [jurisdicciones, setJurisdicciones] = useState([]);
   const [tenantsAsignacion, setTenantsAsignacion] = useState([]);
   const [admins, setAdmins] = useState([]);
+  const [operarios, setOperarios] = useState([]);
   const [sinTenantItems, setSinTenantItems] = useState([]);
   const [sinTenantMeta, setSinTenantMeta] = useState({ total: 0, page: 1, hasMore: false });
   const [asignacionLocal, setAsignacionLocal] = useState({});
@@ -87,9 +91,12 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
   const [filtroSoloSinLimite, setFiltroSoloSinLimite] = useState(false);
   const [filtroSoloConAdmins, setFiltroSoloConAdmins] = useState(false);
   const [filtroAdminQ, setFiltroAdminQ] = useState('');
+  const [filtroOperarioQ, setFiltroOperarioQ] = useState('');
 
   const [nuevoEmail, setNuevoEmail] = useState('');
   const [nuevoTenantId, setNuevoTenantId] = useState('');
+  const [nuevoOperarioEmail, setNuevoOperarioEmail] = useState('');
+  const [nuevoOperarioTenantId, setNuevoOperarioTenantId] = useState('');
 
   const headers = useMemo(() => ({ 'x-user-id': userId }), [userId]);
 
@@ -130,6 +137,14 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
     const { data } = await axios.get(`${API}/api/super/admins`, { headers, params });
     setAdmins(data.items || []);
   }, [headers, filtroAdminQ]);
+
+  const cargarOperarios = useCallback(async () => {
+    const { data } = await axios.get(`${API}/api/markers/admin/operarios`, { headers });
+    setOperarios(data.items || []);
+    if (!nuevoOperarioTenantId && (data.tenants || []).length) {
+      setNuevoOperarioTenantId(data.tenants[0].id);
+    }
+  }, [headers, nuevoOperarioTenantId]);
 
   // Selector de asignación: municipios y comunas activas (sin el filtro de la otra pestaña)
   const cargarTenantsAsignacion = useCallback(async () => {
@@ -173,6 +188,8 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
       else if (seccion === 'jurisdicciones') await Promise.all([cargarJurisdicciones(), ...extras]);
       else if (seccion === 'admins') {
         await Promise.all([cargarAdmins(), cargarTenantsAsignacion(), ...extras]);
+      } else if (seccion === 'cuadrillas') {
+        await Promise.all([cargarOperarios(), cargarTenantsAsignacion(), ...extras]);
       } else if (seccion === 'sin_jurisdiccion') {
         await Promise.all([cargarSinTenant(1), cargarTenantsAsignacion(), ...extras]);
       } else {
@@ -190,6 +207,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
     cargarStats,
     cargarJurisdicciones,
     cargarAdmins,
+    cargarOperarios,
     cargarTenantsAsignacion,
     cargarSinTenant,
   ]);
@@ -251,6 +269,48 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
       });
       mostrarAviso(`Se quitó ${asig.email}`);
       await Promise.all([cargarAdmins(), cargarTenantsAsignacion()]);
+    } catch (err) {
+      mostrarAviso(err.response?.data?.message || 'No se pudo quitar');
+    } finally {
+      setAccionando(false);
+    }
+  };
+
+  const asignarOperario = async (event) => {
+    event.preventDefault();
+    if (accionando) return;
+    const email = nuevoOperarioEmail.trim().toLowerCase();
+    if (!email || !nuevoOperarioTenantId) {
+      mostrarAviso('Completá email y municipio');
+      return;
+    }
+    setAccionando(true);
+    try {
+      const { data } = await axios.post(
+        `${API}/api/markers/admin/operarios`,
+        { email, tenantId: nuevoOperarioTenantId },
+        { headers }
+      );
+      mostrarAviso(data.message || 'Operario asignado');
+      setNuevoOperarioEmail('');
+      await Promise.all([cargarOperarios(), cargarTenantsAsignacion()]);
+    } catch (err) {
+      mostrarAviso(err.response?.data?.message || 'No se pudo asignar');
+    } finally {
+      setAccionando(false);
+    }
+  };
+
+  const quitarOperario = async (item) => {
+    if (accionando) return;
+    setAccionando(true);
+    try {
+      await axios.delete(`${API}/api/markers/admin/operarios`, {
+        headers,
+        data: { email: item.email, tenantId: item.tenantId },
+      });
+      mostrarAviso(`Se quitó ${item.email}`);
+      await Promise.all([cargarOperarios(), cargarTenantsAsignacion()]);
     } catch (err) {
       mostrarAviso(err.response?.data?.message || 'No se pudo quitar');
     } finally {
@@ -327,6 +387,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
     inicio: 'Tablero global',
     jurisdicciones: 'Jurisdicciones',
     admins: 'Administradores municipales',
+    cuadrillas: 'Cuadrillas',
     sin_jurisdiccion: 'Sin jurisdicción',
   }[seccion] || 'Super administración';
 
@@ -338,6 +399,15 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
     }),
     [tenantsAsignacion]
   );
+
+  const operariosVisibles = useMemo(() => {
+    const q = filtroOperarioQ.trim().toLowerCase();
+    if (!q) return operarios;
+    return operarios.filter((o) => (
+      String(o.email || '').toLowerCase().includes(q)
+      || String(o.tenantName || '').toLowerCase().includes(q)
+    ));
+  }, [operarios, filtroOperarioQ]);
 
   return (
     <div className="admin-dash admin-dash-video admin-dash-root">
@@ -358,6 +428,9 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           </button>
           <button type="button" className={seccion === 'admins' ? 'activo' : ''} onClick={() => irSeccion('admins')}>
             <IconoAdmins /> Admins
+          </button>
+          <button type="button" className={seccion === 'cuadrillas' ? 'activo' : ''} onClick={() => irSeccion('cuadrillas')}>
+            <IconoCuadrilla /> Cuadrillas
           </button>
           <button
             type="button"
@@ -384,7 +457,15 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           <button
             type="button"
             className="admin-dash-sidebar-salir"
-            onClick={() => signOut(auth).catch(() => {})}
+            onClick={() => {
+              try {
+                sessionStorage.removeItem(SUPER_VISTA_KEY);
+                sessionStorage.removeItem('ciudadar-admin-seccion');
+                sessionStorage.removeItem('ciudadar-super-casos-foco');
+                sessionStorage.setItem('ciudadar-vista-admin', 'dashboard');
+              } catch { /* ignore */ }
+              signOut(auth).catch(() => {});
+            }}
           >
             <IconoSalir /> Cerrar sesión
           </button>
@@ -883,6 +964,85 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                           className="admin-dash-btn"
                           disabled={accionando}
                           onClick={() => quitarAdmin(a)}
+                        >
+                          Quitar
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {seccion === 'cuadrillas' && (
+            <div className="super-seccion">
+              <header className="super-seccion-cabecera">
+                <div>
+                  <h1>Cuadrillas</h1>
+                  <p>Operarios de cada municipio: toman casos, piden datos y proponen cierre.</p>
+                </div>
+              </header>
+
+              <form className="super-form-asignar" onSubmit={asignarOperario}>
+                <input
+                  type="email"
+                  placeholder="email del operario…"
+                  value={nuevoOperarioEmail}
+                  onChange={(e) => setNuevoOperarioEmail(e.target.value)}
+                  required
+                  aria-label="Email del operario"
+                />
+                <select
+                  value={nuevoOperarioTenantId}
+                  onChange={(e) => setNuevoOperarioTenantId(e.target.value)}
+                  required
+                  aria-label="Municipio"
+                >
+                  <option value="">Elegí municipio…</option>
+                  {tenantsParaSelect.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name} ({t.typeLabel})
+                    </option>
+                  ))}
+                </select>
+                <button type="submit" className="admin-dash-btn admin-dash-btn-primario" disabled={accionando}>
+                  Sumar operario
+                </button>
+              </form>
+
+              <div className="admin-dash-filtros super-filtros">
+                <input
+                  type="search"
+                  placeholder="Buscar por email o municipio…"
+                  value={filtroOperarioQ}
+                  onChange={(e) => setFiltroOperarioQ(e.target.value)}
+                  aria-label="Buscar operario"
+                />
+              </div>
+
+              {cargando ? (
+                <p className="admin-dash-vacio">Cargando…</p>
+              ) : operariosVisibles.length === 0 ? (
+                <p className="admin-dash-vacio">
+                  {filtroOperarioQ.trim()
+                    ? 'Ningún operario coincide con la búsqueda.'
+                    : 'Todavía no hay operarios en ningún municipio.'}
+                </p>
+              ) : (
+                <ul className="super-lista">
+                  {operariosVisibles.map((o) => (
+                    <li key={`${o.email}-${o.tenantId}`} className="super-tarjeta">
+                      <div className="super-tarjeta-info">
+                        <strong>{o.email}</strong>
+                        <span className="super-meta">{o.tenantName}</span>
+                      </div>
+                      <div className="super-tarjeta-acciones">
+                        <button
+                          type="button"
+                          className="admin-dash-btn"
+                          disabled={accionando}
+                          onClick={() => quitarOperario(o)}
                         >
                           Quitar
                         </button>

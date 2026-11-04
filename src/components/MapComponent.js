@@ -164,7 +164,18 @@ const CapaPinesMapa = React.memo(function CapaPinesMapa({
   onMarkerClick,
 }) {
   if (mapaListoTick <= 0) return null;
-  return markers.map((marker, index) => {
+  // Norte abajo en el DOM → sur arriba: al amontonar con zoom, no “salta” la huella sobre otros
+  const ordenados = markers
+    .map((marker, index) => ({ marker, index }))
+    .sort((a, b) => {
+      const latA = Number(a.marker.lat);
+      const latB = Number(b.marker.lat);
+      if (Number.isFinite(latA) && Number.isFinite(latB) && latA !== latB) {
+        return latB - latA;
+      }
+      return a.index - b.index;
+    });
+  return ordenados.map(({ marker, index }) => {
     const posicion = { lat: Number(marker.lat), lng: Number(marker.lng) };
     const clave = marker._id || `nuevo-${index}`;
     const esMio = !isAdmin && userId !== 'anonimo' && (marker.createdBy
@@ -178,19 +189,25 @@ const CapaPinesMapa = React.memo(function CapaPinesMapa({
     const anclaX = ANCHO_PIN / 2;
     const anclaY = PUNTA_PIN_Y;
     const esAnimal = normalizarCategoriaPin(marker.category) === 'perros_gatos';
+    // z-index geográfico: más al sur = más arriba (evita huella tapando pines vecinos)
+    const zGeo = Number.isFinite(posicion.lat)
+      ? Math.round((60 - posicion.lat) * 100)
+      : index;
     return (
       <OverlayView
-        key={`${clave}-${mapaListoTick}`}
+        key={clave}
         position={posicion}
         mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+        getPixelPositionOffset={() => ({ x: -anclaX, y: -anclaY })}
+        zIndex={destacar ? 100000 + zGeo : zGeo}
       >
         <button
           type="button"
-          className={`pin-elegido${esMio ? ' pin-mio' : ''}${destacar ? ' pin-elegido-brillo' : ''}${esMio && !destacar ? ' pin-mio-solo' : ''}`}
+          className={`pin-elegido${esAnimal ? ' pin-animal' : ''}${esMio ? ' pin-mio' : ''}${destacar ? ' pin-elegido-brillo' : ''}${esMio && !destacar ? ' pin-mio-solo' : ''}`}
           style={{
             width: ANCHO_PIN,
             height: ALTO_PIN,
-            transform: `translate(${-anclaX}px, ${-anclaY}px)`,
+            zIndex: destacar ? 100000 + zGeo : zGeo,
           }}
           onMouseDown={(event) => event.stopPropagation()}
           onClick={(event) => {
@@ -753,8 +770,8 @@ const buscarReparacionesCercanas = (lista, lat, lng) => lista
 
 const TIPOS_NOTIF_PANEL_ADMIN = new Set(['por_aprobar', 'nuevo_reporte', 'nueva_perdida']);
 const RADAR_VISTA_KEY = 'ciudadar-radar-vista';
+const MIS_REPORTES_VISTA_KEY = 'ciudadar-mis-reportes-vista';
 const ANIMAL_FILTROS_RADAR = new Set(['todos', 'perdido', 'abandonado', 'adopcion']);
-
 const leerRadarVistaGuardada = () => {
   try {
     const raw = sessionStorage.getItem(RADAR_VISTA_KEY);
@@ -774,6 +791,22 @@ const leerRadarVistaGuardada = () => {
         ? Math.min(8000, Math.max(500, radio))
         : 2500,
       busqueda: typeof data.busqueda === 'string' ? data.busqueda.slice(0, 120) : '',
+    };
+  } catch {
+    return null;
+  }
+};
+
+/** Solo recuerda si estaba abierto y la pestaña; los filtros vuelven siempre a los defaults. */
+const leerMisReportesVistaGuardada = () => {
+  try {
+    const raw = sessionStorage.getItem(MIS_REPORTES_VISTA_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return null;
+    return {
+      abierto: !!data.abierto,
+      seccion: data.seccion === 'registro' ? 'registro' : 'activos',
     };
   } catch {
     return null;
@@ -939,12 +972,28 @@ function MapComponent({
   const inputCamaraRespuestaRef = useRef(null);
   const [soloMisReportes, setSoloMisReportes] = useState(false);
   const [soloMiJurisdiccion, setSoloMiJurisdiccion] = useState(false);
-  const [mostrarMisReportes, setMostrarMisReportes] = useState(false);
+  const [misReportesVistaInicial] = useState(() => (modoSoloCaso ? null : leerMisReportesVistaGuardada()));
   const [radarVistaInicial] = useState(() => (modoSoloCaso ? null : leerRadarVistaGuardada()));
-  const [mostrarCosasPerdidas, setMostrarCosasPerdidas] = useState(() => !!radarVistaInicial?.abierto);
-  const [misReportesSeccion, setMisReportesSeccion] = useState('activos'); // activos | registro
+  const [mostrarMisReportes, setMostrarMisReportes] = useState(() => !!misReportesVistaInicial?.abierto);
+  // Si Mis reportes estaba abierto al refrescar, no restaurar Radar encima
+  const [mostrarCosasPerdidas, setMostrarCosasPerdidas] = useState(
+    () => !!radarVistaInicial?.abierto && !misReportesVistaInicial?.abierto
+  );
+  const [misReportesSeccion, setMisReportesSeccion] = useState(
+    () => misReportesVistaInicial?.seccion || 'activos'
+  ); // activos | registro
   const [misReportesActivos, setMisReportesActivos] = useState([]);
   const [misReportesRegistro, setMisReportesRegistro] = useState([]);
+  // Filtros: siempre defaults al montar (no se heredan de sesión anterior)
+  const [misBusqueda, setMisBusqueda] = useState('');
+  const [misBusquedaDebounced, setMisBusquedaDebounced] = useState('');
+  const [misFiltroEstado, setMisFiltroEstado] = useState('');
+  const [misFiltroCategoria, setMisFiltroCategoria] = useState('');
+  const [misFiltroRegistroCategoria, setMisFiltroRegistroCategoria] = useState('reparaciones');
+  const [misFiltroRegistroTipo, setMisFiltroRegistroTipo] = useState('');
+  const [misFiltroRegistroPeriodo, setMisFiltroRegistroPeriodo] = useState('7');
+  const [misFiltroRegistroDesde, setMisFiltroRegistroDesde] = useState('');
+  const [misFiltroRegistroHasta, setMisFiltroRegistroHasta] = useState('');
   const [radarModo, setRadarModo] = useState(() => radarVistaInicial?.modo || 'cosas'); // cosas | animales
   const [perdidasSeccion, setPerdidasSeccion] = useState(() => radarVistaInicial?.seccion || 'cerca'); // cerca | activos
   const [animalFiltroRadar, setAnimalFiltroRadar] = useState(() => radarVistaInicial?.animalFiltro || 'todos');
@@ -956,15 +1005,21 @@ function MapComponent({
   const [perdidasNoLeidasLocal, setPerdidasNoLeidasLocal] = useState(0);
   const [cercaOrigen, setCercaOrigen] = useState(() => radarVistaInicial?.cercaOrigen || 'gps'); // gps | mapa | vigilada
   const [cercaRadioMetros, setCercaRadioMetros] = useState(() => radarVistaInicial?.cercaRadio || 2500);
-  const radarRestauradoRef = useRef(!!radarVistaInicial?.abierto);
+  const cercaRadioMetrosRef = useRef(cercaRadioMetros);
+  const radarModoRef = useRef(radarModo);
+  const animalFiltroRadarRef = useRef(animalFiltroRadar);
+  const radarRestauradoRef = useRef(!!radarVistaInicial?.abierto && !misReportesVistaInicial?.abierto);
+  const misReportesRestauradoRef = useRef(!!misReportesVistaInicial?.abierto);
   const [zonaAlerta, setZonaAlerta] = useState(null); // { lat, lng, radio }
   const [guardandoZonaAlerta, setGuardandoZonaAlerta] = useState(false);
   const perdidasCercaActivoRef = useRef(false);
-  const cercaOrigenRef = useRef('gps');
+  const cercaOrigenRef = useRef(cercaOrigen);
   const ignorarDragCercaRef = useRef(false);
   const cercaReloadTimerRef = useRef(null);
   const perdidasFetchSeqRef = useRef(0);
   const cercaGpsListoRef = useRef(false);
+  const ultimoCercaGpsFetchRef = useRef(null); // { lat, lng } último punto con el que pedimos cerca
+  const cercaGpsFetchTimerRef = useRef(null);
   const radioCercaCircleRef = useRef(null); // radio de búsqueda (azul / naranja)
   const radioVigiladaCircleRef = useRef(null); // radio verde persistente de zona vigilada
   const [mapaListoTick, setMapaListoTick] = useState(0);
@@ -976,6 +1031,7 @@ function MapComponent({
   const [cargandoMisLista, setCargandoMisLista] = useState(false);
   const [renovandoId, setRenovandoId] = useState(null);
   const MIS_PAGE_SIZE = 8;
+  const MIS_REPORTES_PAGE_SIZE = 20;
   const [mostrarFiltros, setMostrarFiltros] = useState(false);
   const [mostrarNotificaciones, setMostrarNotificaciones] = useState(false);
   const [notificaciones, setNotificaciones] = useState([]);
@@ -1012,6 +1068,11 @@ function MapComponent({
       || msg.includes('ya no aparece')
       || msg.includes('no está disponible');
   };
+  const casoEstaCerrado = (m) => (
+    Boolean(m?.eliminadoAt)
+    || m?.status === 'resuelto'
+    || m?.status === 'rechazado'
+  );
   const [avisando, setAvisando] = useState(null);
   const ignorarCercanosRef = useRef(false);
   const [estadosPendientes, setEstadosPendientes] = useState({});
@@ -1581,34 +1642,84 @@ const stopTouchPropagation = (event) => {
       : 'anonimo',
   }), [normalizeCategoryValue]);
 
-  const cargarMisLista = useCallback(async (seccion = misReportesSeccion, page = 1) => {
+  const resetMisFiltros = useCallback(() => {
+    setMisBusqueda('');
+    setMisBusquedaDebounced('');
+    setMisFiltroEstado('');
+    setMisFiltroCategoria('');
+    setMisFiltroRegistroCategoria('reparaciones');
+    setMisFiltroRegistroTipo('');
+    setMisFiltroRegistroPeriodo('7');
+    setMisFiltroRegistroDesde('');
+    setMisFiltroRegistroHasta('');
+  }, []);
+
+  const cargarMisLista = useCallback(async (seccion = misReportesSeccion, page = 1, overrides = null) => {
     if (!userId || userId === 'anonimo') {
       setMisReportesActivos([]);
       setMisReportesRegistro([]);
-      setMisMeta({ total: 0, hasMore: false, limit: MIS_PAGE_SIZE });
+      setMisMeta({ total: 0, hasMore: false, limit: MIS_REPORTES_PAGE_SIZE });
       return;
     }
+    const q = overrides && 'q' in overrides ? overrides.q : misBusquedaDebounced;
+    const status = overrides && 'status' in overrides ? overrides.status : misFiltroEstado;
+    const categoryActivos = overrides && 'category' in overrides ? overrides.category : misFiltroCategoria;
+    const categoryRegistro = overrides && 'registroCategory' in overrides
+      ? overrides.registroCategory
+      : misFiltroRegistroCategoria;
+    const category = seccion === 'registro' ? categoryRegistro : categoryActivos;
+    const tipoCierre = overrides && 'tipoCierre' in overrides ? overrides.tipoCierre : misFiltroRegistroTipo;
+    const periodo = overrides && 'periodo' in overrides ? overrides.periodo : misFiltroRegistroPeriodo;
+    const desde = overrides && 'desde' in overrides ? overrides.desde : misFiltroRegistroDesde;
+    const hasta = overrides && 'hasta' in overrides ? overrides.hasta : misFiltroRegistroHasta;
+
     setCargandoMisLista(true);
     try {
+      // Todos los avisos propios (reparaciones, animales, familias, cosas perdidas)
       const params = {
         mine: '1',
-        limit: MIS_PAGE_SIZE,
+        limit: MIS_REPORTES_PAGE_SIZE,
         page,
-        excludeCategory: 'cosas_perdidas',
       };
-      if (seccion === 'registro') params.eliminados = '1';
+      const qLimpio = String(q || '').trim().replace(/^#/, '');
+      const esCaseId = /^\d+$/.test(qLimpio);
+      if (qLimpio) params.q = qLimpio;
+
+      // #caso exacto: no aplicar período / estado / categoría (igual que admin)
+      if (esCaseId) {
+        params.soloCaseId = 1;
+        if (seccion === 'registro') params.eliminados = '1';
+      } else {
+        if (category) params.category = category;
+        if (seccion === 'registro') {
+          params.eliminados = '1';
+          if (tipoCierre) params.tipoCierre = tipoCierre;
+          if (periodo === 'personalizado') {
+            if (desde) params.fechaDesde = desde;
+            if (hasta) params.fechaHasta = hasta;
+          } else if (periodo) {
+            params.periodoDias = periodo;
+          }
+        } else if (status) {
+          params.status = status;
+        }
+      }
+
       const { data } = await axios.get('http://localhost:5001/api/markers', {
         headers: { 'x-user-id': userId },
         params,
       });
       const lista = (Array.isArray(data) ? data : (data.items || [])).map(normalizarMisItem);
       const total = Array.isArray(data) ? lista.length : (data.total || lista.length);
-      const limit = Array.isArray(data) ? MIS_PAGE_SIZE : (data.limit || MIS_PAGE_SIZE);
+      const limit = Array.isArray(data) ? MIS_REPORTES_PAGE_SIZE : (data.limit || MIS_REPORTES_PAGE_SIZE);
       const hasMore = Array.isArray(data)
         ? false
         : Boolean(data.hasMore ?? (page * limit < total));
       if (seccion === 'registro') {
         setMisReportesRegistro(lista);
+      } else if (esCaseId) {
+        // Búsqueda por #caso: mostrar el match aunque esté cerrado (soloCaseId ignora archivo)
+        setMisReportesActivos(lista);
       } else {
         // Refuerzo: no mezclar bajas si el servidor devolvió alguna
         setMisReportesActivos(lista.filter((m) => (
@@ -1621,11 +1732,23 @@ const stopTouchPropagation = (event) => {
       console.error('Error cargando mis reportes:', error);
       if (seccion === 'registro') setMisReportesRegistro([]);
       else setMisReportesActivos([]);
-      setMisMeta({ total: 0, hasMore: false, limit: MIS_PAGE_SIZE });
+      setMisMeta({ total: 0, hasMore: false, limit: MIS_REPORTES_PAGE_SIZE });
     } finally {
       setCargandoMisLista(false);
     }
-  }, [userId, misReportesSeccion, normalizarMisItem]);
+  }, [
+    userId,
+    misReportesSeccion,
+    misBusquedaDebounced,
+    misFiltroEstado,
+    misFiltroCategoria,
+    misFiltroRegistroCategoria,
+    misFiltroRegistroTipo,
+    misFiltroRegistroPeriodo,
+    misFiltroRegistroDesde,
+    misFiltroRegistroHasta,
+    normalizarMisItem,
+  ]);
 
   const puntoCercaActivo = useCallback((origen = cercaOrigen) => {
     if (origen === 'vigilada' && zonaAlerta
@@ -1668,15 +1791,20 @@ const stopTouchPropagation = (event) => {
     modoOverride = null,
     animalOverride = null,
     limitOverride = null,
+    puntoOverride = null,
   ) => {
     if (!userId || userId === 'anonimo') {
       setPerdidasLista([]);
+      setPinesCercaMapa([]);
       return;
     }
     // Registro histórico vive en Mis reportes, no en el Radar
     const seccionRadar = seccion === 'registro' ? 'activos' : seccion;
-    const modo = modoOverride || radarModo;
-    const animalFiltro = animalOverride || animalFiltroRadar;
+    // Refs: evita closure viejo al mover el radio con filtro de animales activo
+    const modo = modoOverride || radarModoRef.current || radarModo;
+    const animalFiltro = animalOverride != null
+      ? animalOverride
+      : (animalFiltroRadarRef.current || animalFiltroRadar);
     const pageLimit = Math.min(
       100,
       Math.max(1, Number(limitOverride) || (radarVistaAmpliada ? 50 : MIS_PAGE_SIZE))
@@ -1691,21 +1819,23 @@ const stopTouchPropagation = (event) => {
     setCargandoMisLista(true);
     try {
       if (seccionRadar === 'cerca') {
-        const punto = puntoCercaActivo(origenOverride || cercaOrigen);
+        const origen = origenOverride || cercaOrigenRef.current || cercaOrigen;
+        const punto = puntoOverride || puntoCercaActivo(origen);
         if (!punto) {
           if (seq !== perdidasFetchSeqRef.current) return;
           setPerdidasLista([]);
+          setPinesCercaMapa([]);
           setMisMeta({ total: 0, hasMore: false, limit: pageLimit });
           return;
         }
-        const radio = Number(cercaRadioMetros) || 2500;
+        const radio = Number(cercaRadioMetrosRef.current) || 2500;
         const params = {
           cerca: '1',
           lat: punto.lat,
           lng: punto.lng,
           radius: radio,
-          limit: pageLimit,
-          page,
+          limit: 100,
+          page: 1,
           category: modo === 'animales' ? 'perros_gatos' : 'cosas_perdidas',
         };
         if (modo === 'animales' && animalFiltro && animalFiltro !== 'todos') {
@@ -1717,13 +1847,18 @@ const stopTouchPropagation = (event) => {
         });
         if (seq !== perdidasFetchSeqRef.current) return;
         const yo = String(userId || '').trim().toLowerCase();
-        // El servidor ya filtra por radio; no re-filtrar acá (provoca parpadeo al mover el slider/centro)
+        const catOk = modo === 'animales' ? 'perros_gatos' : 'cosas_perdidas';
         const lista = (data.items || [])
           .map((m) => ({
             ...normalizarMisItem(m),
             distanciaMetros: m.distanciaMetros,
           }))
           .filter((m) => {
+            if (m.category !== catOk) return false;
+            if (modo === 'animales' && animalFiltro && animalFiltro !== 'todos'
+              && m.animalTipo !== animalFiltro) {
+              return false;
+            }
             if (yo && yo !== 'anonimo'
               && String(m.createdBy || '').trim().toLowerCase() === yo) {
               return false;
@@ -1731,18 +1866,16 @@ const stopTouchPropagation = (event) => {
             return true;
           });
         setPerdidasLista(lista);
-        // Mapa: fusionar resultados para que al mover el radio no “parpadeen” ni se borren al instante
-        setPinesCercaMapa((prev) => {
-          const byId = new Map(prev.map((m) => [String(m._id), m]));
-          lista.forEach((m) => byId.set(String(m._id), m));
-          return Array.from(byId.values());
-        });
-        setMisPage(page);
+        setPinesCercaMapa(lista);
+        setMisPage(1);
         setMisMeta({
-          total: lista.length,
-          hasMore: !!data.hasMore,
-          limit: data.limit || pageLimit,
+          total: data.total != null ? data.total : lista.length,
+          hasMore: false,
+          limit: pageLimit,
         });
+        if (origen === 'gps') {
+          ultimoCercaGpsFetchRef.current = { lat: Number(punto.lat), lng: Number(punto.lng) };
+        }
         return;
       }
 
@@ -1777,16 +1910,15 @@ const stopTouchPropagation = (event) => {
       if (seq !== perdidasFetchSeqRef.current) return;
       console.error('Error cargando radar:', error);
       setPerdidasLista([]);
+      setPinesCercaMapa([]);
     } finally {
       if (seq === perdidasFetchSeqRef.current) setCargandoMisLista(false);
     }
   }, [
     userId,
     perdidasSeccion,
-    radarModo,
-    animalFiltroRadar,
-    cercaOrigen,
-    cercaRadioMetros,
+    // modo / animal / origen / radio: refs (si van en deps, cada filtro/slider
+    // recrea la fn y el effect de sección dispara un fetch extra)
     puntoCercaActivo,
     normalizarMisItem,
     radarVistaAmpliada,
@@ -1836,10 +1968,16 @@ const stopTouchPropagation = (event) => {
       if (mapRef.current) {
         mapRef.current.panTo({ lat: Number(zona.lat), lng: Number(zona.lng) });
       }
-      // Esperar el setState de zonaAlerta para que el radio verde use el punto correcto
-      window.setTimeout(() => {
-        cargarPerdidasLista('cerca', 1, 'vigilada');
-      }, 0);
+      // Punto explícito: no depender del setState de zonaAlerta (closure stale)
+      cargarPerdidasLista(
+        'cerca',
+        1,
+        'vigilada',
+        null,
+        null,
+        null,
+        { lat: Number(zona.lat), lng: Number(zona.lng) },
+      );
       mostrarAviso('Vas a recibir avisos de esta zona del mapa (aunque no estés ahí).');
       return data;
     } catch (error) {
@@ -1852,6 +1990,8 @@ const stopTouchPropagation = (event) => {
 
   const programarReloadCercaDesdeMapa = useCallback(() => {
     if (!perdidasCercaActivoRef.current || !mapRef.current?.getCenter) return;
+    // En vigilada el centro es la zona guardada: un pan no debe echarte a “otra zona”
+    if (cercaOrigenRef.current === 'vigilada') return;
     const c = mapRef.current.getCenter();
     if (!c) return;
     const punto = { lat: c.lat(), lng: c.lng() };
@@ -1860,7 +2000,6 @@ const stopTouchPropagation = (event) => {
     setCercaOrigen('mapa');
     if (cercaReloadTimerRef.current) clearTimeout(cercaReloadTimerRef.current);
     cercaReloadTimerRef.current = setTimeout(() => {
-      // 'mapa' + getCenter/mapCenterRef vivos (no depende del closure de mapCenter)
       cargarPerdidasLista('cerca', 1, 'mapa');
     }, 400);
   }, [cargarPerdidasLista]);
@@ -1930,7 +2069,10 @@ const stopTouchPropagation = (event) => {
           lng: data.zonaAlertaLng,
           radio: data.zonaAlertaRadio || 2500,
         });
-        if (data.zonaAlertaRadio) setCercaRadioMetros(Number(data.zonaAlertaRadio) || 2500);
+        // No pisar el radio restaurado de sesión salvo que estemos en vigilada
+        if (data.zonaAlertaRadio && cercaOrigenRef.current === 'vigilada') {
+          setCercaRadioMetros(Number(data.zonaAlertaRadio) || 2500);
+        }
       } else {
         setZonaAlerta(null);
       }
@@ -1953,7 +2095,21 @@ const stopTouchPropagation = (event) => {
   }, [mostrarCosasPerdidas, perdidasSeccion]);
 
   useEffect(() => {
-    setPinesCercaMapa([]);
+    radarModoRef.current = radarModo;
+    animalFiltroRadarRef.current = animalFiltroRadar;
+    const cat = radarModo === 'animales' ? 'perros_gatos' : 'cosas_perdidas';
+    const filtra = (m) => {
+      if (m.category !== cat) return false;
+      if (radarModo === 'animales' && animalFiltroRadar && animalFiltroRadar !== 'todos'
+        && m.animalTipo !== animalFiltroRadar) {
+        return false;
+      }
+      return true;
+    };
+    // Filtrar al toque (sin vaciar): si vaciábamos, al mover el radio un fetch viejo
+    // podía ganar la carrera y dejar la lista definitivamente vacía
+    setPerdidasLista((prev) => prev.filter(filtra));
+    setPinesCercaMapa((prev) => prev.filter(filtra));
   }, [radarModo, animalFiltroRadar]);
 
   useEffect(() => {
@@ -1963,6 +2119,11 @@ const stopTouchPropagation = (event) => {
   useEffect(() => {
     cercaOrigenRef.current = cercaOrigen;
   }, [cercaOrigen]);
+
+  // Refs siempre al día (aunque el debounce aún no corrió)
+  radarModoRef.current = radarModo;
+  animalFiltroRadarRef.current = animalFiltroRadar;
+  cercaRadioMetrosRef.current = Number(cercaRadioMetros) || 2500;
 
   // Persistir Radar al refrescar (misma pestaña)
   useEffect(() => {
@@ -1991,6 +2152,19 @@ const stopTouchPropagation = (event) => {
     radarBusqueda,
   ]);
 
+  // Persistir solo abierto/pestaña al refrescar; los filtros no se guardan
+  useEffect(() => {
+    if (modoSoloCaso) return;
+    try {
+      sessionStorage.setItem(MIS_REPORTES_VISTA_KEY, JSON.stringify({
+        abierto: mostrarMisReportes,
+        seccion: misReportesSeccion === 'registro' ? 'registro' : 'activos',
+      }));
+    } catch {
+      /* ignore quota / private mode */
+    }
+  }, [modoSoloCaso, mostrarMisReportes, misReportesSeccion]);
+
   // Tras F5: si el Radar estaba abierto, recargar la lista
   useEffect(() => {
     if (!radarRestauradoRef.current) return;
@@ -2003,6 +2177,18 @@ const stopTouchPropagation = (event) => {
     cargarPerdidasLista(perdidasSeccion, 1);
   }, [userId, modoSoloCaso, mostrarCosasPerdidas, perdidasSeccion, cargarPerdidasLista]);
 
+  // Tras F5: si Mis reportes estaba abierto, recargar la lista
+  useEffect(() => {
+    if (!misReportesRestauradoRef.current) return;
+    if (modoSoloCaso || !mostrarMisReportes) {
+      misReportesRestauradoRef.current = false;
+      return;
+    }
+    if (!userId || userId === 'anonimo') return;
+    misReportesRestauradoRef.current = false;
+    cargarMisLista(misReportesSeccion, 1);
+  }, [userId, modoSoloCaso, mostrarMisReportes, misReportesSeccion, cargarMisLista]);
+
   // Vista dividida: resize al entrar al Radar (no en cada tick del slider → distorsiona)
   useEffect(() => {
     if (!mostrarCosasPerdidas || !mapRef.current || !window.google?.maps?.event) return;
@@ -2014,7 +2200,9 @@ const stopTouchPropagation = (event) => {
       const c = mapRef.current.getCenter?.();
       if (c) mapRef.current.setCenter(c);
       if (perdidasSeccion === 'cerca') {
+        ignorarZoomProgramaticoRef.current = true;
         mapRef.current.setZoom(zoomRadar);
+        window.setTimeout(() => { ignorarZoomProgramaticoRef.current = false; }, 300);
       }
     }, 80);
     return () => window.clearTimeout(t);
@@ -2142,39 +2330,106 @@ const stopTouchPropagation = (event) => {
     }
   }, []);
 
-  // En Radar "Cerca de mí": el mapa sigue al GPS; la 1ª vez con GPS recarga la lista (evita F5 con centro viejo)
+  // En Radar "Cerca de mí": follow + refetch al caminar (aunque el zoom haya pausado el pan)
   useEffect(() => {
     if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca' || cercaOrigen !== 'gps') {
-      if (cercaOrigen !== 'gps') cercaGpsListoRef.current = false;
-      return;
+      if (cercaOrigen !== 'gps') {
+        cercaGpsListoRef.current = false;
+        gpsFollowPausadoRef.current = false;
+        ultimoCercaGpsFetchRef.current = null;
+        if (cercaGpsFetchTimerRef.current) {
+          clearTimeout(cercaGpsFetchTimerRef.current);
+          cercaGpsFetchTimerRef.current = null;
+        }
+      }
+      return undefined;
     }
-    if (!userLocation || !mapRef.current) return;
-    if (ignorarDragCercaRef.current) return;
+    if (!userLocation || !mapRef.current) return undefined;
+    if (ignorarDragCercaRef.current) return undefined;
+
     const c = mapRef.current.getCenter?.();
-    const lejos = c
+    const lejosDelCentro = c
       ? distanciaMetros(c.lat(), c.lng(), userLocation.lat, userLocation.lng) >= 35
       : true;
+
     if (!cercaGpsListoRef.current) {
       cercaGpsListoRef.current = true;
+      gpsFollowPausadoRef.current = false;
       mapRef.current.panTo(userLocation);
       setMapCenter(userLocation);
+      ultimoCercaGpsFetchRef.current = { lat: userLocation.lat, lng: userLocation.lng };
       cargarPerdidasLista('cerca', 1, 'gps');
-      return;
+      return undefined;
     }
-    if (lejos) {
+
+    // Pan solo si el follow no está pausado por zoom manual
+    if (!gpsFollowPausadoRef.current && lejosDelCentro) {
       mapRef.current.panTo(userLocation);
       setMapCenter(userLocation);
     }
+
+    // Refetch si el GPS se movió >= 80 m desde el último pedido (aunque el pan esté pausado)
+    const ultimo = ultimoCercaGpsFetchRef.current;
+    const movio = !ultimo || !Number.isFinite(ultimo.lat)
+      || distanciaMetros(ultimo.lat, ultimo.lng, userLocation.lat, userLocation.lng) >= 80;
+    if (movio) {
+      if (cercaGpsFetchTimerRef.current) clearTimeout(cercaGpsFetchTimerRef.current);
+      cercaGpsFetchTimerRef.current = setTimeout(() => {
+        ultimoCercaGpsFetchRef.current = { lat: userLocation.lat, lng: userLocation.lng };
+        cargarPerdidasLista('cerca', 1, 'gps');
+      }, 600);
+    }
+    return () => {
+      if (cercaGpsFetchTimerRef.current) {
+        clearTimeout(cercaGpsFetchTimerRef.current);
+        cercaGpsFetchTimerRef.current = null;
+      }
+    };
   }, [userLocation, cercaOrigen, mostrarCosasPerdidas, perdidasSeccion, cargarPerdidasLista]);
 
-  // Debounce del radio/modo: si pedimos en cada tick del slider, los pines parpadean
+  // Mantener radio/origen vivos en ref (fetch usa esto sin recrear cargarPerdidasLista)
   useEffect(() => {
-    if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca') return undefined;
+    cercaRadioMetrosRef.current = Number(cercaRadioMetros) || 2500;
+  }, [cercaRadioMetros]);
+
+  // Debounce radio/modo/filtro animal. Los botones solo hacen setState (evita doble fetch).
+  useEffect(() => {
+    if (!mostrarCosasPerdidas) return undefined;
+    cercaRadioMetrosRef.current = Number(cercaRadioMetros) || 2500;
+    radarModoRef.current = radarModo;
+    animalFiltroRadarRef.current = animalFiltroRadar;
     const t = window.setTimeout(() => {
-      cargarPerdidasLista('cerca', 1);
+      cargarPerdidasLista(perdidasSeccion === 'activos' ? 'activos' : 'cerca', 1);
     }, 400);
     return () => window.clearTimeout(t);
-  }, [cercaRadioMetros, radarModo, animalFiltroRadar]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- no al panear ni al cambiar de pestaña
+  }, [cercaRadioMetros, radarModo, animalFiltroRadar]);
+
+  // Zoom del círculo: únicamente cuando el usuario mueve el slider (no al arrastrar el mapa)
+  const radioZoomListoRef = useRef(false);
+  useEffect(() => {
+    if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca') {
+      radioZoomListoRef.current = false;
+      return undefined;
+    }
+    // La 1ª vez al abrir Cerca ya hace zoom el effect de resize/sección
+    if (!radioZoomListoRef.current) {
+      radioZoomListoRef.current = true;
+      return undefined;
+    }
+    const t = window.setTimeout(() => {
+      if (!mapRef.current) return;
+      const r = Number(cercaRadioMetros) || 2500;
+      const zoomRadar = r >= 4000 ? 11 : (r >= 2000 ? 12 : 13);
+      const c = mapRef.current.getCenter?.();
+      ignorarZoomProgramaticoRef.current = true;
+      mapRef.current.setZoom(zoomRadar);
+      // Reafirmar el centro vivo: setZoom solo no debe desplazar el pin
+      if (c) mapRef.current.setCenter(c);
+      window.setTimeout(() => { ignorarZoomProgramaticoRef.current = false; }, 300);
+    }, 400);
+    return () => window.clearTimeout(t);
+  }, [cercaRadioMetros, mostrarCosasPerdidas, perdidasSeccion]);
 
   // Al abrir Radar en Cerca: bajar badge de avisos nuevos cerca (no mezcla con chat de Míos)
   useEffect(() => {
@@ -2184,14 +2439,35 @@ const stopTouchPropagation = (event) => {
 
   useEffect(() => {
     if (!panelVecino) return;
+    if (panelVecino === 'reportar') {
+      setMostrarNotificaciones(false);
+      setMostrarFiltros(false);
+      setMostrarCosasPerdidas(false);
+      setMostrarMisReportes(false);
+      setMostrarCercanos(false);
+      setShowPopup(false);
+      setEditMode(null);
+      setIdRegistroDestacado(null);
+    }
     if (panelVecino === 'mis-reportes') {
       setMostrarNotificaciones(false);
       setMostrarFiltros(false);
       setMostrarCosasPerdidas(false);
+      setShowPopup(false);
       setMostrarMisReportes(true);
       setMisReportesSeccion('activos');
       setMisPage(1);
-      cargarMisLista('activos', 1);
+      resetMisFiltros();
+      cargarMisLista('activos', 1, {
+        q: '',
+        status: '',
+        category: '',
+        registroCategory: 'reparaciones',
+        tipoCierre: '',
+        periodo: '7',
+        desde: '',
+        hasta: '',
+      });
     }
     if (panelVecino === 'cosas-perdidas') {
       setMostrarNotificaciones(false);
@@ -2217,7 +2493,40 @@ const stopTouchPropagation = (event) => {
       cargarNotificaciones();
     }
     if (onPanelVecinoVisto) onPanelVecinoVisto();
-  }, [panelVecino, onPanelVecinoVisto, cargarNotificaciones, cargarMisLista, cargarPerdidasLista]);
+  }, [panelVecino, onPanelVecinoVisto, cargarNotificaciones, cargarMisLista, cargarPerdidasLista, resetMisFiltros]);
+
+  useEffect(() => {
+    const t = setTimeout(() => setMisBusquedaDebounced(misBusqueda.trim()), 350);
+    return () => clearTimeout(t);
+  }, [misBusqueda]);
+
+  // Recargar Mis reportes al cambiar filtros (no al abrir: eso lo hace panelVecino)
+  const misFiltrosListosRef = useRef(false);
+  useEffect(() => {
+    if (!mostrarMisReportes) {
+      misFiltrosListosRef.current = false;
+      return undefined;
+    }
+    if (!misFiltrosListosRef.current) {
+      misFiltrosListosRef.current = true;
+      return undefined;
+    }
+    setMisPage(1);
+    cargarMisLista(misReportesSeccion, 1);
+    return undefined;
+  }, [
+    mostrarMisReportes,
+    misReportesSeccion,
+    misBusquedaDebounced,
+    misFiltroEstado,
+    misFiltroCategoria,
+    misFiltroRegistroCategoria,
+    misFiltroRegistroTipo,
+    misFiltroRegistroPeriodo,
+    misFiltroRegistroDesde,
+    misFiltroRegistroHasta,
+    cargarMisLista,
+  ]);
 
   useEffect(() => {
     cargarNotificaciones();
@@ -2554,7 +2863,13 @@ const stopTouchPropagation = (event) => {
   const dragListenerRef = useRef(null);
   const centerChangedListenerRef = useRef(null);
   const dragEndListenerRef = useRef(null);
+  const zoomChangedListenerRef = useRef(null);
+  const ignorarZoomProgramaticoRef = useRef(false);
+  // Zoom con rueda no debe soltar GPS ni poner el pin naranja al centro (el puntero “salta”)
+  const gpsFollowPausadoRef = useRef(false);
   const geocodeSeqRef = useRef(0);
+  const pendingCercaOrigenMapaRef = useRef(false);
+  const pendingLimpiarPunteroRef = useRef(false);
 
   const actualizarDireccionDelPin = useCallback((forzar = false) => {
     if (!forzar && (showPopupRef.current || omitirIdleRef.current)) return;
@@ -2643,11 +2958,16 @@ const stopTouchPropagation = (event) => {
     if (dragEndListenerRef.current) {
       window.google.maps.event.removeListener(dragEndListenerRef.current);
     }
+    if (zoomChangedListenerRef.current) {
+      window.google.maps.event.removeListener(zoomChangedListenerRef.current);
+    }
     const setPinCentralMoviendo = (moviendo) => {
       (pinCentralRefs.current || []).forEach((el) => {
         if (!el) return;
         el.classList.toggle('moviendo', moviendo);
       });
+      // Clase en el lienzo: apaga transitions de pines OverlayView durante el pan (evita fantasma)
+      mapaLienzoRef.current?.classList.toggle('mapa-arrastrando', moviendo);
     };
     // center_changed sigue el pan con inercia (más fluido que solo “drag”)
     const sincronizarRadioConPuntero = () => {
@@ -2659,38 +2979,63 @@ const stopTouchPropagation = (event) => {
       const circulo = radioCercaCircleRef.current;
       if (circulo) circulo.setCenter(c);
     };
+    // GPS → otra zona (mismo criterio que al arrastrar)
+    const soltarSeguimientoGps = () => {
+      if (
+        !perdidasCercaActivoRef.current
+        || ignorarDragCercaRef.current
+        || cercaOrigenRef.current !== 'gps'
+      ) return;
+      const c = map.getCenter?.();
+      if (c) {
+        mapCenterRef.current = { lat: c.lat(), lng: c.lng() };
+        if (radioCercaCircleRef.current) {
+          radioCercaCircleRef.current.setCenter(c);
+          radioCercaCircleRef.current.setOptions({
+            strokeColor: '#ea580c',
+            fillColor: '#f97316',
+          });
+        }
+      }
+      cercaOrigenRef.current = 'mapa';
+      pendingCercaOrigenMapaRef.current = true;
+    };
     dragStartListenerRef.current = map.addListener('dragstart', () => {
       bloquearAutoDireccionRef.current = false;
       if (!showPopupRef.current) setPinCentralMoviendo(true);
+      // Solo DOM/refs acá: un setState a mitad del drag re-pinta OverlayViews y genera flash
       if (!omitirRestaurarPunteroRef.current && !showPopupRef.current) {
-        if (ocultarPunteroMapaRef.current) setOcultarPunteroMapa(false);
-        if (highlightedMarkerIdRef.current != null) setHighlightedMarkerId(null);
+        if (ocultarPunteroMapaRef.current || highlightedMarkerIdRef.current != null) {
+          pendingLimpiarPunteroRef.current = true;
+        }
       }
-      // Azul (GPS) → naranja (otra zona) al empezar a mover
+      soltarSeguimientoGps();
+    });
+    // Solo pausar el follow al zoom manual: NO pasar a “otra zona” (eso pone el pin
+    // naranja en el centro y parece que el puntero se corrió).
+    zoomChangedListenerRef.current = map.addListener('zoom_changed', () => {
+      if (ignorarZoomProgramaticoRef.current) return;
       if (
         perdidasCercaActivoRef.current
         && !ignorarDragCercaRef.current
         && cercaOrigenRef.current === 'gps'
       ) {
-        const c = map.getCenter?.();
-        if (c) {
-          mapCenterRef.current = { lat: c.lat(), lng: c.lng() };
-          if (radioCercaCircleRef.current) {
-            radioCercaCircleRef.current.setCenter(c);
-            radioCercaCircleRef.current.setOptions({
-              strokeColor: '#ea580c',
-              fillColor: '#f97316',
-            });
-          }
-        }
-        // Sin setMapCenter acá: evita tirones del effect a mitad del drag
-        setCercaOrigen('mapa');
+        gpsFollowPausadoRef.current = true;
       }
     });
     centerChangedListenerRef.current = map.addListener('center_changed', sincronizarRadioConPuntero);
     dragEndListenerRef.current = map.addListener('dragend', () => {
       setPinCentralMoviendo(false);
       sincronizarRadioConPuntero();
+      if (pendingCercaOrigenMapaRef.current) {
+        pendingCercaOrigenMapaRef.current = false;
+        setCercaOrigen('mapa');
+      }
+      if (pendingLimpiarPunteroRef.current) {
+        pendingLimpiarPunteroRef.current = false;
+        setOcultarPunteroMapa(false);
+        setHighlightedMarkerId(null);
+      }
       if (perdidasCercaActivoRef.current && !ignorarDragCercaRef.current) {
         programarReloadCercaDesdeMapa();
       }
@@ -2725,6 +3070,9 @@ const stopTouchPropagation = (event) => {
       }
       if (dragEndListenerRef.current) {
         window.google.maps.event.removeListener(dragEndListenerRef.current);
+      }
+      if (zoomChangedListenerRef.current) {
+        window.google.maps.event.removeListener(zoomChangedListenerRef.current);
       }
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
     };
@@ -3508,12 +3856,19 @@ const stopTouchPropagation = (event) => {
     }
   }, [renovandoId, userId, normalizeCategoryValue, editMode, irAMiReporte]);
 
+  const coincideAvisoCaso = useCallback((aviso, item) => {
+    if (!item) return false;
+    const mid = aviso?.markerId;
+    const midStr = mid && typeof mid === 'object'
+      ? String(mid._id || mid)
+      : (mid ? String(mid) : '');
+    if (midStr && String(item._id) === midStr) return true;
+    if (aviso?.caseId != null && Number(item.caseId) === Number(aviso.caseId)) return true;
+    return false;
+  }, []);
+
   const abrirCasoDesdeRegistro = useCallback(async (aviso) => {
     if (!aviso?.markerId && !aviso?.caseId) return null;
-    const coincide = (item) => (
-      (aviso.markerId && String(item._id) === String(aviso.markerId))
-      || (aviso.caseId && Number(item.caseId) === Number(aviso.caseId))
-    );
     const guardarYDevolver = (found) => {
       if (!found) return null;
       setMisReportesRegistro((prev) => {
@@ -3530,7 +3885,7 @@ const stopTouchPropagation = (event) => {
           headers: { 'x-user-id': userId },
           params: { mine: '1', eliminados: '1', limit: 20, page: 1, q: String(aviso.caseId) },
         });
-        const found = (data.items || []).map(normalizarMisItem).find(coincide);
+        const found = (data.items || []).map(normalizarMisItem).find((item) => coincideAvisoCaso(aviso, item));
         if (found) return guardarYDevolver(found);
       }
       // 2) Últimos del registro propio (por id de marcador)
@@ -3538,13 +3893,59 @@ const stopTouchPropagation = (event) => {
         headers: { 'x-user-id': userId },
         params: { mine: '1', eliminados: '1', limit: 50, page: 1 },
       });
-      const found = (data.items || []).map(normalizarMisItem).find(coincide);
+      const found = (data.items || []).map(normalizarMisItem).find((item) => coincideAvisoCaso(aviso, item));
       return guardarYDevolver(found || null);
     } catch (error) {
       console.error('Error buscando caso en registro:', error);
     }
     return null;
-  }, [userId, normalizarMisItem]);
+  }, [userId, normalizarMisItem, coincideAvisoCaso]);
+
+  /** Busca el caso del aviso en mapa / Mis reportes / API (activos y registro). */
+  const obtenerCasoDesdeAvisoVecino = useCallback(async (aviso, markerLocal = null) => {
+    if (!aviso?.markerId && !aviso?.caseId) return null;
+    if (markerLocal) return markerLocal;
+    const enMemoria = [
+      ...markers,
+      ...misReportesActivos,
+      ...misReportesRegistro,
+    ].find((item) => coincideAvisoCaso(aviso, item));
+    if (enMemoria) return normalizarMisItem(enMemoria);
+
+    const headers = { 'x-user-id': userId };
+    const buscar = async (extra = {}) => {
+      const params = { mine: '1', limit: 20, page: 1, ...extra };
+      if (aviso.caseId) params.q = String(aviso.caseId);
+      const { data } = await axios.get('http://localhost:5001/api/markers', { headers, params });
+      return (data.items || []).map(normalizarMisItem).find((item) => coincideAvisoCaso(aviso, item)) || null;
+    };
+    try {
+      const activo = await buscar();
+      if (activo) return activo;
+      return await buscar({ eliminados: '1' });
+    } catch (error) {
+      console.error('Error buscando caso del aviso:', error);
+      return null;
+    }
+  }, [
+    markers,
+    misReportesActivos,
+    misReportesRegistro,
+    userId,
+    normalizarMisItem,
+    coincideAvisoCaso,
+  ]);
+
+  const asegurarCasoEnMapa = useCallback((caso) => {
+    if (!caso?._id) return;
+    setMarkers((prev) => {
+      const id = String(caso._id);
+      if (prev.some((m) => String(m._id) === id)) {
+        return prev.map((m) => (String(m._id) === id ? { ...m, ...caso, isSaved: true } : m));
+      }
+      return [...prev, { ...caso, isSaved: true }];
+    });
+  }, []);
 
   const abrirDesdeNotificacion = useCallback(async (aviso) => {
     try {
@@ -3576,56 +3977,164 @@ const stopTouchPropagation = (event) => {
       console.error('Error marcando aviso como leído:', error);
     }
 
-    // Admin en modo vecino → panel admin (no el registro / listas del vecino)
+    // Admin en modo vecino → panel admin (excepto avisos propios de vecino: aprobado, etc.)
     if (typeof onAbrirCasoAdmin === 'function' && aviso && (aviso.markerId || aviso.caseId)) {
-      if (TIPOS_NOTIF_PANEL_ADMIN.has(aviso.tipo)) {
-        const seccion = aviso.tipo === 'por_aprobar'
-          ? 'por_aprobar'
-          : (aviso.tipo === 'nueva_perdida' ? 'cosas_perdidas' : 'reportes');
-        setMostrarNotificaciones(false);
-        onAbrirCasoAdmin({
-          seccion,
-          casoId: aviso.markerId ? String(aviso.markerId) : null,
-          caseNumber: aviso.caseId != null ? Number(aviso.caseId) : null,
-          tenantId: aviso.tenantId ? String(aviso.tenantId) : '',
-          estado: aviso.tipo === 'por_aprobar' ? undefined : 'pendiente',
-        });
-        return;
-      }
-      if (notifApuntaAlRegistro(aviso) || aviso.tipo === 'resuelto' || aviso.tipo === 'rechazado') {
-        setMostrarNotificaciones(false);
-        onAbrirCasoAdmin({
-          seccion: 'registro',
-          casoId: aviso.markerId ? String(aviso.markerId) : null,
-          caseNumber: aviso.caseId != null ? Number(aviso.caseId) : null,
-          tenantId: aviso.tenantId ? String(aviso.tenantId) : '',
-          // Sin filtros: el buscador por #caso debe encontrar el aviso
-          registroTipo: '',
-          registroCategoria: '',
-          registroPeriodo: '',
-        });
-        return;
-      }
-      if (aviso.tipo === 'respuesta_datos') {
-        const seccion = String(aviso.mensaje || '').toLowerCase().includes('perdid')
-          ? 'cosas_perdidas'
-          : 'reportes';
-        setMostrarNotificaciones(false);
-        onAbrirCasoAdmin({
-          seccion,
-          casoId: aviso.markerId ? String(aviso.markerId) : null,
-          caseNumber: aviso.caseId != null ? Number(aviso.caseId) : null,
-          tenantId: aviso.tenantId ? String(aviso.tenantId) : '',
-          atencion: 'respuestas',
-        });
-        return;
+      const esAvisoVecinoPropio = aviso.tipo === 'aprobado'
+        || aviso.tipo === 'avisado'
+        || aviso.tipo === 'estado'
+        || aviso.tipo === 'pedir_datos';
+      if (!esAvisoVecinoPropio) {
+        if (TIPOS_NOTIF_PANEL_ADMIN.has(aviso.tipo)
+          || notifApuntaAlRegistro(aviso)
+          || aviso.tipo === 'resuelto'
+          || aviso.tipo === 'rechazado'
+          || aviso.tipo === 'respuesta_datos') {
+          setMostrarNotificaciones(false);
+          let casoAdmin = null;
+          try {
+            const headers = { 'x-user-id': userId };
+            const q = aviso.caseId != null
+              ? String(aviso.caseId)
+              : String(aviso.markerId?._id || aviso.markerId || '');
+            const pick = (items) => (items || []).find((item) => coincideAvisoCaso(aviso, item)) || null;
+            const esNro = /^\d+$/.test(q);
+            const baseParams = esNro
+              ? { q, soloCaseId: 1, limit: 5, page: 1 }
+              : { q, limit: 10, page: 1 };
+            const intentos = [
+              baseParams,
+              { ...baseParams, eliminados: 1 },
+              { ...baseParams, sinTenant: 1 },
+              { ...baseParams, eliminados: 1, sinTenant: 1 },
+            ];
+            for (const params of intentos) {
+              // eslint-disable-next-line no-await-in-loop
+              const { data } = await axios.get('http://localhost:5001/api/markers/admin', {
+                headers,
+                params,
+              });
+              casoAdmin = pick(data.items);
+              if (casoAdmin) break;
+            }
+          } catch (error) {
+            console.error('Error buscando caso admin del aviso:', error);
+          }
+
+          const cerrado = casoAdmin ? casoEstaCerrado(casoAdmin) : (
+            notifApuntaAlRegistro(aviso) || aviso.tipo === 'resuelto' || aviso.tipo === 'rechazado'
+          );
+          const sinJurisdiccion = casoAdmin
+            ? !casoAdmin.tenant && !casoAdmin.jurisdictionName
+            : false;
+          const baseFoco = {
+            casoId: (casoAdmin?._id || aviso.markerId)
+              ? String(casoAdmin?._id || aviso.markerId?._id || aviso.markerId)
+              : null,
+            caseNumber: (casoAdmin?.caseId ?? aviso.caseId) != null
+              ? Number(casoAdmin?.caseId ?? aviso.caseId)
+              : null,
+            tenantId: '',
+            sinTenant: sinJurisdiccion,
+          };
+
+          if (cerrado) {
+            onAbrirCasoAdmin({
+              ...baseFoco,
+              seccion: 'registro',
+              registroTipo: '',
+              registroCategoria: '',
+              registroPeriodo: '',
+            });
+            return;
+          }
+
+          if (aviso.tipo === 'respuesta_datos') {
+            const seccion = String(aviso.mensaje || '').toLowerCase().includes('perdid')
+              || casoAdmin?.category === 'cosas_perdidas'
+              ? 'cosas_perdidas'
+              : 'reportes';
+            onAbrirCasoAdmin({
+              ...baseFoco,
+              seccion,
+              atencion: 'respuestas',
+            });
+            return;
+          }
+
+          if (TIPOS_NOTIF_PANEL_ADMIN.has(aviso.tipo)) {
+            let seccion = aviso.tipo === 'por_aprobar'
+              ? 'por_aprobar'
+              : (aviso.tipo === 'nueva_perdida' || casoAdmin?.category === 'cosas_perdidas'
+                ? 'cosas_perdidas'
+                : 'reportes');
+            if (casoAdmin?.status === 'pendiente_aprobacion') seccion = 'por_aprobar';
+            if (sinJurisdiccion) seccion = 'reportes';
+            if (casoAdmin?.status === 'pendiente_cierre') {
+              onAbrirCasoAdmin({
+                ...baseFoco,
+                seccion: 'reportes',
+                atencion: 'cierres',
+              });
+              return;
+            }
+            const estado = casoAdmin?.status === 'en_proceso' ? 'en_proceso' : 'pendiente';
+            onAbrirCasoAdmin({
+              ...baseFoco,
+              seccion,
+              ...(seccion === 'por_aprobar' ? {} : { estado }),
+            });
+            return;
+          }
+
+          onAbrirCasoAdmin({
+            ...baseFoco,
+            seccion: 'registro',
+            registroTipo: '',
+            registroCategoria: '',
+            registroPeriodo: '',
+          });
+          return;
+        }
       }
     }
 
-    const marker = markers.find((item) =>
-      String(item._id) === String(aviso.markerId)
-      || (aviso.caseId && Number(item.caseId) === Number(aviso.caseId))
-    );
+    const marker = markers.find((item) => coincideAvisoCaso(aviso, item));
+
+    // Aprobado / cambio de estado / oficina avisada → ficha en mapa o Registro si ya cerró
+    if (
+      aviso?.tipo === 'aprobado'
+      || aviso?.tipo === 'avisado'
+      || aviso?.tipo === 'estado'
+    ) {
+      setMostrarNotificaciones(false);
+      const caso = await obtenerCasoDesdeAvisoVecino(aviso, marker);
+      if (!caso) {
+        mostrarAviso('No se pudo abrir ese caso. Puede que ya no esté disponible.', true);
+        return;
+      }
+      asegurarCasoEnMapa(caso);
+      if (casoEstaCerrado(caso)) {
+        setMisReportesSeccion('registro');
+        setMostrarMisReportes(true);
+        await cargarMisLista('registro', 1);
+        setMisReportesRegistro((prev) => (
+          prev.some((m) => String(m._id) === String(caso._id))
+            ? prev
+            : [caso, ...prev]
+        ));
+        setIdRegistroDestacado(String(caso._id));
+        irAMiReporte(caso);
+        window.setTimeout(() => {
+          const nodo = document.querySelector(`[data-registro-id="${String(caso._id)}"]`);
+          if (nodo) nodo.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 180);
+        window.setTimeout(() => setIdRegistroDestacado(null), 8000);
+        return;
+      }
+      setMostrarMisReportes(false);
+      irAMiReporte(caso);
+      return;
+    }
 
     // Reclamo / chat → Míos + abrir ficha/chat. Cerca → mapa en el pin.
     if (aviso?.tipo === 'reclamo' || aviso?.tipo === 'chat' || aviso?.tipo === 'cerca') {
@@ -3749,6 +4258,9 @@ const stopTouchPropagation = (event) => {
     cargarPerdidasLista,
     marcarPerdidasLeidas,
     normalizeCategoryValue,
+    coincideAvisoCaso,
+    obtenerCasoDesdeAvisoVecino,
+    asegurarCasoEnMapa,
   ]);
 
   const marcarTodasLeidas = async () => {
@@ -4334,6 +4846,10 @@ const renderOficinas = (tipo, jurisdiccion) => {
       const sirve = (m) => {
         if (m.category !== catRadar) return false;
         if (!Number.isFinite(Number(m.lat)) || !Number.isFinite(Number(m.lng))) return false;
+        if (radarModo === 'animales' && animalFiltroRadar && animalFiltroRadar !== 'todos'
+          && m.animalTipo !== animalFiltroRadar) {
+          return false;
+        }
         if (perdidasSeccion === 'cerca' && yo && yo !== 'anonimo') {
           const dueno = String(m.createdBy || '').trim().toLowerCase();
           if (dueno === yo) return false;
@@ -4344,9 +4860,22 @@ const renderOficinas = (tipo, jurisdiccion) => {
         return perdidasLista.filter(sirve);
       }
       // Cerca: no reemplazar el mapa por la búsqueda; unir mapa cargado + resultados del radio
+      // (si solo usamos el radio, los pines fuera del círculo desaparecen hasta “barrer”)
+      const punto = puntoCercaActivo(cercaOrigen);
+      const radio = Number(cercaRadioMetros) || 2500;
+      const dentroDelCirculo = (m) => {
+        if (!punto || !Number.isFinite(punto.lat) || !Number.isFinite(punto.lng)) return true;
+        return distanciaMetros(punto.lat, punto.lng, Number(m.lat), Number(m.lng)) <= radio;
+      };
       const byId = new Map();
       visibleMarkersBase.filter(sirve).forEach((m) => byId.set(String(m._id), m));
-      pinesCercaMapa.filter(sirve).forEach((m) => byId.set(String(m._id), m));
+      // Resultados del radio: solo los que siguen dentro (al achicar no quedan pegados afuera)
+      pinesCercaMapa.filter((m) => sirve(m) && dentroDelCirculo(m)).forEach((m) => {
+        byId.set(String(m._id), m);
+      });
+      perdidasLista.filter((m) => sirve(m) && dentroDelCirculo(m)).forEach((m) => {
+        byId.set(String(m._id), m);
+      });
       return Array.from(byId.values());
     })();
     const misReportes = misReportesSeccion === 'registro'
@@ -4930,21 +5459,56 @@ const renderOficinas = (tipo, jurisdiccion) => {
       && !ocultarPunteroMapa
       && !highlightedMarkerId;
     const mostrarMapaCerca = mostrarCosasPerdidas && perdidasSeccion === 'cerca';
-    const perdidasTotalPaginas = Math.max(1, Math.ceil((misMeta.total || 0) / (misMeta.limit || MIS_PAGE_SIZE)));
     const radarBusquedaActiva = Boolean(normalizarBusquedaRadar(radarBusqueda));
     const yoRadar = String(userId || '').trim().toLowerCase();
-    const perdidasListaBase = perdidasSeccion === 'cerca'
-      ? perdidasLista.filter((m) => {
-        if (yoRadar && yoRadar !== 'anonimo'
-          && String(m.createdBy || '').trim().toLowerCase() === yoRadar) {
-          return false;
-        }
-        return true;
-      })
-      : perdidasLista;
-    const perdidasListaFiltrada = radarBusquedaActiva
+    const catRadarLista = radarModo === 'animales' ? 'perros_gatos' : 'cosas_perdidas';
+    const puntoLista = perdidasSeccion === 'cerca' ? puntoCercaActivo(cercaOrigen) : null;
+    const radioLista = Number(cercaRadioMetros) || 2500;
+    const perdidasListaBase = perdidasLista.filter((m) => {
+      if (m.category !== catRadarLista) return false;
+      if (radarModo === 'animales' && animalFiltroRadar && animalFiltroRadar !== 'todos'
+        && m.animalTipo !== animalFiltroRadar) {
+        return false;
+      }
+      if (perdidasSeccion === 'cerca' && yoRadar && yoRadar !== 'anonimo'
+        && String(m.createdBy || '').trim().toLowerCase() === yoRadar) {
+        return false;
+      }
+      // Misma regla que el círculo del mapa (al achicar el slider no mentir “en el radio”)
+      if (
+        perdidasSeccion === 'cerca'
+        && puntoLista
+        && Number.isFinite(puntoLista.lat)
+        && Number.isFinite(puntoLista.lng)
+      ) {
+        return distanciaMetros(
+          puntoLista.lat,
+          puntoLista.lng,
+          Number(m.lat),
+          Number(m.lng),
+        ) <= radioLista;
+      }
+      return true;
+    });
+    const perdidasListaFiltradaFull = radarBusquedaActiva
       ? perdidasListaBase.filter((m) => coincideBusquedaRadar(m, radarBusqueda))
       : perdidasListaBase;
+    // Cerca: paginación en cliente (ya trajimos el círculo completo)
+    const perdidasPageSize = radarVistaAmpliada ? 50 : (misMeta.limit || MIS_PAGE_SIZE);
+    const perdidasTotalPaginas = Math.max(
+      1,
+      Math.ceil(
+        (perdidasSeccion === 'cerca'
+          ? perdidasListaFiltradaFull.length
+          : (misMeta.total || 0)) / perdidasPageSize
+      )
+    );
+    const perdidasListaFiltrada = perdidasSeccion === 'cerca'
+      ? perdidasListaFiltradaFull.slice(
+        (Math.max(1, misPage) - 1) * perdidasPageSize,
+        Math.max(1, misPage) * perdidasPageSize
+      )
+      : perdidasListaFiltradaFull;
     const tituloPopup = !editMode
       ? 'Publicar aviso'
       : (recienPublicado ? 'Aviso enviado' : 'Aviso');
@@ -4962,7 +5526,7 @@ const renderOficinas = (tipo, jurisdiccion) => {
     const puedeEditarAviso = Boolean(editMode && canEdit && !showDeleteOnly);
 
     return (
-      <div className={`mapa-envoltorio${modoSoloCaso ? ' mapa-envoltorio-embebido' : ''}${guiaActiva ? ' mapa-con-guia' : ''}${mostrarCosasPerdidas ? ' mapa-con-perdidas' : ''}${mostrarCosasPerdidas && radarVistaAmpliada ? ' mapa-radar-ampliado' : ''}`}>
+      <div className={`mapa-envoltorio${modoSoloCaso ? ' mapa-envoltorio-embebido' : ''}${guiaActiva ? ' mapa-con-guia' : ''}${(mostrarCosasPerdidas || mostrarMisReportes) ? ' mapa-con-perdidas' : ''}${(mostrarMisReportes || (mostrarCosasPerdidas && radarVistaAmpliada)) ? ' mapa-radar-ampliado' : ''}`}>
         {modoSoloCaso && habilitarGuiaGps && (() => {
           const paso = guiaActiva ? guiaPasos[guiaPasoIdx] : null;
           const maniobra = guiaLlego ? 'llegada' : tipoManiobra(paso?.instruction);
@@ -5179,6 +5743,7 @@ const renderOficinas = (tipo, jurisdiccion) => {
             </OverlayView>
           )}
           <CapaPinesMapa
+            key={`pines-${mostrarCosasPerdidas ? `radar-${radarModo}-${animalFiltroRadar}` : 'mapa'}`}
             markers={visibleMarkers}
             mapaListoTick={mapaListoTick}
             userId={userId}
@@ -5354,6 +5919,10 @@ const renderOficinas = (tipo, jurisdiccion) => {
                   disabled={!userLocation}
                   onClick={() => {
                     ignorarDragCercaRef.current = true;
+                    gpsFollowPausadoRef.current = false;
+                    ultimoCercaGpsFetchRef.current = userLocation
+                      ? { lat: userLocation.lat, lng: userLocation.lng }
+                      : null;
                     if (userLocation) {
                       setMapCenter(userLocation);
                       if (mapRef.current) mapRef.current.panTo(userLocation);
@@ -6100,228 +6669,328 @@ const renderOficinas = (tipo, jurisdiccion) => {
         )}
 
         {mostrarMisReportes && (
-          <div
-            className="panel-vecino-fondo"
-            onClick={() => {
-              setMostrarMisReportes(false);
-              setIdRegistroDestacado(null);
-            }}
-          >
-            <div className="panel-vecino" onClick={(event) => event.stopPropagation()}>
-              <div className="panel-vecino-cabecera">
-                <h3>Mis reportes</h3>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMostrarMisReportes(false);
-                    setIdRegistroDestacado(null);
-                  }}
-                >
-                  Cerrar
-                </button>
-              </div>
-              <div className="panel-mis-tabs" role="tablist">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={misReportesSeccion === 'activos'}
-                  className={misReportesSeccion === 'activos' ? 'activo' : ''}
-                  onClick={() => {
-                    setMisReportesSeccion('activos');
-                    setMisPage(1);
-                    cargarMisLista('activos', 1);
-                  }}
-                >
-                  Activos
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={misReportesSeccion === 'registro'}
-                  className={misReportesSeccion === 'registro' ? 'activo' : ''}
-                  onClick={() => {
-                    setMisReportesSeccion('registro');
-                    setMisPage(1);
-                    cargarMisLista('registro', 1);
-                  }}
-                >
-                  Registro
-                </button>
-              </div>
+          <aside className="perdidas-panel-lateral ampliado mis-reportes-panel" aria-label="Mis reportes">
+            <div className="panel-vecino-cabecera panel-radar-cabecera-ampliada">
+              <button
+                type="button"
+                className="panel-radar-volver"
+                onClick={() => {
+                  setMostrarMisReportes(false);
+                  setIdRegistroDestacado(null);
+                  resetMisFiltros();
+                }}
+              >
+                ← Volver al mapa
+              </button>
+              <h3>Mis reportes</h3>
+              <span aria-hidden="true" />
+            </div>
+
+            <div className="panel-mis-tabs mis-reportes-tabs" role="tablist">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={misReportesSeccion === 'activos'}
+                className={misReportesSeccion === 'activos' ? 'activo' : ''}
+                onClick={() => {
+                  setMisReportesSeccion('activos');
+                  setMisPage(1);
+                }}
+              >
+                Activos
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={misReportesSeccion === 'registro'}
+                className={misReportesSeccion === 'registro' ? 'activo' : ''}
+                onClick={() => {
+                  setMisReportesSeccion('registro');
+                  setMisPage(1);
+                }}
+              >
+                Registro
+              </button>
+            </div>
+
+            <div className="admin-dash-lista-wrap mis-reportes-lista-wrap">
+              <header className="admin-dash-lista-cabecera">
+                <div>
+                  <h1>{misReportesSeccion === 'registro' ? 'Registro' : 'Activos'}</h1>
+                  <p className="admin-dash-sub">
+                    {cargandoMisLista
+                      ? 'Cargando…'
+                      : (misReportesSeccion === 'registro'
+                        ? (misMeta.total
+                          ? `${misMeta.total} caso${misMeta.total === 1 ? '' : 's'} cerrados, anulados o vencidos`
+                          : 'Todavía no tenés casos en el registro')
+                        : (misMeta.total
+                          ? `${misMeta.total} caso${misMeta.total === 1 ? '' : 's'} activos`
+                          : 'No tenés reportes activos con esta cuenta'))}
+                  </p>
+                </div>
+                <div className="admin-dash-filtros">
+                  <input
+                    type="search"
+                    placeholder={
+                      misReportesSeccion === 'registro'
+                        ? 'Buscar #caso, zona, objeto, motivo…'
+                        : 'Buscar #caso…'
+                    }
+                    value={misBusqueda}
+                    onChange={(e) => setMisBusqueda(e.target.value)}
+                    aria-label="Buscar en mis reportes"
+                  />
+                  <select
+                    value={
+                      misReportesSeccion === 'registro'
+                        ? misFiltroRegistroCategoria
+                        : misFiltroCategoria
+                    }
+                    onChange={(e) => {
+                      if (misReportesSeccion === 'registro') {
+                        setMisFiltroRegistroCategoria(e.target.value);
+                      } else {
+                        setMisFiltroCategoria(e.target.value);
+                      }
+                    }}
+                    aria-label="Categoría"
+                  >
+                    <option value="">
+                      {misReportesSeccion === 'activos' ? 'Todos' : 'Todas las categorías'}
+                    </option>
+                    <option value="reparaciones">Reparaciones</option>
+                    <option value="perros_gatos">Perros y gatos</option>
+                    <option value="familias">Familias</option>
+                    <option value="cosas_perdidas">Cosas perdidas</option>
+                  </select>
+                  {misReportesSeccion === 'activos' ? (
+                    <select
+                      value={misFiltroEstado}
+                      onChange={(e) => setMisFiltroEstado(e.target.value)}
+                      aria-label="Estado"
+                    >
+                      <option value="">Todos</option>
+                      <option value="pendiente_aprobacion">En revisión</option>
+                      <option value="pendiente">Publicado</option>
+                      <option value="en_proceso">En atención</option>
+                      <option value="pendiente_cierre">Cierre propuesto</option>
+                    </select>
+                  ) : (
+                    <>
+                      <select
+                        value={misFiltroRegistroTipo}
+                        onChange={(e) => setMisFiltroRegistroTipo(e.target.value)}
+                        aria-label="Tipo de cierre"
+                      >
+                        <option value="">Todo tipo de cierre</option>
+                        <option value="resuelto">Resuelto</option>
+                        <option value="anulado">Anulado</option>
+                        <option value="vencido">Vencido</option>
+                        <option value="oficina">Oficina avisada</option>
+                      </select>
+                      <select
+                        value={misFiltroRegistroPeriodo}
+                        onChange={(e) => {
+                          setMisFiltroRegistroPeriodo(e.target.value);
+                          if (e.target.value !== 'personalizado') {
+                            setMisFiltroRegistroDesde('');
+                            setMisFiltroRegistroHasta('');
+                          }
+                        }}
+                        aria-label="Período"
+                      >
+                        <option value="">Cualquier fecha</option>
+                        <option value="7">Últimos 7 días</option>
+                        <option value="30">Últimos 30 días</option>
+                        <option value="90">Últimos 90 días</option>
+                        <option value="personalizado">Personalizado</option>
+                      </select>
+                      {misFiltroRegistroPeriodo === 'personalizado' && (
+                        <div className="admin-dash-fechas-rango" role="group" aria-label="Rango de fechas">
+                          <label className="admin-dash-fecha">
+                            <span>Desde</span>
+                            <input
+                              type="date"
+                              value={misFiltroRegistroDesde}
+                              max={misFiltroRegistroHasta || undefined}
+                              onChange={(e) => setMisFiltroRegistroDesde(e.target.value)}
+                              aria-label="Fecha desde"
+                            />
+                          </label>
+                          <label className="admin-dash-fecha">
+                            <span>Hasta</span>
+                            <input
+                              type="date"
+                              value={misFiltroRegistroHasta}
+                              min={misFiltroRegistroDesde || undefined}
+                              onChange={(e) => setMisFiltroRegistroHasta(e.target.value)}
+                              aria-label="Fecha hasta"
+                            />
+                          </label>
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {misReportesSeccion === 'activos' && (
+                    <button
+                      type="button"
+                      className="admin-dash-btn"
+                      onClick={verMisCasosEnElMapa}
+                    >
+                      Ver en el mapa
+                    </button>
+                  )}
+                </div>
+              </header>
+
               {cargandoMisLista ? (
-                <p className="panel-vecino-vacio">Cargando…</p>
+                <p className="admin-dash-vacio">Cargando casos…</p>
               ) : misReportes.length === 0 ? (
-                <p className="panel-vecino-vacio">
+                <p className="admin-dash-vacio">
                   {misReportesSeccion === 'registro'
-                    ? 'Todavía no tenés casos cerrados, anulados o vencidos.'
-                    : 'No tenés reportes activos con esta cuenta.'}
+                    ? 'No hay casos en el registro con esos filtros.'
+                    : 'No hay casos activos con esos filtros.'}
                 </p>
               ) : (
                 <>
-                {misReportesSeccion === 'activos' && (
-                  <button
-                    type="button"
-                    className="btn-aplicar-filtros"
-                    onClick={verMisCasosEnElMapa}
-                  >
-                    Ver mis casos en el mapa
-                  </button>
-                )}
-                <p className="panel-mis-meta">
-                  {`Mostrando ${misReportes.length} de ${misMeta.total} · página ${misPage} de ${misTotalPaginas}`}
-                </p>
-                <ul className="panel-vecino-lista panel-mis-reportes">
-                  {misReportes.map((marker) => {
-                    const categoria = esCasoFamilia(marker.category)
-                      ? 'familias'
-                      : (marker.category || 'reparaciones');
-                    const labelsFamilias = {
-                      violencia: 'Violencia en la casa',
-                      hijos: 'Niños o adolescentes',
-                      calle: 'Persona en situación de calle',
-                    };
-                    const subtipo = categoria === 'cosas_perdidas' && marker.perdidaTipo
-                      ? (perdidaLabels[marker.perdidaTipo] || marker.perdidaTipo)
-                      : categoria === 'perros_gatos' && ANIMAL_TIPOS[marker.animalTipo]
-                        ? ANIMAL_TIPOS[marker.animalTipo]
-                        : categoria === 'familias' && marker.familiasTipo
-                          ? (labelsFamilias[marker.familiasTipo] || marker.familiasTipo)
-                          : null;
-                    const creado = marker.createdAt
-                      ? new Date(marker.createdAt).toLocaleString('es-AR', {
-                        dateStyle: 'short',
-                        timeStyle: 'short',
-                      })
-                      : (marker.date
-                        ? `${marker.date}${marker.time ? ` · ${marker.time}` : ''}`
-                        : null);
-                    const foto = marker.imageUrl ? buildImageUrl(marker.imageUrl) : null;
-                    const descripcion = (marker.description || '').trim();
-                    const direccion = (marker.direccion || '').trim();
-                    const enRegistro = Boolean(marker.eliminadoAt)
-                      || marker.status === 'resuelto'
-                      || marker.status === 'rechazado';
-                    const vencida = esPublicacionVencida(marker);
-                    const motivoBaja = String(marker.motivoEliminacion || '').toLowerCase();
-                    const estadoTexto = enRegistro
-                      ? (motivoBaja.includes('vencimiento') || vencida
-                        ? 'Vencido'
-                        : (marker.status === 'resuelto'
-                          || motivoBaja.includes('resuelto')
-                          || motivoBaja.includes('recuper')
-                          || motivoBaja.includes('cierre del administrador')
-                          ? 'Resuelto'
-                          : 'Anulado'))
-                      : etiquetaEstadoPopup(marker.status || 'pendiente', marker);
-                    const actividad = marker.pideDatosAt
-                      ? 'Te pidieron más datos'
-                      : (marker.ultimaRespuestaDatosAt
-                        ? `Respondiste datos el ${new Date(marker.ultimaRespuestaDatosAt).toLocaleDateString('es-AR')}`
-                        : null);
-                    const destacado = idRegistroDestacado
-                      && String(marker._id) === String(idRegistroDestacado);
-                    return (
-                      <li key={marker._id} data-registro-id={marker._id}>
-                        <div className={`tarjeta-mi-reporte-wrap${destacado ? ' tarjeta-mi-reporte-destacada' : ''}`}>
-                          <button
-                            type="button"
-                            className={`tarjeta-mi-reporte${destacado ? ' tarjeta-mi-reporte-sombra' : ''}`}
-                            onClick={() => {
-                              setIdRegistroDestacado(null);
-                              irAMiReporte(marker);
-                            }}
-                          >
-                            {foto ? (
-                              <img
-                                src={foto}
-                                alt=""
-                                className="tarjeta-mi-reporte-foto"
-                              />
-                            ) : (
-                              <span className="tarjeta-mi-reporte-sin-foto" aria-hidden="true">
-                                Sin foto
-                              </span>
-                            )}
-                            <span className="tarjeta-mi-reporte-info">
-                              <strong>Caso #{marker.caseId || '-'}</strong>
-                              <span className="tarjeta-mi-reporte-meta">
-                                {`Categoría: ${categoryLabels[categoria] || categoria}${subtipo ? ` / ${subtipo}` : ''}`}
-                              </span>
-                              <span
-                                className="panel-vecino-estado"
-                                style={getStatusBadgeStyle(
-                                  vencida
-                                    ? 'rechazado'
-                                    : (enRegistro && marker.status !== 'rechazado' && marker.status !== 'resuelto'
-                                      ? 'resuelto'
-                                      : (marker.status || 'pendiente'))
-                                )}
-                              >
-                                {vencida ? 'Vencido' : estadoTexto}
-                              </span>
-                              {actividad && (
-                                <span className="tarjeta-mi-reporte-actividad">{actividad}</span>
-                              )}
-                              {enRegistro && marker.status === 'rechazado' && marker.motivoEliminacion && (
-                                <span className="tarjeta-mi-reporte-actividad">
-                                  {`Motivo: ${String(marker.motivoEliminacion).replace(/^Anulado:\s*/i, '')}`}
-                                </span>
-                              )}
-                              {direccion && (
-                                <span className="tarjeta-mi-reporte-direccion">{direccion}</span>
-                              )}
-                              {descripcion && (
-                                <span className="tarjeta-mi-reporte-desc">{descripcion}</span>
-                              )}
-                              <small>
-                                {marker.jurisdictionName || 'Sin municipio'}
-                                {creado ? ` · ${creado}` : ''}
-                                {marker.eliminadoAt
-                                  ? ` · Baja: ${new Date(marker.eliminadoAt).toLocaleDateString('es-AR')}`
-                                  : ''}
-                              </small>
-                            </span>
-                          </button>
-                          {vencida && (
+                  <ul className="admin-dash-lista admin-dash-tarjetas">
+                    {misReportes.map((marker) => {
+                      const categoria = esCasoFamilia(marker.category)
+                        ? 'familias'
+                        : (marker.category || 'reparaciones');
+                      const labelsFamilias = {
+                        violencia: 'Violencia en la casa',
+                        hijos: 'Niños o adolescentes',
+                        calle: 'Persona en situación de calle',
+                      };
+                      const subtipo = categoria === 'cosas_perdidas' && marker.perdidaTipo
+                        ? (perdidaLabels[marker.perdidaTipo] || marker.perdidaTipo)
+                        : categoria === 'perros_gatos' && ANIMAL_TIPOS[marker.animalTipo]
+                          ? ANIMAL_TIPOS[marker.animalTipo]
+                          : categoria === 'familias' && marker.familiasTipo
+                            ? (labelsFamilias[marker.familiasTipo] || marker.familiasTipo)
+                            : null;
+                      const creado = marker.createdAt
+                        ? new Date(marker.createdAt).toLocaleString('es-AR', {
+                          dateStyle: 'short',
+                          timeStyle: 'short',
+                        })
+                        : (marker.date
+                          ? `${marker.date}${marker.time ? ` · ${marker.time}` : ''}`
+                          : null);
+                      const foto = marker.imageUrl ? buildImageUrl(marker.imageUrl) : null;
+                      const descripcion = (marker.description || '').trim();
+                      const direccion = (marker.direccion || '').trim();
+                      const enRegistro = Boolean(marker.eliminadoAt)
+                        || marker.status === 'resuelto'
+                        || marker.status === 'rechazado';
+                      const vencida = esPublicacionVencida(marker);
+                      const motivoBaja = String(marker.motivoEliminacion || '').toLowerCase();
+                      const estadoTexto = enRegistro
+                        ? (motivoBaja.includes('vencimiento') || vencida
+                          ? 'Vencido'
+                          : (marker.status === 'resuelto'
+                            || motivoBaja.includes('resuelto')
+                            || motivoBaja.includes('recuper')
+                            || motivoBaja.includes('cierre del administrador')
+                            ? 'Resuelto'
+                            : 'Anulado'))
+                        : etiquetaEstadoPopup(marker.status || 'pendiente', marker);
+                      const claseEstado = enRegistro
+                        ? (estadoTexto === 'Resuelto'
+                          ? 'admin-dash-estado-resuelto'
+                          : (estadoTexto === 'Vencido'
+                            ? 'admin-dash-estado-vencido'
+                            : 'admin-dash-estado-rechazado'))
+                        : (marker.avisadoAt
+                          ? 'admin-dash-estado-oficina_avisada'
+                          : `admin-dash-estado-${marker.status || 'pendiente'}`);
+                      const destacado = idRegistroDestacado
+                        && String(marker._id) === String(idRegistroDestacado);
+                      return (
+                        <li key={marker._id} data-registro-id={marker._id}>
+                          <div className={`tarjeta-mi-reporte-wrap${destacado ? ' tarjeta-mi-reporte-destacada' : ''}`}>
                             <button
                               type="button"
-                              className="btn-renovar-publicacion"
-                              disabled={renovandoId === marker._id}
-                              onClick={() => renovarPublicacion(marker)}
+                              className={`tarjeta-mi-reporte admin-dash-tarjeta${destacado ? ' tarjeta-mi-reporte-sombra' : ''}`}
+                              onClick={() => {
+                                setIdRegistroDestacado(null);
+                                irAMiReporte(marker);
+                              }}
                             >
-                              {renovandoId === marker._id ? 'Renovando…' : 'Renovar 15 días'}
+                              {foto ? (
+                                <img
+                                  src={foto}
+                                  alt=""
+                                  className="tarjeta-mi-reporte-foto"
+                                />
+                              ) : (
+                                <span className="tarjeta-mi-reporte-sin-foto" aria-hidden="true">
+                                  Sin foto
+                                </span>
+                              )}
+                              <span className="tarjeta-mi-reporte-info">
+                                <strong>Caso #{marker.caseId || '—'}</strong>
+                                <span className="tarjeta-mi-reporte-meta">
+                                  {`Categoría: ${categoryLabels[categoria] || categoria}${subtipo ? ` / ${subtipo}` : ''}`}
+                                </span>
+                                <span className={`admin-dash-estado ${claseEstado}`}>
+                                  {estadoTexto}
+                                </span>
+                                {direccion && (
+                                  <span className="tarjeta-mi-reporte-direccion">{direccion}</span>
+                                )}
+                                {descripcion && (
+                                  <span className="tarjeta-mi-reporte-desc">{descripcion}</span>
+                                )}
+                                <small>
+                                  {marker.jurisdictionName || 'Sin municipio'}
+                                  {creado ? ` · ${creado}` : ''}
+                                  {marker.eliminadoAt
+                                    ? ` · Baja: ${new Date(marker.eliminadoAt).toLocaleDateString('es-AR')}`
+                                    : ''}
+                                </small>
+                              </span>
                             </button>
-                          )}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-                {misTotalPaginas > 1 && (
-                  <div className="panel-mis-paginacion">
+                            {vencida && (
+                              <button
+                                type="button"
+                                className="btn-renovar-publicacion"
+                                disabled={renovandoId === marker._id}
+                                onClick={() => renovarPublicacion(marker)}
+                              >
+                                {renovandoId === marker._id ? 'Renovando…' : 'Renovar 15 días'}
+                              </button>
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <div className="admin-dash-paginacion">
                     <button
                       type="button"
-                      className="popup-btn-secundario"
+                      className="admin-dash-btn"
                       disabled={misPage <= 1 || cargandoMisLista}
                       onClick={() => cargarMisLista(misReportesSeccion, misPage - 1)}
                     >
                       Anterior
                     </button>
-                    <span>{misPage} / {misTotalPaginas}</span>
+                    <span>Página {misPage} de {misTotalPaginas}</span>
                     <button
                       type="button"
-                      className="popup-btn-secundario"
+                      className="admin-dash-btn"
                       disabled={!misMeta.hasMore || cargandoMisLista}
                       onClick={() => cargarMisLista(misReportesSeccion, misPage + 1)}
                     >
                       Siguiente
                     </button>
                   </div>
-                )}
                 </>
               )}
             </div>
-          </div>
+          </aside>
         )}
 
         {mostrarCosasPerdidas && (
@@ -6411,7 +7080,6 @@ const renderOficinas = (tipo, jurisdiccion) => {
                   onClick={() => {
                     setRadarModo('cosas');
                     setMisPage(1);
-                    cargarPerdidasLista(perdidasSeccion, 1, null, 'cosas');
                   }}
                 >
                   <span
@@ -6429,7 +7097,6 @@ const renderOficinas = (tipo, jurisdiccion) => {
                   onClick={() => {
                     setRadarModo('animales');
                     setMisPage(1);
-                    cargarPerdidasLista(perdidasSeccion, 1, null, 'animales');
                   }}
                 >
                   <span
@@ -6489,7 +7156,6 @@ const renderOficinas = (tipo, jurisdiccion) => {
                       onClick={() => {
                         setAnimalFiltroRadar(opt.value);
                         setMisPage(1);
-                        cargarPerdidasLista(perdidasSeccion, 1, null, 'animales', opt.value);
                       }}
                     >
                       {opt.label}
@@ -6544,8 +7210,10 @@ const renderOficinas = (tipo, jurisdiccion) => {
                 <>
                 <p className="panel-mis-meta">
                   {radarBusquedaActiva
-                    ? `${perdidasListaFiltrada.length} coincidencia${perdidasListaFiltrada.length === 1 ? '' : 's'} de ${perdidasLista.length} en esta página`
-                    : `Mostrando ${perdidasLista.length} de ${misMeta.total} · página ${misPage} de ${perdidasTotalPaginas}`}
+                    ? `${perdidasListaFiltradaFull.length} coincidencia${perdidasListaFiltradaFull.length === 1 ? '' : 's'} · página ${misPage} de ${perdidasTotalPaginas}`
+                    : (perdidasSeccion === 'cerca'
+                      ? `Mostrando ${perdidasListaFiltrada.length} de ${perdidasListaFiltradaFull.length} en el radio · página ${misPage} de ${perdidasTotalPaginas}`
+                      : `Mostrando ${perdidasLista.length} de ${misMeta.total} · página ${misPage} de ${perdidasTotalPaginas}`)}
                 </p>
                 <ul className={`panel-vecino-lista panel-mis-reportes${radarVistaAmpliada ? ' panel-radar-lista-ampliada' : ''}`}>
                   {perdidasListaFiltrada.map((marker) => {
@@ -6591,6 +7259,8 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     const destacado = idPerdidaDestacada
                       && String(marker._id) === String(idPerdidaDestacada);
                     const metros = Number(marker.distanciaMetros);
+                    const esTuAviso = soyDuenio || (!enCerca && radarModo === 'animales');
+                    const esTuReclamo = !soyDuenio && !enCerca && radarModo !== 'animales';
                     const etiquetaRol = soyDuenio
                       ? 'Tu aviso'
                       : (enCerca
@@ -6608,12 +7278,19 @@ const renderOficinas = (tipo, jurisdiccion) => {
                         : (metros <= 1000
                           ? 'dist-cerca'
                           : (metros <= 2500 ? 'dist-media' : 'dist-lejos')));
+                    const claseRolTarjeta = esTuAviso
+                      ? ' tarjeta-mi-reporte-propia'
+                      : (esTuReclamo ? ' tarjeta-mi-reporte-reclamo' : '');
+                    const metaResto = [
+                      subtipo,
+                      marker.caseId ? `#${marker.caseId}` : null,
+                    ].filter(Boolean).join(' · ');
                     return (
                       <li key={marker._id} data-perdida-id={marker._id}>
                         <div className={`tarjeta-mi-reporte-wrap${destacado ? ' tarjeta-mi-reporte-destacada' : ''}`}>
                           <button
                             type="button"
-                            className={`tarjeta-mi-reporte${destacado ? ' tarjeta-mi-reporte-sombra' : ''}${tarjetaNueva ? ' tarjeta-mi-reporte-nueva' : ''}${badgeCercaNuevo ? ' tarjeta-mi-reporte-cerca-nueva' : ''}`}
+                            className={`tarjeta-mi-reporte${claseRolTarjeta}${destacado ? ' tarjeta-mi-reporte-sombra' : ''}${tarjetaNueva ? ' tarjeta-mi-reporte-nueva' : ''}${badgeCercaNuevo ? ' tarjeta-mi-reporte-cerca-nueva' : ''}`}
                             onClick={() => {
                               setIdPerdidaDestacada(null);
                               if (radarVistaAmpliada) {
@@ -6667,9 +7344,18 @@ const renderOficinas = (tipo, jurisdiccion) => {
                                 )}
                               </strong>
                               <span className="tarjeta-mi-reporte-meta">
-                                {tituloObjeto
-                                  ? `${etiquetaRol}${subtipo ? ` · ${subtipo}` : ''} · #${marker.caseId || '-'}`
-                                  : `${etiquetaRol}${subtipo ? ` · ${subtipo}` : ''}`}
+                                {(esTuAviso || esTuReclamo) ? (
+                                  <>
+                                    <em className={`etiqueta-rol-radar${esTuAviso ? ' rol-aviso' : ' rol-reclamo'}`}>
+                                      {etiquetaRol}
+                                    </em>
+                                    {metaResto ? ` · ${metaResto}` : ''}
+                                  </>
+                                ) : (
+                                  tituloObjeto
+                                    ? `${etiquetaRol}${subtipo ? ` · ${subtipo}` : ''} · #${marker.caseId || '-'}`
+                                    : `${etiquetaRol}${subtipo ? ` · ${subtipo}` : ''}`
+                                )}
                               </span>
                               {badgeChat && (
                                 <span className="tarjeta-mi-reporte-actividad">
@@ -6744,14 +7430,20 @@ const renderOficinas = (tipo, jurisdiccion) => {
                       type="button"
                       className="popup-btn-secundario"
                       disabled={misPage <= 1 || cargandoMisLista}
-                      onClick={() => cargarPerdidasLista(
-                        perdidasSeccion,
-                        misPage - 1,
-                        perdidasSeccion === 'cerca' ? cercaOrigen : null,
-                        radarModo,
-                        animalFiltroRadar,
-                        radarVistaAmpliada ? 50 : MIS_PAGE_SIZE
-                      )}
+                      onClick={() => {
+                        if (perdidasSeccion === 'cerca') {
+                          setMisPage((p) => Math.max(1, p - 1));
+                          return;
+                        }
+                        cargarPerdidasLista(
+                          perdidasSeccion,
+                          misPage - 1,
+                          null,
+                          radarModo,
+                          animalFiltroRadar,
+                          radarVistaAmpliada ? 50 : MIS_PAGE_SIZE
+                        );
+                      }}
                     >
                       Anterior
                     </button>
@@ -6759,15 +7451,26 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     <button
                       type="button"
                       className="popup-btn-secundario"
-                      disabled={!misMeta.hasMore || cargandoMisLista}
-                      onClick={() => cargarPerdidasLista(
-                        perdidasSeccion,
-                        misPage + 1,
-                        perdidasSeccion === 'cerca' ? cercaOrigen : null,
-                        radarModo,
-                        animalFiltroRadar,
-                        radarVistaAmpliada ? 50 : MIS_PAGE_SIZE
-                      )}
+                      disabled={
+                        cargandoMisLista
+                        || (perdidasSeccion === 'cerca'
+                          ? misPage >= perdidasTotalPaginas
+                          : !misMeta.hasMore)
+                      }
+                      onClick={() => {
+                        if (perdidasSeccion === 'cerca') {
+                          setMisPage((p) => Math.min(perdidasTotalPaginas, p + 1));
+                          return;
+                        }
+                        cargarPerdidasLista(
+                          perdidasSeccion,
+                          misPage + 1,
+                          null,
+                          radarModo,
+                          animalFiltroRadar,
+                          radarVistaAmpliada ? 50 : MIS_PAGE_SIZE
+                        );
+                      }}
                     >
                       Siguiente
                     </button>

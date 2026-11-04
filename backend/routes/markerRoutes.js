@@ -24,6 +24,7 @@ const {
   avisarAdminsPorAprobar,
   avisarAdminsCasoAprobado,
   avisarVecinosCercanos,
+  avisarComplementosPerdidaCercanos,
   avisarPartesCaso,
   listarAdminsDelCaso,
   avisarOperariosDelCaso,
@@ -78,6 +79,7 @@ const buildListQuery = ({
   category,
   excludeCategory,
   animalTipo,
+  excludeAnimalTipos,
   perdidaTipo,
   status,
   mine,
@@ -96,6 +98,63 @@ const buildListQuery = ({
   soloEliminados = false,
   excludeAvisados = false,
 }) => {
+  const textoQ = String(q || '').trim().replace(/^#/, '');
+  // Búsqueda exacta por #caso: ignora estado / período / atención (sí respeta jurisdicción)
+  if (soloCaseId && /^\d+$/.test(textoQ)) {
+    const andExacto = [{ caseId: Number(textoQ) }];
+    if (sinTenant) {
+      andExacto.push({
+        $or: [
+          { tenant: null },
+          { tenant: { $exists: false } },
+        ],
+      });
+    } else if (tenantId) {
+      try {
+        andExacto.push({ tenant: new mongoose.Types.ObjectId(String(tenantId)) });
+      } catch {
+        andExacto.push({ tenant: String(tenantId) });
+      }
+    }
+    if (soloAdminScope && !adminScope?.isSuperAdmin && !sinTenant) {
+      // Incluye también sin municipio: el buscador por #caso debe hallarlos
+      andExacto.push({
+        $or: [
+          buildManagedMarkersFilter(adminScope),
+          { tenant: null },
+          { tenant: { $exists: false } },
+        ],
+      });
+    } else if (!soloAdminScope && !isScopeAdmin(adminScope)) {
+      andExacto.push({
+        $or: [
+          { createdBy: requester },
+          {
+            status: { $nin: ['pendiente_aprobacion', 'rechazado'] },
+            category: { $nin: ['familias', 'persona'] },
+          },
+        ],
+      });
+    }
+    if (mine === '1' || mine === 'true') {
+      const yo = normalizeUserId(requester);
+      if (yo && yo !== 'anonimo') {
+        andExacto.push({
+          $expr: {
+            $eq: [
+              { $toLower: { $ifNull: ['$createdBy', ''] } },
+              yo,
+            ],
+          },
+        });
+      } else {
+        andExacto.push({ createdBy: requester });
+      }
+    }
+    if (andExacto.length === 1) return andExacto[0];
+    return { $and: andExacto };
+  }
+
   const and = [];
 
   if (sinTenant) {
@@ -124,12 +183,24 @@ const buildListQuery = ({
 
     const cierre = String(tipoCierre || '').trim();
     if (cierre === 'resuelto') {
+      // Resuelto real: no mezclar derivaciones a oficina (familias / similares)
       and.push({ status: 'resuelto' });
+      and.push({
+        motivoEliminacion: { $not: { $regex: 'oficina', $options: 'i' } },
+      });
     } else if (cierre === 'anulado') {
       and.push({ status: 'rechazado' });
+      and.push({
+        motivoEliminacion: { $not: { $regex: 'oficina|vencimiento', $options: 'i' } },
+      });
     } else if (cierre === 'vencido') {
       and.push({
         motivoEliminacion: { $regex: 'vencimiento', $options: 'i' },
+      });
+    } else if (cierre === 'oficina') {
+      // Familias (y cierres equivalentes): oficina avisada → Registro
+      and.push({
+        motivoEliminacion: { $regex: 'oficina', $options: 'i' },
       });
     }
 
@@ -222,12 +293,26 @@ const buildListQuery = ({
   }
 
   if (mine === '1' || mine === 'true') {
-    and.push({ createdBy: requester });
+    // Case-insensitive: el dueño siempre ve lo suyo, aunque el caso esté en otra jurisdicción
+    const yo = normalizeUserId(requester);
+    if (yo && yo !== 'anonimo') {
+      and.push({
+        $expr: {
+          $eq: [
+            { $toLower: { $ifNull: ['$createdBy', ''] } },
+            yo,
+          ],
+        },
+      });
+    } else {
+      and.push({ createdBy: requester });
+    }
   }
 
-  // Mapa vecino: admin municipal acota a su municipio/comuna/provincia
+  // Mapa vecino: admin municipal acota a su municipio (no aplica si pide “solo mis reportes”)
   if (
     (myJurisdiction === '1' || myJurisdiction === 'true')
+    && !(mine === '1' || mine === 'true')
     && isScopeAdmin(adminScope)
     && !adminScope.isSuperAdmin
   ) {
@@ -250,6 +335,20 @@ const buildListQuery = ({
     and.push({ animalTipo });
   }
 
+  // Reportes municipales: sacar adopción / animal perdido (van al Radar entre vecinos)
+  const tiposAnimalExcluidos = String(excludeAnimalTipos || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => ANIMAL_TIPOS.includes(t));
+  if (tiposAnimalExcluidos.length) {
+    and.push({
+      $nor: [{
+        category: 'perros_gatos',
+        animalTipo: { $in: tiposAnimalExcluidos },
+      }],
+    });
+  }
+
   if (perdidaTipo && PERDIDA_TIPOS.includes(perdidaTipo)) {
     and.push({ perdidaTipo });
   }
@@ -259,32 +358,23 @@ const buildListQuery = ({
     and.push({ status });
   }
 
-  const texto = String(q || '').trim().replace(/^#/, '');
+  const texto = textoQ;
   if (texto) {
-    if (soloCaseId) {
-      if (/^\d+$/.test(texto)) {
-        and.push({ caseId: Number(texto) });
-      } else {
-        // Texto no numérico: no matchea ningún caso
-        and.push({ _id: { $exists: false } });
-      }
-    } else {
-      const orTexto = [
-        { description: { $regex: texto, $options: 'i' } },
-        { direccion: { $regex: texto, $options: 'i' } },
-        { objeto: { $regex: texto, $options: 'i' } },
-        { createdBy: { $regex: texto, $options: 'i' } },
-        { motivoEliminacion: { $regex: texto, $options: 'i' } },
-        { resolutionDescription: { $regex: texto, $options: 'i' } },
-      ];
-      if (/^\d+$/.test(texto)) {
-        orTexto.push({ caseId: Number(texto) });
-      }
-      if (mongoose.Types.ObjectId.isValid(texto) && String(texto).length === 24) {
-        orTexto.push({ _id: new mongoose.Types.ObjectId(texto) });
-      }
-      and.push({ $or: orTexto });
+    const orTexto = [
+      { description: { $regex: texto, $options: 'i' } },
+      { direccion: { $regex: texto, $options: 'i' } },
+      { objeto: { $regex: texto, $options: 'i' } },
+      { createdBy: { $regex: texto, $options: 'i' } },
+      { motivoEliminacion: { $regex: texto, $options: 'i' } },
+      { resolutionDescription: { $regex: texto, $options: 'i' } },
+    ];
+    if (/^\d+$/.test(texto)) {
+      orTexto.push({ caseId: Number(texto) });
     }
+    if (mongoose.Types.ObjectId.isValid(texto) && String(texto).length === 24) {
+      orTexto.push({ _id: new mongoose.Types.ObjectId(texto) });
+    }
+    and.push({ $or: orTexto });
   }
 
   if (!and.length) return {};
@@ -570,13 +660,23 @@ router.get('/', async (req, res) => {
       mine: (misPerdidas || cercaValido) ? undefined : req.query.mine,
       myJurisdiction: req.query.myJurisdiction,
       q: req.query.q,
+      // Mis reportes → Registro: mismos filtros de cierre/período que el admin
+      tipoCierre: (registroPropio || registroPerdidas) ? req.query.tipoCierre : undefined,
+      periodoDias: (registroPropio || registroPerdidas) ? req.query.periodoDias : undefined,
+      fechaDesde: (registroPropio || registroPerdidas) ? req.query.fechaDesde : undefined,
+      fechaHasta: (registroPropio || registroPerdidas) ? req.query.fechaHasta : undefined,
+      // Búsqueda exacta por #caso: ignora período / estado (igual que admin)
+      soloCaseId: req.query.soloCaseId === '1' || req.query.soloCaseId === 'true',
       soloAdminScope: false,
       soloEliminados: registroPropio || registroPerdidas,
     });
 
     if (cercaValido) {
-      const deltaLat = nearRadius / 111320;
-      const deltaLng = nearRadius / (111320 * Math.max(0.2, Math.cos((nearLat * Math.PI) / 180)));
+      // Bounding box un poco holgado (×1.2) para no cortar el borde del círculo geodésico
+      const margen = 1.2;
+      const deltaLat = (nearRadius * margen) / 111320;
+      const deltaLng = (nearRadius * margen)
+        / (111320 * Math.max(0.2, Math.cos((nearLat * Math.PI) / 180)));
       const animalTiposOk = ['perdido', 'abandonado', 'adopcion'];
       const animalTipoQ = String(req.query.animalTipo || '').trim();
       let cercaCategoriaFiltro;
@@ -640,8 +740,9 @@ router.get('/', async (req, res) => {
       .populate('tenant', JURISDICTION_FIELDS);
 
     if (cercaValido) {
-      // Traemos un poco de más y ordenamos por distancia en memoria
-      markersQuery = markersQuery.limit(Math.min(LIMITE_MAX, limit * 3));
+      // Candidatos del bbox sin tope chico: si limitás antes del Haversine,
+      // al agrandar el radio Mongo devuelve 100 al azar y faltan pines dentro del círculo.
+      markersQuery = markersQuery.limit(2000);
     } else {
       markersQuery = markersQuery
         .sort((registroPropio || registroPerdidas) ? { eliminadoAt: -1, createdAt: -1 } : { createdAt: -1 })
@@ -673,7 +774,8 @@ router.get('/', async (req, res) => {
         if (markerOwner === yo) return true;
         return (marker.claims || []).some((c) => normalizeUserId(c.userId) === yo);
       }
-      if (registroPropio) {
+      // Mis reportes / registro propio: siempre los del dueño (aunque el admin no gestione ese municipio)
+      if (mineOn || registroPropio) {
         return markerOwner === requester;
       }
       // "Mi jurisdicción": solo casos que el admin puede gestionar
@@ -693,16 +795,16 @@ router.get('/', async (req, res) => {
     if (cercaValido) {
       visibles.sort((a, b) => (a._distanciaMetros || 0) - (b._distanciaMetros || 0));
       const totalCerca = visibles.length;
-      visibles = visibles.slice(skip, skip + limit);
+      // Devolver todos los del círculo (ya filtrados); el front pagina en cliente si hace falta
       return res.json({
         items: visibles.map((marker) => ({
           ...sanitizeMarkerResponse(marker, adminScope, requester),
           distanciaMetros: Math.round(marker._distanciaMetros || 0),
         })),
         total: totalCerca,
-        page,
-        limit,
-        hasMore: skip + limit < totalCerca,
+        page: 1,
+        limit: totalCerca,
+        hasMore: false,
         lat: nearLat,
         lng: nearLng,
         radius: nearRadius,
@@ -815,6 +917,9 @@ router.post('/', upload.single('image'), async (req, res) => {
     } else if (savedMarker.status === 'pendiente') {
       avisarVecinosCercanos(savedMarker).catch((err) => {
         console.error('No se pudo avisar vecinos cerca:', err.message);
+      });
+      avisarComplementosPerdidaCercanos(savedMarker).catch((err) => {
+        console.error('No se pudo avisar complementos de pérdida:', err.message);
       });
     }
     res.status(201).json(sanitizeMarkerResponse(savedMarker, adminScope, createdBy));
@@ -987,10 +1092,24 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
     const conGeo = (extra) => (
       req.adminScope.isSuperAdmin ? extra : { $and: [geo, extra] }
     );
-    // Reportes / Cosas perdidas activos (sin por aprobar / cierre pendiente / rechazados)
+    // Activos en mapa (alineado a listas Reportes / Cosas): sin por aprobar / cierre / rechazados
+    // y sin derivados (avisadoAt) — esos van solo a la sección Derivados
     const publicados = {
       eliminadoAt: null,
       status: { $nin: ['pendiente_aprobacion', 'rechazado', 'pendiente_cierre'] },
+      $or: [
+        { avisadoAt: null },
+        { avisadoAt: { $exists: false } },
+      ],
+    };
+    // Reportes = intervención municipal (no adopción / animal perdido del Radar)
+    const filtroColaReportes = {
+      ...publicados,
+      category: { $ne: 'cosas_perdidas' },
+      $nor: [{
+        category: 'perros_gatos',
+        animalTipo: { $in: ['adopcion', 'perdido'] },
+      }],
     };
     // Cuadrilla: contadores solo de reparaciones
     const soloReparaciones = esOperario ? { category: 'reparaciones' } : {};
@@ -999,16 +1118,28 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
       category: 'reparaciones',
       status: { $in: ['pendiente', 'en_proceso'] },
       'confirmations.0': { $exists: true },
+      $or: [
+        { avisadoAt: null },
+        { avisadoAt: { $exists: false } },
+      ],
     });
     const resolucionFiltro = conGeo({
       eliminadoAt: null,
       resolvedBy: { $nin: [null, ''] },
       status: { $ne: 'resuelto' },
+      $or: [
+        { avisadoAt: null },
+        { avisadoAt: { $exists: false } },
+      ],
     });
     const respuestasFiltro = conGeo({
       eliminadoAt: null,
       respuestaDatosAt: { $ne: null },
       status: { $nin: ['resuelto', 'rechazado'] },
+      $or: [
+        { avisadoAt: null },
+        { avisadoAt: { $exists: false } },
+      ],
     });
     const [
       total,
@@ -1028,16 +1159,15 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
       nuevosDerivados,
     ] = await Promise.all([
       Marker.countDocuments(conGeo({ ...publicados })),
-      Marker.countDocuments(conGeo({ ...publicados, category: { $ne: 'cosas_perdidas' } })),
+      Marker.countDocuments(conGeo(filtroColaReportes)),
       Marker.countDocuments(conGeo({ ...publicados, category: 'cosas_perdidas' })),
       Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente_aprobacion' })),
       Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente', ...soloReparaciones })),
       Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'en_proceso', ...soloReparaciones })),
       Marker.countDocuments(conGeo({ eliminadoAt: { $ne: null } })),
       Marker.countDocuments(conGeo({
-        ...publicados,
+        ...filtroColaReportes,
         nuevoParaAdmin: true,
-        category: { $ne: 'cosas_perdidas' },
       })),
       Marker.countDocuments(conGeo({
         ...publicados,
@@ -1117,6 +1247,10 @@ router.patch('/admin/marcar-vistos', requireStaff, async (req, res) => {
       base.category = 'cosas_perdidas';
     } else if (seccion === 'reportes') {
       base.category = { $ne: 'cosas_perdidas' };
+      base.$nor = [{
+        category: 'perros_gatos',
+        animalTipo: { $in: ['adopcion', 'perdido'] },
+      }];
     } else {
       return res.status(400).json({ message: 'Indicá la sección: reportes, cosas_perdidas o derivados' });
     }
@@ -1157,6 +1291,7 @@ router.get('/admin', requireStaff, async (req, res) => {
       category: req.query.category,
       excludeCategory: req.query.excludeCategory,
       animalTipo: req.query.animalTipo,
+      excludeAnimalTipos: req.query.excludeAnimalTipos,
       perdidaTipo: req.query.perdidaTipo,
       status: statusQuery,
       mine: req.query.mine,
@@ -1208,7 +1343,17 @@ router.get('/admin', requireStaff, async (req, res) => {
       }
     }
 
+    // Cola FIFO: pendientes (sin colaAdminAt) vs diferidos (omitidos / avisados a cuadrilla)
+    const cola = String(req.query.cola || '').trim();
+    if (cola === 'pendientes' || cola === 'diferidos') {
+      const condCola = cola === 'pendientes'
+        ? { $or: [{ colaAdminAt: null }, { colaAdminAt: { $exists: false } }] }
+        : { colaAdminAt: { $ne: null } };
+      filtroFinal = { $and: [filtroFinal, condCola] };
+    }
+
     // Cola FIFO (más antiguos primero). En bandejas activas: no vistos arriba, luego FIFO.
+    // Tras avisar/omitir, colaAdminAt empuja el caso (nulls primero si se listan todos).
     // Registro: los cierres más recientes primero.
     let orden;
     if (soloEliminados) {
@@ -1217,8 +1362,10 @@ router.get('/admin', requireStaff, async (req, res) => {
       orden = { createdAt: 1 };
     } else if (atencion === 'derivados') {
       orden = { nuevoDerivadoParaAdmin: -1, createdAt: 1 };
+    } else if (cola === 'diferidos') {
+      orden = { colaAdminAt: 1, createdAt: 1 };
     } else {
-      orden = { nuevoParaAdmin: -1, createdAt: 1 };
+      orden = { nuevoParaAdmin: -1, colaAdminAt: 1, createdAt: 1 };
     }
 
     const [total, markers] = await Promise.all([
@@ -1519,6 +1666,30 @@ router.patch('/admin/:id/reabrir-cierre', requireJurisdictionAdmin, async (req, 
   }
 });
 
+// Admin omite el caso por ahora → va al final de la cola FIFO (sin cambiar estado)
+router.patch('/admin/:id/omitir-cola', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (['resuelto', 'rechazado', 'pendiente_aprobacion'].includes(marker.status)) {
+      return res.status(400).json({ message: 'Este caso no está en la cola activa' });
+    }
+    marker.colaAdminAt = new Date();
+    marker.nuevoParaAdmin = false;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Admin → cuadrilla: instrucción o pedido de info (campanita al operario)
 router.patch('/admin/:id/avisar-cuadrilla', requireJurisdictionAdmin, async (req, res) => {
   try {
@@ -1545,6 +1716,9 @@ router.patch('/admin/:id/avisar-cuadrilla', requireJurisdictionAdmin, async (req
     marker.notaCuadrilla = mensaje;
     marker.notaCuadrillaAt = new Date();
     marker.notaCuadrillaPor = req.requester;
+    // Vuelve al final de la cola admin (FIFO): ya se pidió movimiento a la cuadrilla
+    marker.colaAdminAt = new Date();
+    marker.nuevoParaAdmin = false;
     // Nuevo pedido: limpia la respuesta anterior
     marker.respuestaCuadrilla = '';
     marker.respuestaCuadrillaAt = null;
@@ -1801,6 +1975,9 @@ router.patch('/admin/:id/approve', requireJurisdictionAdmin, async (req, res) =>
     });
     avisarVecinosCercanos(updatedMarker).catch((err) => {
       console.error('No se pudo avisar vecinos cerca:', err.message);
+    });
+    avisarComplementosPerdidaCercanos(updatedMarker).catch((err) => {
+      console.error('No se pudo avisar complementos de pérdida:', err.message);
     });
     res.json(sanitizeMarkerResponse(updatedMarker, req.adminScope, req.requester));
   } catch (error) {

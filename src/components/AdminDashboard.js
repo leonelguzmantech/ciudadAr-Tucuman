@@ -20,6 +20,11 @@ const SECCIONES_ADMIN = new Set([
   'operarios',
 ]);
 const ATENCIONES_OK = new Set(['urgentes', 'resolucion', 'respuestas', 'cierres', 'derivados']);
+const COLA_OPTIONS = [
+  { value: 'pendientes', label: 'Por atender' },
+  { value: 'diferidos', label: 'Diferidos' },
+  { value: 'todos', label: 'Todos' },
+];
 
 const leerVistaAdminGuardada = () => {
   try {
@@ -184,6 +189,7 @@ const REGISTRO_TIPO_CIERRE = [
   { value: 'resuelto', label: 'Resuelto' },
   { value: 'anulado', label: 'Anulado' },
   { value: 'vencido', label: 'Vencido' },
+  { value: 'oficina', label: 'Oficina avisada' },
   { value: '', label: 'Todo tipo de cierre' },
 ];
 
@@ -193,6 +199,14 @@ const REGISTRO_CATEGORIA = [
   { value: 'familias', label: 'Familias' },
   { value: 'cosas_perdidas', label: 'Cosas perdidas' },
   { value: '', label: 'Todas las categorías' },
+];
+
+const POR_APROBAR_CATEGORIA = [
+  { value: '', label: 'Todas las categorías' },
+  { value: 'reparaciones', label: 'Reparaciones' },
+  { value: 'familias', label: 'Familias' },
+  { value: 'perros_gatos', label: 'Perros y gatos' },
+  { value: 'cosas_perdidas', label: 'Cosas perdidas' },
 ];
 
 const REGISTRO_PERIODO = [
@@ -462,6 +476,9 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
 
   const cerrarFichaCaso = useCallback(() => {
     caseNumberFocoRef.current = null;
+    // Limpiar búsqueda: si queda el #caso, la lista exacta vuelve a abrir la ficha
+    setBusqueda('');
+    setBusquedaDebounced('');
     setCasoDetalle(null);
     setCasoId(null);
     setVerResolucion(false);
@@ -481,12 +498,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     return () => window.clearTimeout(t);
   }, []);
   const [filtroEstado, setFiltroEstado] = useState(vistaInicial.estado || 'pendiente');
+  const [filtroCola, setFiltroCola] = useState('pendientes');
   const [filtroAtencion, setFiltroAtencion] = useState(vistaInicial.atencion || '');
   const [filtroRegistroTipo, setFiltroRegistroTipo] = useState(vistaInicial.registroTipo);
   const [filtroRegistroCategoria, setFiltroRegistroCategoria] = useState(vistaInicial.registroCategoria);
   const [filtroRegistroPeriodo, setFiltroRegistroPeriodo] = useState(vistaInicial.registroPeriodo);
   const [filtroRegistroDesde, setFiltroRegistroDesde] = useState('');
   const [filtroRegistroHasta, setFiltroRegistroHasta] = useState('');
+  const [filtroPorAprobarCategoria, setFiltroPorAprobarCategoria] = useState('');
   const [filtroSinTenant, setFiltroSinTenant] = useState(!!vistaInicial.sinTenant);
   const [filtroTenantId, setFiltroTenantId] = useState(
     vistaInicial.tenantId != null ? vistaInicial.tenantId : ''
@@ -575,12 +594,26 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
 
   const paramsLista = useMemo(() => {
     const params = { page, limit: 20 };
+    const qLimpio = String(busquedaDebounced || '').trim().replace(/^#/, '');
+    const esBusquedaCaseId = /^\d+$/.test(qLimpio);
     const aplicarTenant = () => {
       if (!filtroSinTenant && filtroTenantId) params.tenantId = filtroTenantId;
     };
+    // #caso exacto: no aplicar estado / período / atención (el backend solo usa caseId + jurisdicción)
+    if (esBusquedaCaseId) {
+      params.q = qLimpio;
+      params.soloCaseId = 1;
+      if (filtroSinTenant) params.sinTenant = 1;
+      else aplicarTenant();
+      return params;
+    }
     if (!filtroSinTenant) {
       if (seccion === 'cosas_perdidas') params.category = 'cosas_perdidas';
-      if (seccion === 'reportes') params.excludeCategory = 'cosas_perdidas';
+      if (seccion === 'reportes') {
+        // Cola municipal: sin cosas perdidas ni adopción / animal perdido (Radar)
+        params.excludeCategory = 'cosas_perdidas';
+        params.excludeAnimalTipos = 'adopcion,perdido';
+      }
     }
     // Registro: archivo histórico con filtros de búsqueda
     if (seccion === 'registro') {
@@ -599,18 +632,13 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         params.periodoDias = filtroRegistroPeriodo;
       }
       aplicarTenant();
-      if (busquedaDebounced) {
-        params.q = busquedaDebounced;
-        // Si escriben solo el número (#30), buscar por caseId exacto
-        if (/^\d+$/.test(String(busquedaDebounced).trim())) {
-          params.soloCaseId = 1;
-        }
-      }
+      if (busquedaDebounced) params.q = busquedaDebounced;
       return params;
     }
-    // Por aprobar: solo pendientes de revisión
+    // Por aprobar: solo pendientes de revisión (+ categoría opcional)
     if (seccion === 'por_aprobar') {
       params.status = 'pendiente_aprobacion';
+      if (filtroPorAprobarCategoria) params.category = filtroPorAprobarCategoria;
       aplicarTenant();
       if (busquedaDebounced) params.q = busquedaDebounced;
       return params;
@@ -647,6 +675,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       // Reportes / Cosas: no mezclar casos ya derivados a oficina
       if (seccion === 'reportes' || seccion === 'cosas_perdidas') {
         params.excludeAvisados = 1;
+        if (filtroCola && filtroCola !== 'todos') params.cola = filtroCola;
       }
       aplicarTenant();
     }
@@ -656,12 +685,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     seccion,
     page,
     filtroEstado,
+    filtroCola,
     filtroAtencion,
     filtroRegistroTipo,
     filtroRegistroCategoria,
     filtroRegistroPeriodo,
     filtroRegistroDesde,
     filtroRegistroHasta,
+    filtroPorAprobarCategoria,
     filtroTenantId,
     filtroSinTenant,
     busquedaDebounced,
@@ -762,7 +793,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     } finally {
       setCargando(false);
     }
-  }, [userId, headers, paramsLista, seccion, casoId, cargarAuthYStats]);
+  }, [userId, headers, paramsLista, seccion, casoId, cargarAuthYStats, filtroSinTenant]);
 
   useEffect(() => {
     cargarAuthYStats();
@@ -775,12 +806,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   }, [
     seccion,
     filtroEstado,
+    filtroCola,
     filtroAtencion,
     filtroRegistroTipo,
     filtroRegistroCategoria,
     filtroRegistroPeriodo,
     filtroRegistroDesde,
     filtroRegistroHasta,
+    filtroPorAprobarCategoria,
     filtroTenantId,
     filtroSinTenant,
     busquedaDebounced,
@@ -837,35 +870,51 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     if (sec === 'cosas_perdidas') {
       if (m.eliminadoAt || m.status === 'pendiente_aprobacion' || m.status === 'rechazado') return false;
       if (m.avisadoAt) return false;
+      if (filtroCola === 'pendientes' && m.colaAdminAt) return false;
+      if (filtroCola === 'diferidos' && !m.colaAdminAt) return false;
       return m.category === 'cosas_perdidas';
     }
     if (sec === 'reportes') {
       if (m.eliminadoAt || m.status === 'pendiente_aprobacion' || m.status === 'rechazado') return false;
       if (m.category === 'cosas_perdidas') return false;
+      if (m.category === 'perros_gatos'
+        && (m.animalTipo === 'adopcion' || m.animalTipo === 'perdido')) {
+        return false;
+      }
       if (m.avisadoAt) return false;
       if (filtroEstado && m.status !== filtroEstado) return false;
+      if (filtroCola === 'pendientes' && m.colaAdminAt) return false;
+      if (filtroCola === 'diferidos' && !m.colaAdminAt) return false;
       return true;
     }
     return true;
-  }, [seccion, filtroEstado]);
+  }, [seccion, filtroEstado, filtroCola]);
 
-  const actualizarLocal = (actualizado) => {
+  const actualizarLocal = (actualizado, { alFinal = false } = {}) => {
     const merged = { ...actualizado, canManage: true };
+    const idMerged = String(merged._id || '');
+    const saleDeLaSeccion = !perteneceASeccion(merged);
     setMarkers((prev) => {
-      if (!perteneceASeccion(merged)) {
-        return prev.filter((m) => m._id !== merged._id);
+      if (saleDeLaSeccion) {
+        return prev.filter((m) => String(m._id) !== idMerged);
       }
-      const existe = prev.some((m) => m._id === merged._id);
-      if (!existe) return [merged, ...prev];
-      return prev.map((m) => (m._id === merged._id ? { ...m, ...merged } : m));
+      const resto = prev.filter((m) => String(m._id) !== idMerged);
+      const anterior = prev.find((m) => String(m._id) === idMerged);
+      const item = anterior ? { ...anterior, ...merged } : merged;
+      // Tras avisar a la cuadrilla: al final de la cola (como en el servidor)
+      if (alFinal) return [...resto, item];
+      if (!anterior) return [item, ...prev];
+      return prev.map((m) => (String(m._id) === idMerged ? item : m));
     });
     setCasoDetalle((prev) => {
-      if (!prev || prev._id !== merged._id) return prev;
-      if (!perteneceASeccion(merged)) return null;
+      if (!prev || String(prev._id) !== idMerged) return prev;
+      if (saleDeLaSeccion) return null;
       return { ...prev, ...merged };
     });
-    if (!perteneceASeccion(merged) && casoId === merged._id) {
+    // Cerrar ficha y quedarse en la cola (no saltar a Registro / otra sección)
+    if (saleDeLaSeccion && String(casoId || '') === idMerged) {
       setCasoId(null);
+      setMapaCaso(null);
     }
     cargarAuthYStats();
   };
@@ -913,19 +962,24 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     const cargarFicha = async () => {
       try {
         let found = null;
-        if (casoId) {
+        const buscarAdmin = async (extra) => {
           const { data } = await axios.get(`${API}/api/markers/admin`, {
             headers,
-            params: { ...baseParams, q: String(casoId) },
+            params: { ...baseParams, ...extra },
           });
-          found = pick(data.items, casoId, nroPendiente);
+          return pick(data.items, casoId, nroPendiente);
+        };
+        if (casoId) {
+          found = await buscarAdmin({ q: String(casoId) });
+          if (!found && filtroSinTenant) {
+            found = await buscarAdmin({ q: String(casoId), sinTenant: 1 });
+          }
         }
         if (!found && nroPendiente) {
-          const { data } = await axios.get(`${API}/api/markers/admin`, {
-            headers,
-            params: { ...baseParams, q: String(nroPendiente) },
-          });
-          found = pick(data.items, casoId, nroPendiente);
+          found = await buscarAdmin({ q: String(nroPendiente), soloCaseId: 1 });
+          if (!found) {
+            found = await buscarAdmin({ q: String(nroPendiente), soloCaseId: 1, sinTenant: 1 });
+          }
         }
         if (cancelado) return;
         if (found) {
@@ -957,7 +1011,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     };
     cargarFicha();
     return () => { cancelado = true; };
-  }, [casoId, markers, headers, seccion]);
+  }, [casoId, markers, headers, seccion, filtroSinTenant]);
 
   // Al abrir una ficha con respuesta de datos, marcarla vista (baja el indicador)
   useEffect(() => {
@@ -1107,6 +1161,27 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   const pedirDatos = (marker = caso) => abrirDialogo('pedir_datos', marker);
   const avisarCuadrilla = (marker = caso) => abrirDialogo('avisar_cuadrilla', marker);
 
+  const omitirCola = async (marker = caso) => {
+    if (!marker || accionando) return;
+    setAccionando(true);
+    try {
+      const { data } = await axios.patch(
+        `${API}/api/markers/admin/${marker._id}/omitir-cola`,
+        {},
+        { headers }
+      );
+      actualizarLocal(data, { alFinal: true });
+      setCasoId(null);
+      setCasoDetalle(null);
+      setMapaCaso(null);
+      mostrarAviso('Omitido · pasó al final de la cola');
+    } catch (err) {
+      mostrarAviso(err.response?.data?.message || 'No se pudo omitir');
+    } finally {
+      setAccionando(false);
+    }
+  };
+
   const confirmarCierreCuadrilla = async (marker = caso) => {
     if (!marker || accionando) return;
     setAccionando(true);
@@ -1118,7 +1193,6 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       );
       actualizarLocal(data);
       mostrarAviso(`Caso #${data.caseId} confirmado · pasó al Registro`);
-      irSeccion('registro');
     } catch (err) {
       mostrarAviso(err.response?.data?.message || 'No se pudo confirmar');
     } finally {
@@ -1129,7 +1203,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   const reabrirCierreCuadrilla = (marker = caso) => abrirDialogo('reabrir_cierre', marker);
 
   const cargarOperarios = useCallback(async () => {
-    if (!userId || roleInfo.role === 'SUPER_ADMIN') return;
+    if (!userId) return;
     try {
       const { data } = await axios.get(`${API}/api/markers/admin/operarios`, { headers });
       setOperariosLista(data.items || []);
@@ -1141,7 +1215,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       setOperariosLista([]);
       setOperariosTenants([]);
     }
-  }, [userId, headers, roleInfo.role, nuevoOperarioTenantId]);
+  }, [userId, headers, nuevoOperarioTenantId]);
 
   useEffect(() => {
     if (seccion === 'operarios') cargarOperarios();
@@ -1232,8 +1306,8 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           { mensaje: texto },
           { headers }
         );
-        actualizarLocal(data);
-        mostrarAviso('Aviso enviado a la cuadrilla');
+        actualizarLocal(data, { alFinal: true });
+        mostrarAviso('Aviso enviado · el caso pasó al final de la cola');
       } else if (tipo === 'reabrir_cierre') {
         const { data } = await axios.patch(
           `${API}/api/markers/admin/${marker._id}/reabrir-cierre`,
@@ -1254,7 +1328,6 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         setDialogo(null);
         setDialogoTexto('');
         mostrarAviso(`Caso #${data.caseId || marker.caseId} cerrado · pasó al Registro`);
-        irSeccion('registro');
         return;
       } else if (tipo === 'anular' || tipo === 'no_aprobar') {
         const { data } = await axios.patch(
@@ -1270,8 +1343,6 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
             ? 'Caso no aprobado · pasó al Registro'
             : 'Caso anulado · pasó al Registro'
         );
-        irSeccion('registro');
-        setFiltroRegistroTipo('anulado');
         return;
       }
       setDialogo(null);
@@ -1309,12 +1380,10 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         || marker.category === 'familias' || marker.category === 'persona';
       if (esFamilia && data.eliminadoAt) {
         mostrarAviso(`Caso #${data.caseId || marker.caseId}: oficina avisada · pasó al Registro`);
-        irSeccion('registro');
         return;
       }
-      // Abandonados: siguen en el mapa → Derivados
-      mostrarAviso(`Caso #${data.caseId || marker.caseId}: oficina avisada · sigue en el mapa`);
-      irSeccion('derivados');
+      // Abandonados: siguen en el mapa (Derivados); nos quedamos en la cola actual
+      mostrarAviso(`Caso #${data.caseId || marker.caseId}: oficina avisada · pasó a Derivados`);
       return;
     } catch (err) {
       setDialogoError(err.response?.data?.message || 'No se pudo registrar el aviso');
@@ -1398,21 +1467,33 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   : `Mostrando ${lista.length} de ${meta.total} casos${meta.hasMore ? ' · usá filtros o pasá de página' : ''}`}
           </p>
         </div>
-        {(seccion !== 'por_aprobar' || esSuperOperando) && (
-          <div className="admin-dash-filtros">
+        <div className="admin-dash-filtros">
             <input
               type="search"
               placeholder={
-                seccion === 'registro' && esSuperOperando
-                  ? 'Buscar por #caso…'
-                  : seccion === 'registro'
-                    ? 'Buscar #caso, zona, objeto, motivo…'
-                    : 'Buscar #caso…'
+                seccion === 'por_aprobar'
+                  ? 'Buscar #caso…'
+                  : seccion === 'registro' && esSuperOperando
+                    ? 'Buscar por #caso…'
+                    : seccion === 'registro'
+                      ? 'Buscar #caso, zona, objeto, motivo…'
+                      : 'Buscar #caso…'
               }
               value={busqueda}
               onChange={(e) => setBusqueda(e.target.value)}
             />
             {esSuperOperando && !filtroSinTenant && selectJurisdiccionSuper}
+            {seccion === 'por_aprobar' && (
+              <select
+                value={filtroPorAprobarCategoria}
+                onChange={(e) => setFiltroPorAprobarCategoria(e.target.value)}
+                aria-label="Categoría"
+              >
+                {POR_APROBAR_CATEGORIA.map((opt) => (
+                  <option key={opt.value || 'todas'} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            )}
             {seccion === 'registro' && (
               <>
                 <select
@@ -1474,6 +1555,17 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                 )}
               </>
             )}
+            {(seccion === 'reportes' || seccion === 'cosas_perdidas') && !filtroAtencion && (
+              <select
+                value={filtroCola}
+                onChange={(e) => setFiltroCola(e.target.value)}
+                aria-label="Cola"
+              >
+                {COLA_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            )}
             {seccion !== 'registro'
               && seccion !== 'por_aprobar'
               && seccion !== 'derivados'
@@ -1512,17 +1604,22 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
               </button>
             )}
           </div>
-        )}
       </header>
       {cargando ? (
         <p className="admin-dash-vacio">Cargando casos…</p>
       ) : !lista.length ? (
         <p className="admin-dash-vacio">
           {seccion === 'por_aprobar'
-            ? 'No hay nada para aprobar por ahora.'
+            ? (busquedaDebounced || filtroPorAprobarCategoria
+              ? 'Ningún caso por aprobar coincide con esos filtros.'
+              : 'No hay nada para aprobar por ahora.')
             : seccion === 'registro'
               ? 'No hay casos en el registro.'
-              : 'No hay casos con esos filtros.'}
+              : ((seccion === 'reportes' || seccion === 'cosas_perdidas') && filtroCola === 'pendientes'
+                ? 'No quedan casos por atender · cambiá a Diferidos si querés retomar omitidos o avisados'
+                : ((seccion === 'reportes' || seccion === 'cosas_perdidas') && filtroCola === 'diferidos'
+                  ? 'No hay casos diferidos'
+                  : 'No hay casos con esos filtros.'))}
         </p>
       ) : (
         <>
@@ -1655,13 +1752,13 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
             <IconoReportes /> Reportes
             {stats.nuevosReportes > 0 && <em className="admin-dash-tab-badge">{stats.nuevosReportes}</em>}
           </button>
-          <button type="button" className={navActivo('cosas_perdidas') ? 'activo' : ''} onClick={() => irSeccion('cosas_perdidas')}>
-            <IconoPerdidas /> Cosas perdidas
-            {stats.nuevasPerdidas > 0 && <em className="admin-dash-tab-badge">{stats.nuevasPerdidas}</em>}
-          </button>
           <button type="button" className={navActivo('por_aprobar') ? 'activo' : ''} onClick={() => irSeccion('por_aprobar')}>
             <IconoCheck /> Por aprobar
             {stats.porAprobar > 0 && <em className="admin-dash-tab-badge">{stats.porAprobar}</em>}
+          </button>
+          <button type="button" className={navActivo('cosas_perdidas') ? 'activo' : ''} onClick={() => irSeccion('cosas_perdidas')}>
+            <IconoPerdidas /> Cosas perdidas
+            {stats.nuevasPerdidas > 0 && <em className="admin-dash-tab-badge">{stats.nuevasPerdidas}</em>}
           </button>
           <button type="button" className={navActivo('derivados') ? 'activo' : ''} onClick={() => irSeccion('derivados')}>
             <IconoDerivados /> Derivados
@@ -1672,7 +1769,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           <button type="button" className={navActivo('registro') ? 'activo' : ''} onClick={() => irSeccion('registro')}>
             <IconoRegistro /> Registro
           </button>
-          {roleInfo.role === 'JURISDICTION_ADMIN' && (
+          {(roleInfo.role === 'JURISDICTION_ADMIN' || roleInfo.role === 'SUPER_ADMIN' || onVolverSuper) && (
             <button type="button" className={navActivo('operarios') ? 'activo' : ''} onClick={() => irSeccion('operarios')}>
               <IconoCuadrilla /> Cuadrilla
             </button>
@@ -1692,7 +1789,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           <button
             type="button"
             className="admin-dash-sidebar-salir"
-            onClick={() => signOut(auth).catch(() => {})}
+            onClick={() => {
+              try {
+                sessionStorage.removeItem(ADMIN_VISTA_KEY);
+                sessionStorage.removeItem('ciudadar-super-casos-foco');
+                sessionStorage.setItem('ciudadar-vista-admin', 'dashboard');
+              } catch { /* ignore */ }
+              signOut(auth).catch(() => {});
+            }}
           >
             <IconoSalir /> Cerrar sesión
           </button>
@@ -1885,6 +1989,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                       && caso.status !== 'rechazado' && (
                       <button type="button" className="admin-dash-btn" onClick={() => avisarCuadrilla()} disabled={accionando}>
                         <IconoCuadrilla /> Avisar a cuadrilla
+                      </button>
+                    )}
+                    {caso.status !== 'pendiente_aprobacion'
+                      && caso.status !== 'resuelto'
+                      && caso.status !== 'rechazado'
+                      && !caso.eliminadoAt && (
+                      <button type="button" className="admin-dash-btn" onClick={() => omitirCola()} disabled={accionando}>
+                        Omitir · al final
                       </button>
                     )}
                     {caso.category === 'reparaciones'
@@ -2169,8 +2281,9 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                 <div>
                   <h1>Cuadrilla / Operarios</h1>
                   <p>
-                    Dan de alta a quienes van al terreno. Pueden tomar casos, pedir datos y proponer cierre;
-                    vos confirmás el cierre.
+                    {esSuperOperando
+                      ? 'Alta y baja de operarios por municipio. Pueden tomar casos, pedir datos y proponer cierre.'
+                      : 'Dan de alta a quienes van al terreno. Pueden tomar casos, pedir datos y proponer cierre; vos confirmás el cierre.'}
                   </p>
                 </div>
               </header>
@@ -2197,7 +2310,11 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                 </button>
               </form>
               {operariosLista.length === 0 ? (
-                <p className="admin-dash-vacio">Todavía no hay operarios en tu jurisdicción.</p>
+                <p className="admin-dash-vacio">
+                  {esSuperOperando
+                    ? 'Todavía no hay operarios en ningún municipio.'
+                    : 'Todavía no hay operarios en tu jurisdicción.'}
+                </p>
               ) : (
                 <ul className="super-lista">
                   {operariosLista.map((o) => (
@@ -2273,14 +2390,22 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
 
               <section className="admin-dash-bloque">
                 <h2>Resumen</h2>
-                <div className="admin-dash-stats admin-dash-stats-3">
-                  <button type="button" onClick={() => irSeccion('reportes')}>
+                <div className="admin-dash-stats admin-dash-stats-4">
+                  <button
+                    type="button"
+                    className="admin-dash-stat-principal"
+                    onClick={() => irSeccion('reportes')}
+                  >
                     <strong>{stats.reportes || 0}</strong>
                     <span>Reportes</span>
                   </button>
                   <button type="button" onClick={() => irSeccion('cosas_perdidas')}>
                     <strong>{stats.perdidas || 0}</strong>
                     <span>Cosas perdidas</span>
+                  </button>
+                  <button type="button" onClick={() => irSeccion('derivados')}>
+                    <strong>{stats.derivados || 0}</strong>
+                    <span>Derivados</span>
                   </button>
                   <button type="button" onClick={() => irSeccion('registro')}>
                     <strong>{stats.registro || 0}</strong>

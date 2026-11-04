@@ -15,6 +15,15 @@ const IconoFiltros = () => (
   </svg>
 );
 
+const IconoReportar = () => (
+  <svg className="sidebar-icono" viewBox="0 0 24 24" aria-hidden="true">
+    <path
+      fill="currentColor"
+      d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"
+    />
+  </svg>
+);
+
 const IconoReportes = () => (
   <svg className="sidebar-icono" viewBox="0 0 24 24" aria-hidden="true">
     <path
@@ -82,6 +91,7 @@ const Barra = ({
   conSidebar = false,
   esAdmin = false,
   esOperario = false,
+  onReportar,
   onMisReportes,
   onCosasPerdidas,
   onFiltros,
@@ -106,6 +116,12 @@ const Barra = ({
   const cerrarSesion = () => {
     setMenuMovilAbierto(false);
     setMostrarPerfil(false);
+    try {
+      sessionStorage.removeItem('ciudadar-mis-reportes-vista');
+      sessionStorage.removeItem('ciudadar-radar-vista');
+    } catch {
+      /* ignore */
+    }
     signOut(auth).catch((error) => {
       console.error('Error al cerrar sesión:', error);
     });
@@ -148,6 +164,19 @@ const Barra = ({
             <span className="sidebar-item-contenido">
               <IconoFiltros />
               Filtros
+            </span>
+          </button>
+          <button
+            type="button"
+            className="sidebar-item"
+            onClick={() => {
+              setMenuMovilAbierto(false);
+              if (onReportar) onReportar();
+            }}
+          >
+            <span className="sidebar-item-contenido">
+              <IconoReportar />
+              Reportar
             </span>
           </button>
           <button

@@ -48,6 +48,8 @@ const markerSchema = new mongoose.Schema({
   notaCuadrilla: { type: String, default: '' },
   notaCuadrillaAt: { type: Date, default: null },
   notaCuadrillaPor: { type: String, default: null },
+  // Cola admin (FIFO): al avisar cuadrilla se actualiza → el caso va al final
+  colaAdminAt: { type: Date, default: null, index: true },
   // Respuesta de la cuadrilla al último aviso del admin
   respuestaCuadrilla: { type: String, default: '' },
   respuestaCuadrillaAt: { type: Date, default: null },

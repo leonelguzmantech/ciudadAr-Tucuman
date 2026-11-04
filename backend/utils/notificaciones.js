@@ -1,4 +1,5 @@
 const Notificacion = require('../models/notificacion');
+const Marker = require('../models/marker');
 const Tenant = require('../models/tenant');
 const Usuario = require('../models/usuario');
 const adminsGlobales = require('../config/admins');
@@ -6,6 +7,9 @@ const { normalizeUserId } = require('./users');
 
 const RADIO_CERCA_DEFAULT_M = 2500;
 const MAX_AVISOS_CERCA = 80;
+/** Radio para cruzar “perdí” ↔ “encontré” (sin zona vigilada) */
+const RADIO_COMPLEMENTO_PERDIDA_M = 2500;
+const MAX_AVISOS_COMPLEMENTO = 40;
 
 const distanciaMetros = (lat1, lng1, lat2, lng2) => {
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -397,6 +401,87 @@ const avisarVecinosCercanos = async (marker, { radioMetros = RADIO_CERCA_DEFAULT
   return creadas;
 };
 
+/**
+ * Si publicás “encontré”, avisá a quienes tienen un “perdí” activo cerca de ese pin
+ * (y al revés). No depende de zona vigilada ni de estar en el lugar:
+ * el dueño del aviso complementario recibe el tip aunque esté lejos.
+ */
+const avisarComplementosPerdidaCercanos = async (
+  marker,
+  { radioMetros = RADIO_COMPLEMENTO_PERDIDA_M } = {},
+) => {
+  if (!marker || marker.category !== 'cosas_perdidas') return [];
+  if (!['pendiente', 'en_proceso'].includes(marker.status)) return [];
+  const tipoNuevo = String(marker.perdidaTipo || '').trim();
+  if (tipoNuevo !== 'perdi' && tipoNuevo !== 'encontre') return [];
+  const lat = Number(marker.lat);
+  const lng = Number(marker.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return [];
+
+  const tipoBuscado = tipoNuevo === 'encontre' ? 'perdi' : 'encontre';
+  const radio = Math.min(8000, Math.max(500, Number(radioMetros) || RADIO_COMPLEMENTO_PERDIDA_M));
+  const deltaLat = radio / 111320;
+  const deltaLng = radio / (111320 * Math.max(0.2, Math.cos((lat * Math.PI) / 180)));
+  const creadorNuevo = normalizeUserId(marker.createdBy);
+
+  const candidatos = await Marker.find({
+    _id: { $ne: marker._id },
+    category: 'cosas_perdidas',
+    perdidaTipo: tipoBuscado,
+    status: { $in: ['pendiente', 'en_proceso'] },
+    eliminadoAt: null,
+    lat: { $gte: lat - deltaLat, $lte: lat + deltaLat },
+    lng: { $gte: lng - deltaLng, $lte: lng + deltaLng },
+  })
+    .select('lat lng createdBy caseId objeto perdidaTipo')
+    .limit(200);
+
+  const casoNuevo = marker.caseId ? `#${marker.caseId}` : '';
+  const objetoNuevo = String(marker.objeto || '').trim().slice(0, 60);
+  const tenantId = tenantIdDeMarker(marker);
+  const creadas = [];
+  const yaAvisados = new Set();
+
+  for (const otro of candidatos) {
+    const dueno = normalizeUserId(otro.createdBy);
+    if (!dueno || dueno === 'anonimo' || dueno === creadorNuevo || yaAvisados.has(dueno)) continue;
+    const d = distanciaMetros(lat, lng, Number(otro.lat), Number(otro.lng));
+    if (!Number.isFinite(d) || d > radio) continue;
+
+    const casoPropio = otro.caseId ? `#${otro.caseId}` : 'tu aviso';
+    let mensaje;
+    if (tipoNuevo === 'encontre') {
+      mensaje = objetoNuevo
+        ? `Alguien publicó que encontró algo cerca de tu aviso ${casoPropio}: ${objetoNuevo}${casoNuevo ? ` · ${casoNuevo}` : ''}.`
+        : `Alguien publicó que encontró algo cerca de tu aviso ${casoPropio}${casoNuevo ? ` · caso ${casoNuevo}` : ''}.`;
+    } else {
+      mensaje = objetoNuevo
+        ? `Alguien publicó que perdió algo cerca de tu aviso ${casoPropio}: ${objetoNuevo}${casoNuevo ? ` · ${casoNuevo}` : ''}.`
+        : `Alguien publicó que perdió algo cerca de tu aviso ${casoPropio}${casoNuevo ? ` · caso ${casoNuevo}` : ''}.`;
+    }
+
+    yaAvisados.add(dueno);
+    try {
+      // markerId = el aviso NUEVO (para abrir el pin complementario desde la campanita)
+      const n = await crearNotificacion({
+        userId: dueno,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tenantId,
+        tipo: 'cerca',
+        mensaje: mensaje.replace(/  +/g, ' ').trim(),
+      });
+      if (n) {
+        creadas.push(n);
+        if (creadas.length >= MAX_AVISOS_COMPLEMENTO) break;
+      }
+    } catch (error) {
+      console.error('Error notificando complemento pérdida:', error.message);
+    }
+  }
+  return creadas;
+};
+
 /** Notifica a quien publicó y a quienes reclamaron (p. ej. cierre / registro). */
 const avisarPartesCaso = async (marker, mensaje, tipo = 'estado', excluirUserId = null) => {
   if (!marker || !mensaje) return [];
@@ -432,11 +517,13 @@ module.exports = {
   avisarAdminsPorAprobar,
   avisarAdminsCasoAprobado,
   avisarVecinosCercanos,
+  avisarComplementosPerdidaCercanos,
   avisarPartesCaso,
   listarAdminsDelCaso,
   listarOperariosDelCaso,
   avisarOperariosDelCaso,
   RADIO_CERCA_DEFAULT_M,
+  RADIO_COMPLEMENTO_PERDIDA_M,
   ESTADO_TEXTO,
   etiquetaEstadoVecino,
 };
