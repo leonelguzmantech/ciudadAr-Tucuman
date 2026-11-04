@@ -2282,8 +2282,9 @@ body{
 .tarjeta-mi-reporte-badge{
   position: absolute;
   top: 6px;
-  left: 6px;
-  z-index: 2;
+  right: 6px;
+  left: auto;
+  z-index: 3;
   display: inline-flex;
   align-items: center;
   gap: 3px;
@@ -2578,6 +2579,39 @@ body{
 .etiqueta-rol-radar.rol-reclamo{
   background: #ffedd5;
   color: #c2410c;
+}
+/* Radar Cerca: Perdí / Encontré con el mismo color del formulario */
+.etiqueta-perdida-tipo{
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 1.25;
+  color: #fff;
+}
+.etiqueta-perdida-tipo.tipo-perdi{
+  background: #0b2c5e;
+}
+.etiqueta-perdida-tipo.tipo-encontre{
+  background: #00a3e0;
+}
+.tarjeta-mi-reporte-meta-caso{
+  color: #64748b;
+  font-weight: 700;
+  font-size: 12px;
+}
+.tarjeta-mi-reporte.tarjeta-cerca-perdi{
+  border-left: 3px solid #0b2c5e;
+  background: linear-gradient(90deg, rgba(11, 44, 94, 0.08), transparent 42%);
+}
+.tarjeta-mi-reporte.tarjeta-cerca-encontre{
+  border-left: 3px solid #00a3e0;
+  background: linear-gradient(90deg, rgba(0, 163, 224, 0.12), transparent 42%);
 }
 .tarjeta-mi-reporte.tarjeta-mi-reporte-propia{
   border-left: 3px solid #0f766e;

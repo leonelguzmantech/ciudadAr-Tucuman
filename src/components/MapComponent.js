@@ -7281,8 +7281,11 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     const claseRolTarjeta = esTuAviso
                       ? ' tarjeta-mi-reporte-propia'
                       : (esTuReclamo ? ' tarjeta-mi-reporte-reclamo' : '');
+                    const claseTipoPerdida = enCerca && marker.perdidaTipo === 'perdi'
+                      ? ' tarjeta-cerca-perdi'
+                      : (enCerca && marker.perdidaTipo === 'encontre' ? ' tarjeta-cerca-encontre' : '');
                     const metaResto = [
-                      subtipo,
+                      (!enCerca || !marker.perdidaTipo) ? subtipo : null,
                       marker.caseId ? `#${marker.caseId}` : null,
                     ].filter(Boolean).join(' · ');
                     return (
@@ -7290,7 +7293,7 @@ const renderOficinas = (tipo, jurisdiccion) => {
                         <div className={`tarjeta-mi-reporte-wrap${destacado ? ' tarjeta-mi-reporte-destacada' : ''}`}>
                           <button
                             type="button"
-                            className={`tarjeta-mi-reporte${claseRolTarjeta}${destacado ? ' tarjeta-mi-reporte-sombra' : ''}${tarjetaNueva ? ' tarjeta-mi-reporte-nueva' : ''}${badgeCercaNuevo ? ' tarjeta-mi-reporte-cerca-nueva' : ''}`}
+                            className={`tarjeta-mi-reporte${claseRolTarjeta}${claseTipoPerdida}${destacado ? ' tarjeta-mi-reporte-sombra' : ''}${tarjetaNueva ? ' tarjeta-mi-reporte-nueva' : ''}${badgeCercaNuevo ? ' tarjeta-mi-reporte-cerca-nueva' : ''}`}
                             onClick={() => {
                               setIdPerdidaDestacada(null);
                               if (radarVistaAmpliada) {
@@ -7305,16 +7308,16 @@ const renderOficinas = (tipo, jurisdiccion) => {
                               irAPerdida(marker, { abrirChat: badgeChat });
                             }}
                           >
+                            {badgeChat && (
+                              <span
+                                className="tarjeta-mi-reporte-badge"
+                                title={`${chatSinLeer} mensaje${chatSinLeer === 1 ? '' : 's'} o reclamo${chatSinLeer === 1 ? '' : 's'} sin leer`}
+                              >
+                                {chatSinLeer > 9 ? '9+' : chatSinLeer}
+                                <em>chat</em>
+                              </span>
+                            )}
                             <span className="tarjeta-mi-reporte-media">
-                              {badgeChat && (
-                                <span
-                                  className="tarjeta-mi-reporte-badge"
-                                  title={`${chatSinLeer} mensaje${chatSinLeer === 1 ? '' : 's'} o reclamo${chatSinLeer === 1 ? '' : 's'} sin leer`}
-                                >
-                                  {chatSinLeer > 9 ? '9+' : chatSinLeer}
-                                  <em>chat</em>
-                                </span>
-                              )}
                               {badgeCercaNuevo && (
                                 <span className="tarjeta-mi-reporte-badge-nuevo" title="Aviso nuevo cerca de vos">
                                   Nuevo
@@ -7344,7 +7347,16 @@ const renderOficinas = (tipo, jurisdiccion) => {
                                 )}
                               </strong>
                               <span className="tarjeta-mi-reporte-meta">
-                                {(esTuAviso || esTuReclamo) ? (
+                                {enCerca && marker.perdidaTipo ? (
+                                  <>
+                                    <em className={`etiqueta-perdida-tipo tipo-${marker.perdidaTipo}`}>
+                                      {perdidaLabels[marker.perdidaTipo] || marker.perdidaTipo}
+                                    </em>
+                                    {marker.caseId ? (
+                                      <span className="tarjeta-mi-reporte-meta-caso">#{marker.caseId}</span>
+                                    ) : null}
+                                  </>
+                                ) : (esTuAviso || esTuReclamo) ? (
                                   <>
                                     <em className={`etiqueta-rol-radar${esTuAviso ? ' rol-aviso' : ' rol-reclamo'}`}>
                                       {etiquetaRol}
