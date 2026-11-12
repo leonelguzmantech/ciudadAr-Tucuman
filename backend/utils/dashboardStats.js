@@ -2,9 +2,28 @@
  * Agrega métricas de casos / uso para dashboards (admin municipal y super).
  * matchBase: filtro Mongo ya acotado a la jurisdicción (o {} para toda la red).
  */
+const mongoose = require('mongoose');
+const Usuario = require('../models/usuario');
+
 const categoriaCanon = (category) => (
   category === 'persona' ? 'familias' : (category || 'reparaciones')
 );
+
+/** Extrae ObjectIds de tenant desde el match de casos ({ tenant } | { tenant: { $in } }). */
+const extraerTenantIds = (matchBase = {}) => {
+  const raw = matchBase && matchBase.tenant;
+  if (raw == null) return [];
+  const lista = raw.$in ? raw.$in : [raw];
+  return lista
+    .map((id) => {
+      try {
+        return new mongoose.Types.ObjectId(String(id));
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+};
 
 const diaKey = (fecha) => {
   const d = new Date(fecha);
@@ -69,14 +88,14 @@ const rangoAnterior = (desde, hasta) => {
   };
 };
 
-const serieVacia = (desde, dias) => {
+const serieVacia = (desde, dias, extra = {}) => {
   const out = [];
   const base = new Date(desde);
   base.setHours(0, 0, 0, 0);
   for (let i = 0; i <= dias; i += 1) {
     const d = new Date(base);
     d.setDate(base.getDate() + i);
-    out.push({ fecha: d.toISOString().slice(0, 10), ingresos: 0, resueltos: 0 });
+    out.push({ fecha: d.toISOString().slice(0, 10), ingresos: 0, resueltos: 0, ...extra });
   }
   return out;
 };
@@ -103,6 +122,7 @@ const metricasDePeriodo = async (Marker, base, desde, hasta) => {
     tomados,
     resueltos,
     anulados,
+    vencidos,
     docsCreados,
     docsResueltosDemora,
     confirmacionesAgg,
@@ -117,9 +137,16 @@ const metricasDePeriodo = async (Marker, base, desde, hasta) => {
       status: 'resuelto',
       ...filtroCierreEnRango(desde, hasta),
     })),
+    // Anulados manuales: no mezclar vencimientos automáticos
     Marker.countDocuments(con({
       status: 'rechazado',
+      motivoEliminacion: { $not: { $regex: 'vencimiento', $options: 'i' } },
       ...filtroCierreEnRango(desde, hasta),
+    })),
+    // Animales / cosas perdidas que caducaron (15 días)
+    Marker.countDocuments(con({
+      eliminadoAt: { $gte: desde, $lte: hasta },
+      motivoEliminacion: { $regex: 'vencimiento', $options: 'i' },
     })),
     Marker.find(con({ createdAt: { $gte: desde, $lte: hasta } }))
       .select('category createdBy createdAt perdidaTipo')
@@ -209,7 +236,7 @@ const metricasDePeriodo = async (Marker, base, desde, hasta) => {
     demoraN += 1;
   });
 
-  const totalCierre = resueltos + anulados;
+  const totalCierre = resueltos + anulados + vencidos;
   const operariosMap = new Map();
   tomadosPorOperario.forEach((row) => {
     const id = String(row._id || '').toLowerCase();
@@ -253,8 +280,10 @@ const metricasDePeriodo = async (Marker, base, desde, hasta) => {
     tomados,
     resueltos,
     anulados,
+    vencidos,
     pctResueltos: totalCierre ? Math.round((resueltos / totalCierre) * 100) : null,
     vecinosDistinctos: vecinos.size,
+    vecinosEmails: Array.from(vecinos),
     confirmacionesReparacion: confirmacionesAgg[0]?.total || 0,
     reclamosPerdidas: reclamosAgg[0]?.total || 0,
     demoraMediaHoras: demoraN ? msAHoras(demoraSumaMs / demoraN) : null,
@@ -274,6 +303,64 @@ const metricasDePeriodo = async (Marker, base, desde, hasta) => {
   };
 };
 
+/**
+ * Usuarios: altas y cuántos reportaron en el período.
+ * - Con tenantIds: acotado al/los municipio(s).
+ * - Con global=true: toda la red (super).
+ */
+const metricasUsuarios = async (tenantIds, Marker, matchBase, desde, hasta, { global = false } = {}) => {
+  const vacio = {
+    registrados: 0,
+    nuevos: 0,
+    activos: 0,
+    nuevosActivos: 0,
+    nuevosQuietos: 0,
+    docsNuevos: [],
+    ambito: global ? 'global' : 'municipal',
+  };
+  if (!tenantIds.length && !global) return vacio;
+
+  const filtroMuni = tenantIds.length
+    ? { municipioTenantId: { $in: tenantIds } }
+    : {};
+  const [registrados, docsNuevos, emailsActivosAgg] = await Promise.all([
+    Usuario.countDocuments({ ...filtroMuni, activo: { $ne: false } }),
+    Usuario.find({
+      ...filtroMuni,
+      createdAt: { $gte: desde, $lte: hasta },
+    })
+      .select('email createdAt')
+      .lean(),
+    Marker.aggregate([
+      {
+        $match: conBase(matchBase, {
+          createdAt: { $gte: desde, $lte: hasta },
+          createdBy: { $exists: true, $nin: [null, '', 'anonimo'] },
+        }),
+      },
+      { $group: { _id: { $toLower: '$createdBy' } } },
+    ]),
+  ]);
+
+  const emailsActivos = new Set(
+    (emailsActivosAgg || []).map((r) => String(r._id || '').toLowerCase()).filter(Boolean)
+  );
+  const emailsNuevos = docsNuevos
+    .map((u) => String(u.email || '').toLowerCase())
+    .filter(Boolean);
+  const nuevosActivos = emailsNuevos.filter((e) => emailsActivos.has(e)).length;
+
+  return {
+    registrados,
+    nuevos: docsNuevos.length,
+    activos: emailsActivos.size,
+    nuevosActivos,
+    nuevosQuietos: Math.max(0, docsNuevos.length - nuevosActivos),
+    docsNuevos,
+    ambito: global ? 'global' : 'municipal',
+  };
+};
+
 const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
   const opts = (opciones && typeof opciones === 'object' && !Array.isArray(opciones))
     ? opciones
@@ -282,6 +369,25 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
   const base = matchBase && Object.keys(matchBase).length ? matchBase : {};
   const con = (extra) => conBase(base, extra);
   const prev = rangoAnterior(desde, hasta);
+  const tenantIdsExplicitos = Array.isArray(opts.tenantIds)
+    ? opts.tenantIds
+      .map((id) => {
+        try {
+          return new mongoose.Types.ObjectId(String(id));
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+    : [];
+  const tenantIds = tenantIdsExplicitos.length
+    ? tenantIdsExplicitos
+    : extraerTenantIds(base);
+  const usuariosGlobales = !!opts.usuariosGlobales && !tenantIds.length;
+
+  // Embudo operativo: solo reparaciones (cuadrilla no atiende familias/animales/perdidas).
+  const baseReparaciones = conBase(base, { category: 'reparaciones' });
+  const conRep = (extra) => conBase(baseReparaciones, extra);
 
   const [
     porAprobar,
@@ -293,6 +399,12 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
     abiertosAgingDocs,
     actual,
     anterior,
+    creadosReparaciones,
+    aprobadosReparaciones,
+    avanzadosReparaciones,
+    resueltosReparaciones,
+    usuariosActual,
+    usuariosAnterior,
   ] = await Promise.all([
     Marker.countDocuments(con({ eliminadoAt: null, status: 'pendiente_aprobacion' })),
     Marker.countDocuments(con({
@@ -319,6 +431,22 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
       .lean(),
     metricasDePeriodo(Marker, base, desde, hasta),
     metricasDePeriodo(Marker, base, prev.desde, prev.hasta),
+    Marker.countDocuments(conRep({ createdAt: { $gte: desde, $lte: hasta } })),
+    Marker.countDocuments(conRep({ aprobadoAt: { $gte: desde, $lte: hasta } })),
+    // Avance hacia el cierre: cuadrilla tomó, vecino avisó resolución, o se propuso cierre
+    Marker.countDocuments(conRep({
+      $or: [
+        { atendidoAt: { $gte: desde, $lte: hasta } },
+        { resolvedByReportedAt: { $gte: desde, $lte: hasta } },
+        { cierrePropuestoAt: { $gte: desde, $lte: hasta } },
+      ],
+    })),
+    Marker.countDocuments(conRep({
+      status: 'resuelto',
+      ...filtroCierreEnRango(desde, hasta),
+    })),
+    metricasUsuarios(tenantIds, Marker, base, desde, hasta, { global: usuariosGlobales }),
+    metricasUsuarios(tenantIds, Marker, base, prev.desde, prev.hasta, { global: usuariosGlobales }),
   ]);
 
   const ahora = Date.now();
@@ -341,7 +469,9 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
     else antiguedad.d30_mas += 1;
   });
 
-  const serieMap = new Map(serieVacia(desde, dias).map((row) => [row.fecha, { ...row }]));
+  const serieMap = new Map(
+    serieVacia(desde, dias, { nuevos: 0, activos: 0 }).map((row) => [row.fecha, { ...row }])
+  );
   actual.docsCreados.forEach((doc) => {
     const key = diaKey(doc.createdAt);
     if (key && serieMap.has(key)) serieMap.get(key).ingresos += 1;
@@ -349,6 +479,23 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
   actual.docsResueltosDemora.forEach((doc) => {
     const key = diaKey(doc.eliminadoAt || doc.updatedAt);
     if (key && serieMap.has(key)) serieMap.get(key).resueltos += 1;
+  });
+
+  // Serie de usuarios: altas por día + vecinos distintos que reportaron ese día
+  const activosPorDia = new Map();
+  actual.docsCreados.forEach((doc) => {
+    const key = diaKey(doc.createdAt);
+    const email = String(doc.createdBy || '').toLowerCase();
+    if (!key || !serieMap.has(key) || !email || email === 'anonimo') return;
+    if (!activosPorDia.has(key)) activosPorDia.set(key, new Set());
+    activosPorDia.get(key).add(email);
+  });
+  activosPorDia.forEach((set, key) => {
+    if (serieMap.has(key)) serieMap.get(key).activos = set.size;
+  });
+  (usuariosActual.docsNuevos || []).forEach((doc) => {
+    const key = diaKey(doc.createdAt);
+    if (key && serieMap.has(key)) serieMap.get(key).nuevos += 1;
   });
 
   const estados = {
@@ -362,10 +509,14 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
   });
 
   const embudo = [
-    { key: 'creados', label: 'Creados', n: actual.creados },
-    { key: 'aprobados', label: 'Aprobados', n: actual.aprobados },
-    { key: 'tomados', label: 'Tomados por cuadrilla', n: actual.tomados },
-    { key: 'resueltos', label: 'Resueltos', n: actual.resueltos },
+    { key: 'creados', label: 'Creados', n: creadosReparaciones },
+    { key: 'aprobados', label: 'Aprobados', n: aprobadosReparaciones },
+    {
+      key: 'tomados',
+      label: 'Cuadrilla o cierre propuesto',
+      n: avanzadosReparaciones,
+    },
+    { key: 'resueltos', label: 'Resueltos', n: resueltosReparaciones },
   ];
 
   const comparar = {
@@ -384,6 +535,11 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
       anterior: anterior.anulados,
       pct: pctCambio(actual.anulados, anterior.anulados),
     },
+    vencidos: {
+      actual: actual.vencidos,
+      anterior: anterior.vencidos,
+      pct: pctCambio(actual.vencidos, anterior.vencidos),
+    },
     tomados: {
       actual: actual.tomados,
       anterior: anterior.tomados,
@@ -399,7 +555,19 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
       anterior: anterior.vecinosDistinctos,
       pct: pctCambio(actual.vecinosDistinctos, anterior.vecinosDistinctos),
     },
+    usuariosNuevos: {
+      actual: usuariosActual.nuevos,
+      anterior: usuariosAnterior.nuevos,
+      pct: pctCambio(usuariosActual.nuevos, usuariosAnterior.nuevos),
+    },
+    usuariosActivos: {
+      actual: usuariosActual.activos,
+      anterior: usuariosAnterior.activos,
+      pct: pctCambio(usuariosActual.activos, usuariosAnterior.activos),
+    },
   };
+
+  const serieDiaria = Array.from(serieMap.values());
 
   return {
     periodo: {
@@ -430,6 +598,7 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
       publicadosPeriodo: actual.creados,
       resueltosPeriodo: actual.resueltos,
       anuladosPeriodo: actual.anulados,
+      vencidosPeriodo: actual.vencidos,
       pctResueltos: actual.pctResueltos,
       vecinosDistinctos: actual.vecinosDistinctos,
       confirmacionesReparacion: actual.confirmacionesReparacion,
@@ -437,6 +606,15 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
       aprobadosPeriodo: actual.aprobados,
       tomadosPeriodo: actual.tomados,
     },
+    usuarios: (tenantIds.length || usuariosGlobales) ? {
+      registrados: usuariosActual.registrados,
+      nuevos: usuariosActual.nuevos,
+      activos: usuariosActual.activos,
+      nuevosActivos: usuariosActual.nuevosActivos,
+      nuevosQuietos: usuariosActual.nuevosQuietos,
+      ambito: usuariosActual.ambito || (usuariosGlobales ? 'global' : 'municipal'),
+      disponibles: true,
+    } : { disponibles: false },
     porCategoria: actual.porCategoria,
     perdidaTipos: actual.perdidaTipos,
     porOperario: actual.porOperario,
@@ -446,7 +624,16 @@ const buildDashboardStats = async (Marker, matchBase = {}, opciones = 30) => {
       { key: 'en_proceso', label: 'En proceso', n: estados.en_proceso },
       { key: 'pendiente_cierre', label: 'Cierre propuesto', n: estados.pendiente_cierre },
     ],
-    serieDiaria: Array.from(serieMap.values()),
+    serieDiaria,
+    serieUsuarios: serieDiaria.map((row) => ({
+      fecha: row.fecha,
+      ingresos: row.nuevos || 0,
+      resueltos: row.activos || 0,
+    })),
+    composicionUsuariosNuevos: [
+      { key: 'aprobados', label: 'Nuevos que reportaron', n: usuariosActual.nuevosActivos },
+      { key: 'pendiente', label: 'Nuevos sin reportar', n: usuariosActual.nuevosQuietos },
+    ],
   };
 };
 

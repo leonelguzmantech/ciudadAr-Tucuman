@@ -905,6 +905,7 @@ router.post('/me/soporte', async (req, res) => {
 router.get('/admin/soporte', requireAdmin, async (req, res) => {
   try {
     const estado = String(req.query.estado || 'pendiente').trim();
+    const tenantId = String(req.query.tenantId || '').trim();
     const filtro = estado === 'todos'
       ? { soporteEstado: { $in: ['pendiente', 'reseteado', 'rechazado'] } }
       : { soporteEstado: estado || 'pendiente' };
@@ -914,7 +915,13 @@ router.get('/admin/soporte', requireAdmin, async (req, res) => {
         return res.json({ items: [] });
       }
       // Solo pedidos de su jurisdicción (los “sin municipio activo” quedan para el super)
-      filtro.soporteTenantId = { $in: permitidos };
+      if (tenantId && !permitidos.includes(tenantId)) {
+        return res.json({ items: [] });
+      }
+      filtro.soporteTenantId = { $in: tenantId ? [tenantId] : permitidos };
+    } else if (tenantId) {
+      // Super operando un municipio concreto
+      filtro.soporteTenantId = tenantId;
     }
     const lista = await Usuario.find(filtro)
       .select('email nombre dni telefono soporteEstado soporteCampo soporteMensaje soporteTenantId soporteTenantName soporteAt soporteResueltoAt soporteResueltoPor soporteNotaAdmin dniFotosAt createdAt')

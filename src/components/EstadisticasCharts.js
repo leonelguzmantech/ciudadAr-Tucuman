@@ -11,6 +11,7 @@ const COLORS = {
   pendiente_cierre: '#0d9488',
   resuelto: '#16a34a',
   rechazado: '#dc2626',
+  vencido: '#a855f7',
   perdi: '#0b2c5e',
   encontre: '#00a3e0',
   ingresos: '#2563eb',
@@ -160,7 +161,21 @@ const agruparSerie = (serie) => {
 };
 
 /** Línea ingresos vs resueltos */
-export const LineaIngresosResueltos = ({ serie = [], vacio = 'Sin movimiento en el período' }) => {
+export const LineaIngresosResueltos = ({
+  serie = [],
+  vacio = 'Sin movimiento en el período',
+  labelA = 'casos nuevos',
+  labelB = 'casos resueltos',
+  leyendaA = 'Azul: casos nuevos',
+  leyendaB = 'Verde: casos resueltos',
+  ariaLabel = 'Casos nuevos y resueltos en el tiempo',
+  /** 'casos' | 'usuarios' — cambia el texto del resumen y la tip de lectura */
+  variante = 'casos',
+  tipLectura = '',
+  /** Totales reales del período (evita sumar días/semanas y contar de más). */
+  totalA = null,
+  totalB = null,
+}) => {
   const width = 420;
   const height = 180;
   const pad = { t: 16, r: 12, b: 28, l: 32 };
@@ -169,8 +184,10 @@ export const LineaIngresosResueltos = ({ serie = [], vacio = 'Sin movimiento en 
 
   const { puntos: serieVis, unidad } = useMemo(() => agruparSerie(serie), [serie]);
 
-  const totalIngresos = serieVis.reduce((a, d) => a + (Number(d.ingresos) || 0), 0);
-  const totalResueltos = serieVis.reduce((a, d) => a + (Number(d.resueltos) || 0), 0);
+  const totalIngresosSerie = serieVis.reduce((a, d) => a + (Number(d.ingresos) || 0), 0);
+  const totalResueltosSerie = serieVis.reduce((a, d) => a + (Number(d.resueltos) || 0), 0);
+  const totalIngresos = totalA != null ? Number(totalA) : totalIngresosSerie;
+  const totalResueltos = totalB != null ? Number(totalB) : totalResueltosSerie;
 
   const maxY = Math.max(
     1,
@@ -192,7 +209,7 @@ export const LineaIngresosResueltos = ({ serie = [], vacio = 'Sin movimiento en 
     };
   }, [serieVis, maxY, innerW, innerH, pad.l, pad.t]);
 
-  const hayDatos = totalIngresos + totalResueltos > 0;
+  const hayDatos = totalIngresosSerie + totalResueltosSerie > 0;
   if (!serieVis.length || !hayDatos) {
     return <p className="estadisticas-vacio-chart">{vacio}</p>;
   }
@@ -204,19 +221,46 @@ export const LineaIngresosResueltos = ({ serie = [], vacio = 'Sin movimiento en 
     serieVis.length - 1,
   ].filter((v, i, arr) => arr.indexOf(v) === i);
 
+  const tipPorDefecto = variante === 'usuarios'
+    ? (
+      unidad === 'semana'
+        ? 'Cada punto suma una semana. Azul alto y verde bajo = se registran pero poco publican. Si ambas líneas suben juntas, la gente que llega también reporta.'
+        : 'Cada punto es un día. Azul alto y verde bajo = se registran pero poco publican. Si ambas líneas suben juntas, la gente que llega también reporta.'
+    )
+    : (
+      unidad === 'semana'
+        ? 'Cada punto suma una semana. Si el azul va arriba del verde, la cola tiende a crecer.'
+        : 'Cada punto es un día. Si el azul va arriba del verde, la cola tiende a crecer.'
+    );
+  const tip = tipLectura || tipPorDefecto;
+
   return (
     <div className="estadisticas-linea-wrap">
       <p className="estadisticas-linea-resumen">
-        En el período: <strong>{totalIngresos}</strong> nuevos
-        {' · '}
-        <strong>{totalResueltos}</strong> resueltos
-        {unidad === 'semana' ? ' · (agrupado por semana)' : ''}
+        {variante === 'usuarios' ? (
+          <>
+            Total del período: <strong>{totalIngresos}</strong> altas nuevas
+            {' · '}
+            <strong>{totalResueltos}</strong> vecinos distintos que publicaron
+            {unidad === 'semana'
+              ? ' · el gráfico está agrupado por semana (el rango es largo)'
+              : ' · el gráfico muestra un punto por día'}
+          </>
+        ) : (
+          <>
+            En el período: <strong>{totalIngresos}</strong> {labelA}
+            {' · '}
+            <strong>{totalResueltos}</strong> {labelB}
+            {unidad === 'semana' ? ' · (agrupado por semana)' : ''}
+          </>
+        )}
       </p>
+      {tip ? <p className="estadisticas-linea-tip">{tip}</p> : null}
       <svg
         className="estadisticas-linea"
         viewBox={`0 0 ${width} ${height}`}
         role="img"
-        aria-label="Casos nuevos y resueltos en el tiempo"
+        aria-label={ariaLabel}
       >
         {ticks.map((t) => {
           const y = pad.t + innerH - (t / maxY) * innerH;
@@ -256,8 +300,8 @@ export const LineaIngresosResueltos = ({ serie = [], vacio = 'Sin movimiento en 
         })}
       </svg>
       <div className="estadisticas-linea-leyenda">
-        <span><i style={{ background: COLORS.ingresos }} /> Azul: casos nuevos</span>
-        <span><i style={{ background: COLORS.resueltos }} /> Verde: casos resueltos</span>
+        <span><i style={{ background: COLORS.ingresos }} /> {leyendaA}</span>
+        <span><i style={{ background: COLORS.resueltos }} /> {leyendaB}</span>
       </div>
     </div>
   );
@@ -326,16 +370,33 @@ export const PeriodoSelector = ({
 
 export const KpiGrid = ({ items = [] }) => (
   <div className="estadisticas-kpis">
-    {items.map((item) => (
-      <div
-        key={item.label}
-        className={`estadisticas-kpi${item.alerta ? ' alerta' : ''}`}
-        title={item.ayuda || ''}
-      >
-        <strong>{item.valor}</strong>
-        <span>{item.label}</span>
-      </div>
-    ))}
+    {items.map((item) => {
+      const clase = `estadisticas-kpi${item.alerta ? ' alerta' : ''}${item.onClick ? ' clickable' : ''}`;
+      if (item.onClick) {
+        return (
+          <button
+            key={item.label}
+            type="button"
+            className={clase}
+            title={item.ayuda || ''}
+            onClick={item.onClick}
+          >
+            <strong>{item.valor}</strong>
+            <span>{item.label}</span>
+          </button>
+        );
+      }
+      return (
+        <div
+          key={item.label}
+          className={clase}
+          title={item.ayuda || ''}
+        >
+          <strong>{item.valor}</strong>
+          <span>{item.label}</span>
+        </div>
+      );
+    })}
   </div>
 );
 

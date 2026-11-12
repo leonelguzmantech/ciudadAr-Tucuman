@@ -1170,10 +1170,14 @@ router.get('/admin/dashboard', requireStaff, async (req, res) => {
       }
       filtro = { tenant: tenantId };
     }
+    const tenantIdsStats = tenantId
+      ? [tenantId]
+      : (req.adminScope.isSuperAdmin ? [] : (req.adminScope.tenantIds || []));
     const data = await buildDashboardStats(Marker, filtro, {
       dias: req.query.dias,
       fechaDesde: req.query.fechaDesde,
       fechaHasta: req.query.fechaHasta,
+      tenantIds: tenantIdsStats,
     });
     res.json(data);
   } catch (error) {
@@ -1214,9 +1218,20 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
     const geo = buildManagedMarkersFilter(req.adminScope);
     const esOperario = isScopeOperario(req.adminScope);
     const esSuper = !!req.adminScope.isSuperAdmin;
-    const conGeo = (extra) => (
-      esSuper ? extra : { $and: [geo, extra] }
-    );
+    const tenantIdStats = String(req.query.tenantId || '').trim();
+    let tenantFiltro = null;
+    if (esSuper && tenantIdStats) {
+      try {
+        tenantFiltro = { tenant: new mongoose.Types.ObjectId(String(tenantIdStats)) };
+      } catch {
+        tenantFiltro = { tenant: tenantIdStats };
+      }
+    }
+    const conGeo = (extra) => {
+      if (esSuper && tenantFiltro) return { $and: [tenantFiltro, extra] };
+      if (esSuper) return extra;
+      return { $and: [geo, extra] };
+    };
     // Activos en mapa (alineado a listas Reportes / Cosas): sin por aprobar / cierre / rechazados
     // y sin derivados (avisadoAt) — esos van solo a la sección Derivados
     const publicados = {
@@ -1328,9 +1343,9 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
       })),
     ]);
 
-    // Desglose por municipio (solo super): el badge indica dónde saltar, sin listar todo
+    // Desglose por municipio (solo super sin municipio fijo)
     let porMunicipio = null;
-    if (esSuper) {
+    if (esSuper && !tenantFiltro) {
       const [
         pmNuevosReportes,
         pmNuevosReparaciones,

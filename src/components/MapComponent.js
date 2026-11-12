@@ -6776,9 +6776,6 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     }}
                     aria-label="Categoría"
                   >
-                    {misReportesSeccion === 'registro' && (
-                      <option value="">Todas las categorías</option>
-                    )}
                     <option value="reparaciones">Reparaciones</option>
                     <option value="perros_gatos">Perros y gatos</option>
                     <option value="familias">Familias</option>
@@ -6906,21 +6903,25 @@ const renderOficinas = (tipo, jurisdiccion) => {
                       const vencida = esPublicacionVencida(marker);
                       const motivoBaja = String(marker.motivoEliminacion || '').toLowerCase();
                       const estadoTexto = enRegistro
-                        ? (motivoBaja.includes('vencimiento') || vencida
-                          ? 'Vencido'
-                          : (marker.status === 'resuelto'
-                            || motivoBaja.includes('resuelto')
-                            || motivoBaja.includes('recuper')
-                            || motivoBaja.includes('cierre del administrador')
-                            ? 'Resuelto'
-                            : 'Anulado'))
+                        ? (motivoBaja.includes('oficina') || (esCasoFamilia(marker.category) && marker.avisadoAt)
+                          ? 'Oficina avisada'
+                          : (motivoBaja.includes('vencimiento') || vencida
+                            ? 'Vencido'
+                            : (marker.status === 'resuelto'
+                              || motivoBaja.includes('resuelto')
+                              || motivoBaja.includes('recuper')
+                              || motivoBaja.includes('cierre del administrador')
+                              ? 'Resuelto'
+                              : 'Anulado')))
                         : etiquetaEstadoPopup(marker.status || 'pendiente', marker);
                       const claseEstado = enRegistro
-                        ? (estadoTexto === 'Resuelto'
-                          ? 'admin-dash-estado-resuelto'
-                          : (estadoTexto === 'Vencido'
-                            ? 'admin-dash-estado-vencido'
-                            : 'admin-dash-estado-rechazado'))
+                        ? (estadoTexto === 'Oficina avisada'
+                          ? 'admin-dash-estado-oficina_avisada'
+                          : (estadoTexto === 'Resuelto'
+                            ? 'admin-dash-estado-resuelto'
+                            : (estadoTexto === 'Vencido'
+                              ? 'admin-dash-estado-vencido'
+                              : 'admin-dash-estado-rechazado')))
                         : (marker.avisadoAt
                           ? 'admin-dash-estado-oficina_avisada'
                           : `admin-dash-estado-${marker.status || 'pendiente'}`);

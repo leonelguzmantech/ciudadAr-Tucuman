@@ -3,10 +3,10 @@ import axios from 'axios';
 import { getAuth, signOut } from 'firebase/auth';
 import appFirebase from './credenciales';
 import logoCiudad from '../assets/ciudadar-logo-circulo-estilo.jpg';
-import EstadisticasPanel from './EstadisticasPanel';
 import SelectMunicipio from './SelectMunicipio';
 import MiPerfil from './MiPerfil';
 import UsuariosPanel from './UsuariosPanel';
+import SuperEstadisticasPanel from './SuperEstadisticasPanel';
 
 const auth = getAuth(appFirebase);
 const API = 'http://localhost:5001';
@@ -44,6 +44,16 @@ const IconoSinJurisdiccion = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path fill="currentColor" d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z" />
     <path fill="currentColor" d="M3.4 4.8 4.8 3.4 20.6 19.2 19.2 20.6z" />
+  </svg>
+);
+const IconoRegistro = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="currentColor" d="M6 2h9l5 5v15a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm8 1.5V8h4.5L14 3.5zM8 12h8v2H8v-2zm0 4h8v2H8v-2z" />
+  </svg>
+);
+const IconoSoporte = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="currentColor" d="M12 3a7 7 0 0 0-7 7v2H4a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h1v1a3 3 0 0 0 3 3h1v-8H5v-2a7 7 0 0 1 14 0v2h-2v8h1a3 3 0 0 0 3-3v-1h1a2 2 0 0 0 2-2v-2a2 2 0 0 0-2-2h-1v-2a7 7 0 0 0-7-7z" />
   </svg>
 );
 const IconoMapa = () => (
@@ -113,6 +123,10 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
   const [nuevoOperarioEmail, setNuevoOperarioEmail] = useState('');
   const [nuevoOperarioTenantId, setNuevoOperarioTenantId] = useState('');
   const [mostrarPerfil, setMostrarPerfil] = useState(false);
+  const [pickerOperar, setPickerOperar] = useState(null); // { foco } | null
+  const [municipioPicker, setMunicipioPicker] = useState('');
+  const [busquedaPicker, setBusquedaPicker] = useState('');
+  const [filtroSinTenantEstado, setFiltroSinTenantEstado] = useState('todos'); // todos | por_aprobar | aprobados
 
   const headers = useMemo(() => ({ 'x-user-id': userId }), [userId]);
 
@@ -132,7 +146,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
   const cargarStats = useCallback(async () => {
     const [{ data: statsData }, { data: rankingData }] = await Promise.all([
       axios.get(`${API}/api/super/stats`, { headers }),
-      axios.get(`${API}/api/super/ranking`, { headers, params: { limit: 12 } }),
+      axios.get(`${API}/api/super/ranking`, { headers, params: { limit: 20 } }),
     ]);
     setStats(statsData);
     setRanking(rankingData.items || []);
@@ -174,10 +188,10 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
     setTenantsAsignacion(items);
   }, [headers]);
 
-  const cargarSinTenant = useCallback(async (page = 1) => {
+  const cargarSinTenant = useCallback(async (page = 1, estado = filtroSinTenantEstado) => {
     const { data } = await axios.get(`${API}/api/super/sin-tenant`, {
       headers,
-      params: { page, limit: 20 },
+      params: { page, limit: 20, estado },
     });
     setSinTenantItems(data.items || []);
     setSinTenantMeta({
@@ -185,7 +199,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
       page: data.page || page,
       hasMore: !!data.hasMore,
     });
-  }, [headers]);
+  }, [headers, filtroSinTenantEstado]);
 
   const refrescar = useCallback(async () => {
     if (!userId) return;
@@ -203,7 +217,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
       if (seccion === 'inicio') {
         await Promise.all([cargarStats(), ...extras]);
       } else if (seccion === 'estadisticas') {
-        await Promise.all([cargarTenantsAsignacion(), ...extras]);
+        await Promise.all([cargarStats(), cargarTenantsAsignacion(), ...extras]);
       } else if (seccion === 'jurisdicciones') await Promise.all([cargarJurisdicciones(), ...extras]);
       else if (seccion === 'admins') {
         await Promise.all([cargarAdmins(), cargarTenantsAsignacion(), ...extras]);
@@ -236,6 +250,23 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
   useEffect(() => {
     refrescar();
   }, [refrescar]);
+
+  useEffect(() => {
+    if (seccion !== 'sin_jurisdiccion' || !userId) return undefined;
+    let cancelado = false;
+    setCargando(true);
+    cargarSinTenant(1)
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelado) setCargando(false);
+      });
+    return () => { cancelado = true; };
+  }, [seccion, filtroSinTenantEstado, userId, cargarSinTenant]);
+
+  useEffect(() => {
+    if (!pickerOperar || tenantsAsignacion.length) return;
+    cargarTenantsAsignacion().catch(() => {});
+  }, [pickerOperar, tenantsAsignacion.length, cargarTenantsAsignacion]);
 
   const cambiarEstadoJuris = async (item, status) => {
     if (accionando) return;
@@ -390,10 +421,35 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
     if (id === 'admins' && Object.prototype.hasOwnProperty.call(opciones, 'q')) {
       setFiltroAdminQ(opciones.q);
     }
+    if (id === 'sin_jurisdiccion' && Object.prototype.hasOwnProperty.call(opciones, 'sinTenantEstado')) {
+      setFiltroSinTenantEstado(opciones.sinTenantEstado || 'todos');
+    }
     setSeccion(id);
   };
 
   const operarCasos = (foco = {}) => {
+    if (typeof onOperarCasos !== 'function') return;
+    // Sin jurisdicción o ya con municipio: entrar directo.
+    if (foco.sinTenant || foco.tenantId) {
+      onOperarCasos(foco);
+      return;
+    }
+    // Obligatorio elegir municipio antes de mezclar colas de toda la provincia.
+    setMunicipioPicker('');
+    setBusquedaPicker('');
+    setPickerOperar({ foco: { ...(foco || {}) } });
+  };
+
+  const confirmarPickerOperar = (tenantIdForzado = '') => {
+    const elegido = String(tenantIdForzado || municipioPicker || '').trim();
+    if (!elegido) {
+      mostrarAviso('Seleccioná un municipio o comuna');
+      return;
+    }
+    const foco = { ...(pickerOperar?.foco || {}), tenantId: elegido };
+    setPickerOperar(null);
+    setMunicipioPicker('');
+    setBusquedaPicker('');
     if (typeof onOperarCasos === 'function') onOperarCasos(foco);
   };
 
@@ -422,6 +478,21 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
     }),
     [tenantsAsignacion]
   );
+
+  const municipiosPickerFiltrados = useMemo(() => {
+    const q = String(busquedaPicker || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim();
+    if (!q) return tenantsParaSelect;
+    return tenantsParaSelect.filter((t) => {
+      const hay = `${t.name || ''} ${t.typeLabel || ''}`.toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+      return hay.includes(q);
+    });
+  }, [tenantsParaSelect, busquedaPicker]);
 
   const operariosVisibles = useMemo(() => {
     const q = filtroOperarioQ.trim().toLowerCase();
@@ -471,6 +542,24 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
               <em className="admin-dash-tab-badge">{stats.sinTenant}</em>
             )}
           </button>
+          {onOperarCasos && (
+            <button
+              type="button"
+              className="admin-dash-nav-secundario"
+              onClick={() => operarCasos({ seccion: 'registro' })}
+            >
+              <IconoRegistro /> Registro
+            </button>
+          )}
+          {onOperarCasos && (
+            <button
+              type="button"
+              className="admin-dash-nav-secundario"
+              onClick={() => operarCasos({ seccion: 'soporte' })}
+            >
+              <IconoSoporte /> Soporte
+            </button>
+          )}
           {onOperarCasos && (
             <button
               type="button"
@@ -534,7 +623,10 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           {seccion === 'inicio' && stats && (
             <div className="admin-dash-inicio">
               <h1>Gobernanza CiudadAr</h1>
-              <p>Visión global de jurisdicciones, admins y carga operativa.</p>
+              <p>
+                Acá administrás el sistema. Para atender casos, elegí un municipio:
+                así no se mezclan las colas de toda la provincia.
+              </p>
 
               <section className="admin-dash-bloque">
                 <h2>Sistema</h2>
@@ -594,59 +686,51 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                     <span>Inactivas</span>
                   </button>
                 </div>
-              </section>
-
-              <section className="admin-dash-bloque">
-                <h2>Casos en toda la provincia</h2>
-                <div className="admin-dash-stats admin-dash-stats-4">
+                <div className="admin-dash-stats admin-dash-stats-2 super-stats-sin-tenant">
                   <button
                     type="button"
-                    className={stats.porAprobar > 0 ? 'admin-dash-stat-alerta' : ''}
-                    onClick={() => operarCasos({ seccion: 'por_aprobar' })}
-                  >
-                    <strong>{stats.porAprobar || 0}</strong>
-                    <span>Por aprobar</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => operarCasos({ seccion: 'reportes', estado: 'pendiente' })}
-                  >
-                    <strong>{stats.abiertos || 0}</strong>
-                    <span>Abiertos</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => operarCasos({
-                      seccion: 'registro',
-                      registroTipo: '',
-                      registroCategoria: '',
-                      registroPeriodo: '',
-                    })}
-                  >
-                    <strong>{stats.registro || 0}</strong>
-                    <span>En registro</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={stats.sinTenant > 0 ? 'admin-dash-stat-alerta' : ''}
-                    onClick={() => irSeccion('sin_jurisdiccion')}
+                    className={(stats.sinTenant || 0) > 0 ? 'admin-dash-stat-alerta' : ''}
+                    onClick={() => irSeccion('sin_jurisdiccion', { sinTenantEstado: 'todos' })}
                   >
                     <strong>{stats.sinTenant || 0}</strong>
                     <span>Sin jurisdicción</span>
                   </button>
                 </div>
-                <p className="estadisticas-inicio-link">
-                  <button type="button" className="admin-dash-btn" onClick={() => irSeccion('estadisticas')}>
-                    Ver estadísticas de casos y uso
-                  </button>
-                </p>
               </section>
 
+              {(stats.casosSinAdmin || 0) > 0 && (
+                <section className="admin-dash-bloque">
+                  <h2>Cola sin admin local</h2>
+                  <p className="admin-dash-sub">
+                    Casos que ya tienen municipio, pero todavía no hay administrador ahí.
+                    El Super puede operarlos o sumar un admin al proyecto.
+                  </p>
+                  <div className="admin-dash-stats admin-dash-stats-2">
+                    <button
+                      type="button"
+                      className="admin-dash-stat-alerta"
+                      onClick={() => irSeccion('estadisticas')}
+                    >
+                      <strong>{stats.casosSinAdmin || 0}</strong>
+                      <span>Casos en municipios sin admin</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={(stats.casosSinAdminPorAprobar || 0) > 0 ? 'admin-dash-stat-alerta' : ''}
+                      onClick={() => irSeccion('estadisticas')}
+                    >
+                      <strong>{stats.casosSinAdminPorAprobar || 0}</strong>
+                      <span>De esos, por aprobar</span>
+                    </button>
+                  </div>
+                </section>
+              )}
+
               <section className="admin-dash-bloque">
-                <h2>Ranking por municipio</h2>
+                <h2>Municipios con carga</h2>
                 <p className="admin-dash-sub super-ranking-ayuda">
-                  Si un municipio no tiene admin, todavía no está sumado al proyecto: dale de alta un administrador.
-                  Operar los casos le corresponde a ese municipio, no al super.
+                  Tocá un municipio para operar solo ahí (aunque aún no tenga admin).
+                  Si falta quien lo lleve, sumalo al proyecto.
                 </p>
                 {ranking.length === 0 ? (
                   <p className="admin-dash-vacio">No hay carga operativa destacada.</p>
@@ -654,7 +738,10 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                   <ul className="super-ranking">
                     {[...ranking]
                       .sort((a, b) => {
-                        // Primero los que aún no se sumaron (sin admin)
+                        // Primero sin admin con carga (el Super debe atenderlos)
+                        const aPri = a.sinAdmin && a.carga > 0 ? 1 : 0;
+                        const bPri = b.sinAdmin && b.carga > 0 ? 1 : 0;
+                        if (bPri !== aPri) return bPri - aPri;
                         if (a.sinAdmin !== b.sinAdmin) return a.sinAdmin ? -1 : 1;
                         if (b.carga !== a.carga) return b.carga - a.carga;
                         return a.name.localeCompare(b.name);
@@ -665,11 +752,6 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                           type="button"
                           className="super-ranking-btn"
                           onClick={() => {
-                            if (r.sinAdmin) {
-                              setNuevoTenantId(r.id);
-                              irSeccion('admins');
-                              return;
-                            }
                             operarCasos({
                               seccion: r.porAprobar > 0 ? 'por_aprobar' : 'reportes',
                               estado: 'pendiente',
@@ -683,7 +765,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                             <span className="super-meta">
                               {r.typeLabel}
                               {r.sinAdmin
-                                ? ' · Pendiente de sumar al proyecto'
+                                ? ' · Sin admin · el Super puede operar o delegar'
                                 : ` · ${r.adminCount} admin`}
                             </span>
                           </span>
@@ -701,7 +783,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                               irSeccion('admins');
                             }}
                           >
-                            Sumar al proyecto
+                            Sumar admin
                           </button>
                         ) : null}
                       </li>
@@ -714,15 +796,18 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           )}
 
           {seccion === 'estadisticas' && (
-            <div className="super-seccion">
-              <EstadisticasPanel
-                url={`${API}/api/super/dashboard`}
-                headers={headers}
-                titulo="Estadísticas de casos"
-                subtitulo="Uso y control de publicaciones por municipio"
-                tenants={tenantsParaSelect}
-              />
-            </div>
+            <SuperEstadisticasPanel
+              userId={userId}
+              headers={headers}
+              tenants={tenantsParaSelect}
+              stats={stats}
+              onIrSeccion={irSeccion}
+              onOperarCasos={operarCasos}
+              onSumarAdmin={(tenantId) => {
+                setNuevoTenantId(tenantId);
+                irSeccion('admins');
+              }}
+            />
           )}
 
           {seccion === 'sin_jurisdiccion' && (
@@ -736,18 +821,44 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                 </div>
               </header>
 
+              <div className="admin-dash-filtros" style={{ marginBottom: '1rem' }}>
+                {[
+                  { id: 'todos', label: 'Todos' },
+                  { id: 'por_aprobar', label: 'Por aprobar' },
+                  { id: 'aprobados', label: 'Ya aprobados' },
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={`admin-dash-btn${filtroSinTenantEstado === f.id ? ' primario' : ''}`}
+                    onClick={() => setFiltroSinTenantEstado(f.id)}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
               {cargando ? (
                 <p className="admin-dash-vacio">Cargando…</p>
               ) : sinTenantItems.length === 0 ? (
                 <p className="admin-dash-vacio">
                   {sinTenantMeta.total === 0
-                    ? 'No hay casos sin jurisdicción. Todo en orden.'
+                    ? (filtroSinTenantEstado === 'por_aprobar'
+                      ? 'No hay casos sin jurisdicción por aprobar.'
+                      : filtroSinTenantEstado === 'aprobados'
+                        ? 'No hay casos sin jurisdicción ya aprobados.'
+                        : 'No hay casos sin jurisdicción. Todo en orden.')
                     : 'No hay más casos en esta página.'}
                 </p>
               ) : (
                 <>
                   <p className="admin-dash-sub">
                     {sinTenantMeta.total} caso{sinTenantMeta.total === 1 ? '' : 's'} sin territorio
+                    {filtroSinTenantEstado === 'por_aprobar'
+                      ? ' · por aprobar'
+                      : filtroSinTenantEstado === 'aprobados'
+                        ? ' · ya aprobados'
+                        : ''}
                   </p>
                   <ul className="super-lista">
                     {sinTenantItems.map((c) => (
@@ -1120,6 +1231,80 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           )}
         </div>
       </div>
+
+      {pickerOperar && (
+        <div
+          className="perfil-pedido-fondo"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Elegir municipio para operar"
+          onClick={() => {
+            setPickerOperar(null);
+            setMunicipioPicker('');
+            setBusquedaPicker('');
+          }}
+        >
+          <div className="perfil-pedido-modal super-operar-picker" onClick={(e) => e.stopPropagation()}>
+            <h4>
+              {pickerOperar?.foco?.seccion === 'registro'
+                ? 'Registro · elegir municipio'
+                : pickerOperar?.foco?.seccion === 'soporte'
+                  ? 'Soporte · elegir municipio'
+                  : 'Elegir municipio'}
+            </h4>
+            <p className="perfil-nota">
+              {pickerOperar?.foco?.seccion === 'registro'
+                ? 'El registro (resueltos, anulados, vencidos) se mira por municipio, sin mezclar toda la provincia.'
+                : pickerOperar?.foco?.seccion === 'soporte'
+                  ? 'Los pedidos de identidad (DNI, celular, nombre, municipio) se atienden por municipio.'
+                  : 'Vas a operar los casos de un solo municipio o comuna, sin mezclar con el resto de la provincia.'}
+            </p>
+            <input
+              type="search"
+              className="super-operar-picker-buscar"
+              value={busquedaPicker}
+              onChange={(e) => setBusquedaPicker(e.target.value)}
+              placeholder="Buscar municipio o comuna…"
+              aria-label="Buscar municipio"
+              autoFocus
+            />
+            <ul className="super-operar-picker-lista" role="listbox" aria-label="Municipios">
+              {municipiosPickerFiltrados.length === 0 ? (
+                <li className="super-operar-picker-vacio">Ningún municipio coincide</li>
+              ) : (
+                municipiosPickerFiltrados.map((t) => (
+                  <li key={t.id}>
+                    <button
+                      type="button"
+                      className={String(municipioPicker) === String(t.id) ? 'activo' : ''}
+                      onClick={() => {
+                        setMunicipioPicker(String(t.id));
+                        confirmarPickerOperar(String(t.id));
+                      }}
+                    >
+                      <strong>{t.name}</strong>
+                      {t.typeLabel ? <em>{t.typeLabel}</em> : null}
+                    </button>
+                  </li>
+                ))
+              )}
+            </ul>
+            <div className="perfil-pedido-acciones">
+              <button
+                type="button"
+                className="usuarios-ficha-accion"
+                onClick={() => {
+                  setPickerOperar(null);
+                  setMunicipioPicker('');
+                  setBusquedaPicker('');
+                }}
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

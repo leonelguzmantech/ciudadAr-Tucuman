@@ -6,19 +6,30 @@ const API = 'http://localhost:5001';
 
 /**
  * Administración de vecinos (Mongo).
- * Super: todos. Admin municipal: solo su jurisdicción.
+ * Super (panel propio): elige municipio.
+ * Super operando un municipio / admin municipal: solo esa jurisdicción.
  */
 const UsuariosPanel = ({
   userId,
   esSuper = false,
   tenantsOptions = [],
+  /** Si viene, queda fijado a ese municipio (modo “operar como admin”). */
+  tenantIdFijo = '',
+  municipioNombre = '',
 }) => {
   const headers = { 'x-user-id': userId };
+  const municipioFijo = Boolean(String(tenantIdFijo || '').trim());
   const [q, setQ] = useState('');
   const [qDebounced, setQDebounced] = useState('');
   const [estado, setEstado] = useState('activos');
-  const [tenantId, setTenantId] = useState('');
+  const [tenantId, setTenantId] = useState(() => String(tenantIdFijo || ''));
   const [soloPendiente, setSoloPendiente] = useState(false);
+
+  useEffect(() => {
+    if (!municipioFijo) return;
+    setTenantId(String(tenantIdFijo));
+    setSoloPendiente(false);
+  }, [municipioFijo, tenantIdFijo]);
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -43,6 +54,16 @@ const UsuariosPanel = ({
 
   const cargar = useCallback(async (pagina = 1) => {
     if (!userId) return;
+    const tenantEfectivo = String(tenantIdFijo || tenantId || '').trim();
+    // Super sin municipio fijo: hay que elegir municipio (o “Sin municipio activo”).
+    if (esSuper && !municipioFijo && !soloPendiente && !tenantEfectivo) {
+      setItems([]);
+      setTotal(0);
+      setPage(1);
+      setHasMore(false);
+      setCargando(false);
+      return;
+    }
     setCargando(true);
     try {
       const params = {
@@ -51,8 +72,8 @@ const UsuariosPanel = ({
         page: pagina,
         limit: 40,
       };
-      if (esSuper && soloPendiente) params.pendiente = 1;
-      else if (tenantId) params.tenantId = tenantId;
+      if (esSuper && !municipioFijo && soloPendiente) params.pendiente = 1;
+      else if (tenantEfectivo) params.tenantId = tenantEfectivo;
 
       const { data } = await axios.get(`${API}/api/usuarios/admin/usuarios`, {
         headers,
@@ -69,7 +90,7 @@ const UsuariosPanel = ({
     } finally {
       setCargando(false);
     }
-  }, [userId, qDebounced, estado, tenantId, soloPendiente, esSuper]);
+  }, [userId, qDebounced, estado, tenantId, tenantIdFijo, municipioFijo, soloPendiente, esSuper]);
 
   useEffect(() => {
     cargar(1);
@@ -176,9 +197,11 @@ const UsuariosPanel = ({
         <div>
           <h1>Usuarios</h1>
           <p>
-            {esSuper
-              ? 'Vecinos de toda la provincia: buscar, desactivar o liberar identidad sin entrar a Firebase.'
-              : 'Vecinos de tu jurisdicción: buscar, desactivar o liberar identidad.'}
+            {municipioFijo
+              ? `Vecinos de ${municipioNombre || 'este municipio'}: buscar, desactivar o liberar identidad.`
+              : esSuper
+                ? 'Elegí un municipio para ver vecinos: buscar, desactivar o liberar identidad.'
+                : 'Vecinos de tu jurisdicción: buscar, desactivar o liberar identidad.'}
           </p>
         </div>
       </header>
@@ -201,7 +224,7 @@ const UsuariosPanel = ({
           <option value="activos">Activos</option>
           <option value="desactivados">Desactivados</option>
         </select>
-        {esSuper && (
+        {esSuper && !municipioFijo && (
           <>
             <SelectMunicipio
               value={soloPendiente ? '' : tenantId}
@@ -210,10 +233,10 @@ const UsuariosPanel = ({
                 setTenantId(id);
               }}
               options={tenantsOptions}
-              emptyLabel="Todos los municipios…"
-              placeholder="Filtrar municipio…"
+              emptyLabel="Seleccionar municipio"
+              placeholder="Buscar municipio…"
               allowEmpty
-              ariaLabel="Filtrar por municipio"
+              ariaLabel="Seleccionar municipio"
               compact
             />
             <button
@@ -231,10 +254,14 @@ const UsuariosPanel = ({
       </div>
 
       <p className="admin-dash-sub" style={{ margin: '0.5rem 0 1rem' }}>
-        {cargando ? 'Cargando…' : `${total} usuario${total === 1 ? '' : 's'}`}
+        {esSuper && !municipioFijo && !soloPendiente && !tenantId
+          ? 'Seleccioná un municipio'
+          : (cargando ? 'Cargando…' : `${total} usuario${total === 1 ? '' : 's'}`)}
       </p>
 
-      {cargando && items.length === 0 ? (
+      {esSuper && !municipioFijo && !soloPendiente && !tenantId ? (
+        <p className="admin-dash-vacio">Seleccioná un municipio para ver sus vecinos.</p>
+      ) : cargando && items.length === 0 ? (
         <p className="admin-dash-vacio">Cargando usuarios…</p>
       ) : items.length === 0 ? (
         <p className="admin-dash-vacio">No hay usuarios con ese filtro.</p>

@@ -46,9 +46,42 @@ const resumenTenant = (tenant, contadores = {}) => ({
   registro: contadores.registro || 0,
 });
 
+/** Casos sin municipio/comuna: tenant vacío o (legado) tenant = provincia. */
+const buildFiltroSinTenant = async (extra = {}) => {
+  const provincias = await Tenant.find({ type: 'province' }).select('_id').lean();
+  const provinceIds = provincias.map((t) => t._id);
+  const orTenant = [{ tenant: null }, { tenant: { $exists: false } }];
+  if (provinceIds.length) orTenant.push({ tenant: { $in: provinceIds } });
+  return {
+    eliminadoAt: null,
+    status: { $nin: ['resuelto', 'rechazado'] },
+    $or: orTenant,
+    ...extra,
+  };
+};
+
+/** Municipios/comunas activos sin ningún admin local. */
+const idsMunicipiosSinAdmin = async () => {
+  const rows = await Tenant.find({
+    type: { $in: ['municipality', 'commune'] },
+    status: 'active',
+    $or: [{ admins: { $exists: false } }, { admins: { $size: 0 } }],
+  })
+    .select('_id')
+    .lean();
+  return rows.map((t) => t._id);
+};
+
 // Tablero global
 router.get('/stats', async (req, res) => {
   try {
+    const filtroSinTenantBase = await buildFiltroSinTenant();
+    const sinAdminIds = await idsMunicipiosSinAdmin();
+    const filtroCasosSinAdmin = {
+      eliminadoAt: null,
+      status: { $nin: ['resuelto', 'rechazado'] },
+      tenant: { $in: sinAdminIds },
+    };
     const [
       jurisdicciones,
       conAdmins,
@@ -58,6 +91,11 @@ router.get('/stats', async (req, res) => {
       abiertos,
       registro,
       sinTenant,
+      sinTenantPorAprobar,
+      sinTenantAprobados,
+      municipiosSinAdmin,
+      casosSinAdmin,
+      casosSinAdminPorAprobar,
     ] = await Promise.all([
       Tenant.countDocuments({}),
       Tenant.countDocuments({ 'admins.0': { $exists: true } }),
@@ -80,10 +118,20 @@ router.get('/stats', async (req, res) => {
           { status: { $in: ['resuelto', 'rechazado'] } },
         ],
       }),
+      Marker.countDocuments(filtroSinTenantBase),
       Marker.countDocuments({
-        eliminadoAt: null,
-        status: { $nin: ['resuelto', 'rechazado'] },
-        $or: [{ tenant: null }, { tenant: { $exists: false } }],
+        ...filtroSinTenantBase,
+        status: 'pendiente_aprobacion',
+      }),
+      Marker.countDocuments({
+        ...filtroSinTenantBase,
+        status: { $in: ['pendiente', 'en_proceso', 'pendiente_cierre'] },
+      }),
+      Promise.resolve(sinAdminIds.length),
+      Marker.countDocuments(filtroCasosSinAdmin),
+      Marker.countDocuments({
+        ...filtroCasosSinAdmin,
+        status: 'pendiente_aprobacion',
       }),
     ]);
 
@@ -96,6 +144,11 @@ router.get('/stats', async (req, res) => {
       abiertos,
       registro,
       sinTenant,
+      sinTenantPorAprobar,
+      sinTenantAprobados,
+      municipiosSinAdmin,
+      casosSinAdmin,
+      casosSinAdminPorAprobar,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -111,6 +164,9 @@ router.get('/dashboard', async (req, res) => {
       dias: req.query.dias,
       fechaDesde: req.query.fechaDesde,
       fechaHasta: req.query.fechaHasta,
+      tenantIds: tenantId ? [tenantId] : [],
+      // Sin municipio: altas y actividad de toda la red (panel Super).
+      usuariosGlobales: !tenantId,
     });
     res.json(data);
   } catch (error) {
@@ -121,7 +177,11 @@ router.get('/dashboard', async (req, res) => {
 // Ranking operativo por municipio/comuna (carga + demoras)
 router.get('/ranking', async (req, res) => {
   try {
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 40);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 80);
+    const incluirSinCarga = String(req.query.todos || '') === '1';
+    const dias = [7, 30, 90].includes(Number(req.query.dias)) ? Number(req.query.dias) : 30;
+    const desdePeriodo = new Date(Date.now() - dias * 24 * 60 * 60 * 1000);
+
     const tenants = await Tenant.find({
       type: { $in: ['municipality', 'commune'] },
       status: 'active',
@@ -130,13 +190,13 @@ router.get('/ranking', async (req, res) => {
       .lean();
 
     const ids = tenants.map((t) => t._id);
-    const [abiertosAgg, porAprobarAgg] = await Promise.all([
+    const [abiertosAgg, porAprobarAgg, resueltosAgg] = await Promise.all([
       Marker.aggregate([
         {
           $match: {
             tenant: { $in: ids },
             eliminadoAt: null,
-            status: { $in: ['pendiente', 'en_proceso'] },
+            status: { $in: ['pendiente', 'en_proceso', 'pendiente_cierre'] },
           },
         },
         { $group: { _id: '$tenant', n: { $sum: 1 } } },
@@ -151,6 +211,38 @@ router.get('/ranking', async (req, res) => {
         },
         { $group: { _id: '$tenant', n: { $sum: 1 } } },
       ]),
+      Marker.aggregate([
+        {
+          $match: {
+            tenant: { $in: ids },
+            status: 'resuelto',
+            createdAt: { $exists: true, $ne: null },
+            $or: [
+              { eliminadoAt: { $gte: desdePeriodo } },
+              { eliminadoAt: null, updatedAt: { $gte: desdePeriodo } },
+            ],
+          },
+        },
+        {
+          $group: {
+            _id: '$tenant',
+            resueltos: { $sum: 1 },
+            demoraMs: {
+              $sum: {
+                $max: [
+                  0,
+                  {
+                    $subtract: [
+                      { $ifNull: ['$eliminadoAt', '$updatedAt'] },
+                      '$createdAt',
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ]),
     ]);
 
     const mapCount = (rows) => {
@@ -160,56 +252,84 @@ router.get('/ranking', async (req, res) => {
     };
     const abiertos = mapCount(abiertosAgg);
     const porAprobar = mapCount(porAprobarAgg);
+    const resueltosMap = new Map();
+    resueltosAgg.forEach((r) => {
+      resueltosMap.set(String(r._id), {
+        resueltos: r.resueltos || 0,
+        demoraMediaHoras: r.resueltos
+          ? Math.round(((r.demoraMs || 0) / r.resueltos) / (1000 * 60 * 60) * 10) / 10
+          : null,
+      });
+    });
 
-    const items = tenants
-      .map((t) => {
-        const pa = porAprobar.get(String(t._id)) || 0;
-        const ab = abiertos.get(String(t._id)) || 0;
-        const adminCount = Array.isArray(t.admins) ? t.admins.length : 0;
-        return {
-          id: String(t._id),
-          name: t.name,
-          slug: t.slug,
-          type: t.type,
-          typeLabel: TYPE_LABEL[t.type] || t.type,
-          adminCount,
-          porAprobar: pa,
-          abiertos: ab,
-          carga: pa + ab,
-          sinAdmin: adminCount === 0,
-        };
-      })
-      .filter((t) => t.carga > 0 || t.sinAdmin)
-      .sort((a, b) => {
-        if (b.carga !== a.carga) return b.carga - a.carga;
-        if (b.porAprobar !== a.porAprobar) return b.porAprobar - a.porAprobar;
-        if (a.sinAdmin !== b.sinAdmin) return a.sinAdmin ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      })
-      .slice(0, limit);
+    let items = tenants.map((t) => {
+      const id = String(t._id);
+      const pa = porAprobar.get(id) || 0;
+      const ab = abiertos.get(id) || 0;
+      const cierre = resueltosMap.get(id) || { resueltos: 0, demoraMediaHoras: null };
+      const adminCount = Array.isArray(t.admins) ? t.admins.length : 0;
+      return {
+        id,
+        name: t.name,
+        slug: t.slug,
+        type: t.type,
+        typeLabel: TYPE_LABEL[t.type] || t.type,
+        adminCount,
+        porAprobar: pa,
+        abiertos: ab,
+        carga: pa + ab,
+        resueltos: cierre.resueltos,
+        demoraMediaHoras: cierre.demoraMediaHoras,
+        sinAdmin: adminCount === 0,
+      };
+    });
 
-    res.json({ items, total: items.length });
+    if (!incluirSinCarga) {
+      // Solo territorios con trabajo (o cierres recientes). Sin admin “vacíos” no entran acá.
+      items = items.filter((t) => t.carga > 0 || t.resueltos > 0);
+    }
+
+    items.sort((a, b) => {
+      // Prioridad: sin admin local pero con cola (el Super debe verlos primero).
+      const aPri = a.sinAdmin && a.carga > 0 ? 1 : 0;
+      const bPri = b.sinAdmin && b.carga > 0 ? 1 : 0;
+      if (bPri !== aPri) return bPri - aPri;
+      if (b.carga !== a.carga) return b.carga - a.carga;
+      if (b.porAprobar !== a.porAprobar) return b.porAprobar - a.porAprobar;
+      if (a.sinAdmin !== b.sinAdmin) return a.sinAdmin ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+
+    // Con todos=1 devolvemos el listado completo (comparativo provincial).
+    if (!incluirSinCarga && limit < items.length) {
+      items = items.slice(0, limit);
+    }
+
+    res.json({ items, total: items.length, dias });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-const filtroSinTenant = {
-  eliminadoAt: null,
-  status: { $nin: ['resuelto', 'rechazado'] },
-  $or: [{ tenant: null }, { tenant: { $exists: false } }],
-};
-
 // Cola de casos sin jurisdicción (para asignar territorio)
+// estado: todos | por_aprobar | aprobados
 router.get('/sin-tenant', async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
     const skip = (page - 1) * limit;
+    const estado = String(req.query.estado || 'todos').trim();
+    const extra = {};
+    if (estado === 'por_aprobar') {
+      extra.status = 'pendiente_aprobacion';
+    } else if (estado === 'aprobados') {
+      extra.status = { $in: ['pendiente', 'en_proceso', 'pendiente_cierre'] };
+    }
+    const filtro = await buildFiltroSinTenant(extra);
 
     const [total, docs] = await Promise.all([
-      Marker.countDocuments(filtroSinTenant),
-      Marker.find(filtroSinTenant)
+      Marker.countDocuments(filtro),
+      Marker.find(filtro)
         .select('caseId status category description direccion lat lng createdAt createdBy objeto perdidaTipo')
         .sort({ createdAt: -1 })
         .skip(skip)

@@ -73,11 +73,6 @@ const EstadisticasPanel = ({
   const rangoListo = !personalizado || (fechaDesde && fechaHasta && fechaDesde <= fechaHasta);
 
   const tieneSelector = Array.isArray(tenants) && tenants.length > 0;
-  useEffect(() => {
-    if (!tieneSelector) return;
-    if (tenantId && tenants.some((t) => String(t.id) === String(tenantId))) return;
-    setTenantId(String(tenants[0].id));
-  }, [tieneSelector, tenants, tenantId]);
   const tenantElegido = tieneSelector
     ? tenants.find((t) => String(t.id) === String(tenantId))
     : null;
@@ -88,6 +83,13 @@ const EstadisticasPanel = ({
   });
   const cargar = useCallback(async () => {
     if (!url || !headers || !rangoListo) return;
+    // Super: no cargar toda la provincia mezclada; primero elegir municipio.
+    if (tieneSelector && !tenantId) {
+      setData(null);
+      setCargando(false);
+      setError('');
+      return;
+    }
     setCargando(true);
     setError('');
     try {
@@ -103,7 +105,7 @@ const EstadisticasPanel = ({
     } finally {
       setCargando(false);
     }
-  }, [url, headers, periodo, personalizado, fechaDesde, fechaHasta, rangoListo, extraKey]);
+  }, [url, headers, periodo, personalizado, fechaDesde, fechaHasta, rangoListo, extraKey, tieneSelector, tenantId]);
 
   useEffect(() => {
     cargar();
@@ -197,9 +199,14 @@ const EstadisticasPanel = ({
       ayuda: `Casos anulados o no aprobados ${etiquetaPeriodoLarga}`,
     },
     {
+      label: 'Vencidos',
+      valor: fmt(uso.vencidosPeriodo),
+      ayuda: `Avisos de animales/perdidas que caducaron solos (15 días) ${etiquetaPeriodoLarga}`,
+    },
+    {
       label: '% que se resolvió',
       valor: uso.pctResueltos == null ? '—' : `${uso.pctResueltos}%`,
-      ayuda: 'De los que se cerraron (resuelto + anulado), qué % terminó resuelto',
+      ayuda: 'De los que salieron del mapa (resuelto + anulado + vencido), qué % terminó resuelto',
     },
     {
       label: 'Vecinos distintos',
@@ -263,7 +270,52 @@ const EstadisticasPanel = ({
       anterior: comparar.vecinosDistinctos?.anterior,
       pct: comparar.vecinosDistinctos?.pct,
     },
+    {
+      key: 'usuariosNuevos',
+      label: 'Usuarios nuevos',
+      actual: comparar.usuariosNuevos?.actual,
+      anterior: comparar.usuariosNuevos?.anterior,
+      pct: comparar.usuariosNuevos?.pct,
+    },
+    {
+      key: 'usuariosActivos',
+      label: 'Usuarios activos',
+      actual: comparar.usuariosActivos?.actual,
+      anterior: comparar.usuariosActivos?.anterior,
+      pct: comparar.usuariosActivos?.pct,
+    },
   ];
+
+  const usuarios = data?.usuarios || {};
+  const kpisUsuarios = usuarios.disponibles ? [
+    {
+      label: usuarios.ambito === 'global' ? 'Registrados (red)' : 'Registrados en el municipio',
+      valor: fmt(usuarios.registrados),
+      ayuda: usuarios.ambito === 'global'
+        ? 'Cuentas activas en toda la plataforma'
+        : 'Cuentas activas que eligieron este municipio al registrarse',
+    },
+    {
+      label: 'Usuarios nuevos',
+      valor: fmt(usuarios.nuevos),
+      ayuda: `Se registraron ${etiquetaPeriodoLarga}`,
+    },
+    {
+      label: 'Activos (reportaron)',
+      valor: fmt(usuarios.activos),
+      ayuda: `Vecinos distintos que publicaron al menos un aviso ${etiquetaPeriodoLarga}`,
+    },
+    {
+      label: 'Nuevos que reportaron',
+      valor: fmt(usuarios.nuevosActivos),
+      ayuda: 'De los que se registraron en el período, cuántos ya mandaron un aviso',
+    },
+    {
+      label: 'Nuevos sin reportar',
+      valor: fmt(usuarios.nuevosQuietos),
+      ayuda: 'Se registraron en el período pero todavía no publicaron nada',
+    },
+  ] : [];
 
   const exportarCsv = () => {
     if (!data) return;
@@ -344,10 +396,11 @@ const EstadisticasPanel = ({
               value={tenantId}
               onChange={setTenantId}
               options={tenants}
+              emptyLabel="Seleccionar municipio"
               placeholder="Buscar municipio…"
               ariaLabel="Municipio"
               disabled={cargando}
-              allowEmpty={false}
+              allowEmpty
             />
           )}
           <PeriodoSelector
@@ -375,7 +428,11 @@ const EstadisticasPanel = ({
       {personalizado && !rangoListo && (
         <p className="admin-dash-vacio">Elegí una fecha desde y hasta válidas.</p>
       )}
-      {cargando && !data ? (
+      {tieneSelector && !tenantId ? (
+        <p className="admin-dash-vacio">
+          Seleccioná un municipio para ver sus estadísticas. No se mezclan todos juntos.
+        </p>
+      ) : cargando && !data ? (
         <p className="admin-dash-vacio">Cargando estadísticas…</p>
       ) : data ? (
         <>
@@ -411,13 +468,125 @@ const EstadisticasPanel = ({
               Cuántos casos entraron, se aprobaron, tomó la cuadrilla y se resolvieron.
             </p>
             <KpiGrid items={kpisUso} />
+            <div className="estadisticas-grid-charts" style={{ marginTop: 16 }}>
+              <section className="admin-dash-bloque estadisticas-chart-card">
+                <h2>Flujo del período (barras)</h2>
+                <p className="estadisticas-ayuda">
+                  De izquierda a derecha conceptual: entraron, se aprobaron, tomó la cuadrilla y cómo cerraron.
+                </p>
+                <BarrasHorizontales
+                  items={[
+                    { key: 'creados', label: 'Nuevos reportes', n: uso.publicadosPeriodo || 0 },
+                    { key: 'aprobados', label: 'Aprobados', n: uso.aprobadosPeriodo || 0 },
+                    { key: 'tomados', label: 'Tomados por cuadrilla', n: uso.tomadosPeriodo || 0 },
+                    { key: 'resueltos', label: 'Resueltos', n: uso.resueltosPeriodo || 0 },
+                    { key: 'rechazado', label: 'Anulados', n: uso.anuladosPeriodo || 0 },
+                    { key: 'vencido', label: 'Vencidos', n: uso.vencidosPeriodo || 0 },
+                  ]}
+                  vacio="Sin actividad en el período"
+                />
+              </section>
+              <section className="admin-dash-bloque estadisticas-chart-card">
+                <h2>Cómo cerraron (dona)</h2>
+                <p className="estadisticas-ayuda">
+                  De los que salieron del mapa {etiquetaPeriodoLarga}: resueltos, anulados
+                  o vencidos (animales/perdidas a los 15 días).
+                  {uso.pctResueltos != null ? ` ${uso.pctResueltos}% terminó resuelto.` : ''}
+                </p>
+                <DonaEstados
+                  items={[
+                    { key: 'resuelto', label: 'Resueltos', n: uso.resueltosPeriodo || 0 },
+                    { key: 'rechazado', label: 'Anulados', n: uso.anuladosPeriodo || 0 },
+                    { key: 'vencido', label: 'Vencidos', n: uso.vencidosPeriodo || 0 },
+                  ]}
+                  vacio="No hubo cierres en el período"
+                  centroLabel="cierres"
+                />
+              </section>
+            </div>
           </section>
+
+          {usuarios.disponibles ? (
+            <section className="admin-dash-bloque">
+              <h2>
+                {usuarios.ambito === 'global'
+                  ? `Usuarios de la red (${etiquetaPeriodo})`
+                  : `Usuarios del municipio (${etiquetaPeriodo})`}
+              </h2>
+              <p className="estadisticas-ayuda">
+                {usuarios.ambito === 'global'
+                  ? 'Altas y actividad en toda la plataforma.'
+                  : 'Altas nuevas y quiénes participaron publicando avisos.'}
+              </p>
+              <KpiGrid items={kpisUsuarios} />
+              <div className="estadisticas-grid-charts" style={{ marginTop: 16 }}>
+                <section className="admin-dash-bloque estadisticas-chart-card">
+                  <h2>Resumen en barras</h2>
+                  <p className="estadisticas-ayuda">
+                    Registrados totales vs altas y actividad {etiquetaPeriodoLarga}.
+                  </p>
+                  <BarrasHorizontales
+                    items={[
+                      { key: 'creados', label: 'Registrados', n: usuarios.registrados || 0 },
+                      { key: 'aprobados', label: 'Nuevos', n: usuarios.nuevos || 0 },
+                      { key: 'resueltos', label: 'Activos (reportaron)', n: usuarios.activos || 0 },
+                    ]}
+                    vacio="Sin datos de usuarios"
+                  />
+                </section>
+                <section className="admin-dash-bloque estadisticas-chart-card">
+                  <h2>De los usuarios nuevos</h2>
+                  <p className="estadisticas-ayuda">
+                    Qué parte de las altas ya publicó un aviso y qué parte todavía no.
+                  </p>
+                  <DonaEstados
+                    items={[
+                      {
+                        key: 'resuelto',
+                        label: 'Nuevos que reportaron',
+                        n: usuarios.nuevosActivos || 0,
+                      },
+                      {
+                        key: 'pendiente',
+                        label: 'Nuevos sin reportar',
+                        n: usuarios.nuevosQuietos || 0,
+                      },
+                    ]}
+                    vacio="No hubo usuarios nuevos en el período"
+                    centroLabel="nuevos"
+                  />
+                </section>
+                <section className="admin-dash-bloque estadisticas-chart-card estadisticas-chart-wide">
+                  <h2>Usuarios en el tiempo</h2>
+                  <p className="estadisticas-ayuda">
+                    Evolución de altas y participación.
+                    <strong> Azul:</strong> cuentas nuevas que se registraron.
+                    <strong> Verde:</strong> vecinos distintos que publicaron al menos un aviso
+                    (si alguien manda 3 reportes el mismo día, cuenta 1).
+                  </p>
+                  <LineaIngresosResueltos
+                    serie={data.serieUsuarios || []}
+                    vacio="Sin altas ni reportes de usuarios en el período"
+                    labelA="usuarios nuevos"
+                    labelB="usuarios activos"
+                    leyendaA="Azul: altas nuevas (registros)"
+                    leyendaB="Verde: vecinos que publicaron"
+                    ariaLabel="Usuarios nuevos y activos en el tiempo"
+                    variante="usuarios"
+                    totalA={usuarios.nuevos}
+                    totalB={usuarios.activos}
+                  />
+                </section>
+              </div>
+            </section>
+          ) : null}
 
           <div className="estadisticas-grid-charts">
             <section className="admin-dash-bloque estadisticas-chart-card">
-              <h2>Embudo del proceso</h2>
+              <h2>Embudo de reparaciones</h2>
               <p className="estadisticas-ayuda">
-                De los creados {etiquetaPeriodoLarga}: cuántos se aprobaron, tomó la cuadrilla y se resolvieron.
+                Solo reparaciones urbanas {etiquetaPeriodoLarga}: creadas, aprobadas, avanzadas
+                (cuadrilla tomó el caso, un vecino avisó que lo resolvió, o hay cierre propuesto) y resueltas.
                 Si se achica mucho entre pasos, ahí está el cuello de botella.
               </p>
               <EmbudoProceso items={data.embudo || []} />

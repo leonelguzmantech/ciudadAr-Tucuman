@@ -37,8 +37,10 @@ const findJurisdictionForPoint = async (lat, lng) => {
     null;
   const province = matches.find((t) => t.type === 'province') || null;
 
+  // Solo municipio/comuna es "jurisdicción operativa".
+  // Si el punto cae solo en la provincia, queda sin tenant para que el Super lo asigne.
   return {
-    tenant: local ? local._id : province ? province._id : null,
+    tenant: local ? local._id : null,
     province: province ? province._id : null,
   };
 };
