@@ -3,28 +3,46 @@ import axios from 'axios';
 import { getAuth, signOut } from 'firebase/auth';
 import appFirebase from './credenciales';
 import logoCiudad from '../assets/ciudadar-logo-circulo-estilo.jpg';
+import iconoAnimalesPata from '../assets/icono-animales-pata.png';
 import ChatReclamo from './ChatReclamo';
 import MapComponent from './MapComponent';
+import EstadisticasPanel from './EstadisticasPanel';
+import SelectMunicipio from './SelectMunicipio';
+import MiPerfil from './MiPerfil';
+import UsuariosPanel from './UsuariosPanel';
 
 const auth = getAuth(appFirebase);
 
 const ADMIN_VISTA_KEY = 'ciudadar-admin-seccion';
 const SECCIONES_ADMIN = new Set([
   'inicio',
+  'estadisticas',
   'reportes',
+  'reparaciones',
   'cosas_perdidas',
+  'animales',
   'por_aprobar',
-  'derivados',
+  'derivados', // compat sesión vieja → se normaliza a animales
   'registro',
   'mapa',
   'operarios',
+  'usuarios',
+  'soporte',
 ]);
 const ATENCIONES_OK = new Set(['urgentes', 'resolucion', 'respuestas', 'cierres', 'derivados']);
 const COLA_OPTIONS = [
   { value: 'pendientes', label: 'Por atender' },
-  { value: 'diferidos', label: 'Diferidos' },
-  { value: 'todos', label: 'Todos' },
+  { value: 'omitidos', label: 'Omitidos' },
 ];
+const ANIMALES_VISTA = [
+  { value: 'oficina', label: 'Abandonados' },
+  { value: 'perdido', label: 'Perdidos' },
+  { value: 'adopcion', label: 'En adopción' },
+];
+
+const normalizarSeccionAdmin = (raw) => (raw === 'derivados' ? 'animales' : raw);
+
+const esSeccionConCola = (sec) => sec === 'reportes' || sec === 'reparaciones';
 
 const leerVistaAdminGuardada = () => {
   try {
@@ -32,8 +50,9 @@ const leerVistaAdminGuardada = () => {
     if (!raw) return null;
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object') return null;
+    const seccionRaw = SECCIONES_ADMIN.has(data.seccion) ? data.seccion : 'inicio';
     return {
-      seccion: SECCIONES_ADMIN.has(data.seccion) ? data.seccion : 'inicio',
+      seccion: normalizarSeccionAdmin(seccionRaw),
       casoId: data.casoId ? String(data.casoId) : null,
       atencion: ATENCIONES_OK.has(data.atencion) ? data.atencion : '',
       estado: ['pendiente', 'en_proceso'].includes(data.estado) ? data.estado : 'pendiente',
@@ -66,6 +85,11 @@ const leerFocoSuperCasos = () => {
 
 const IconoInicio = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3 4 9v12h5v-7h6v7h5V9z" /></svg>
+);
+const IconoEstadisticas = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="currentColor" d="M4 20h16v2H2V2h2v18zm3-1h2V10H7v9zm4 0h2V6h-2v13zm4 0h2v-5h-2v5zm4 0h2V8h-2v11z" />
+  </svg>
 );
 /** Alerta / reporte ciudadano */
 const IconoReportes = () => (
@@ -108,13 +132,24 @@ const IconoRegistro = () => (
     <path fill="currentColor" d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V4h10v7zM9 13h10v3H9v-3z" />
   </svg>
 );
-/** Derivados a oficina (siguen en el mapa) */
-const IconoDerivados = () => (
-  <svg viewBox="0 0 24 24" aria-hidden="true">
-    <path fill="currentColor" d="M12 2a7 7 0 0 1 7 7c0 5.25-7 13-7 13S5 14.25 5 9a7 7 0 0 1 7-7zm0 9.5A2.5 2.5 0 1 0 12 6a2.5 2.5 0 0 0 0 5.5z" />
-  </svg>
+/** Animales: patita (oficina avisada, perdidos y adopción) */
+const IconoAnimales = () => (
+  <img
+    src={iconoAnimalesPata}
+    alt=""
+    className="admin-dash-nav-icono-img"
+    aria-hidden="true"
+  />
 );
 /** Material Icons “engineering” (oficial) — persona con casco + engranajes */
+const IconoAdmins = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0 2c-4 0-8 2-8 4v2h16v-2c0-2-4-4-8-4z" /></svg>
+);
+const IconoSoporte = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="currentColor" d="M12 2a8 8 0 0 0-8 8v3.5A2.5 2.5 0 0 0 6.5 16H8v-4H5.1A6 6 0 0 1 12 4a6 6 0 0 1 6.9 8H16v4h1.5A2.5 2.5 0 0 0 20 13.5V10a8 8 0 0 0-8-8zm-3 14v2a3 3 0 0 0 3 3h1v-2h-1a1 1 0 0 1-1-1v-2H9z" />
+  </svg>
+);
 const IconoCuadrilla = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path
@@ -127,7 +162,7 @@ const API = 'http://localhost:5001';
 const GOOGLE_MAPS_API_KEY = 'AIzaSyBKHbs5m_qsi4sd80epFp-mLP8KSFixk_4';
 
 const STATUS_LABEL = {
-  pendiente_aprobacion: 'Pendiente',
+  pendiente_aprobacion: 'Por revisar',
   pendiente: 'Publicado',
   en_proceso: 'En proceso',
   pendiente_cierre: 'Cierre propuesto',
@@ -138,9 +173,10 @@ const STATUS_LABEL = {
 /** Familias no se publican en el mapa vecino: no decir "Publicado" */
 const etiquetaEstadoAdmin = (m) => {
   if (!m) return '—';
+  // Misma etiqueta para todas las categorías en Por aprobar
+  if (m.status === 'pendiente_aprobacion') return 'Por revisar';
   const esFamilia = m.category === 'familias' || m.category === 'persona';
   if (esFamilia) {
-    if (m.status === 'pendiente_aprobacion') return 'Por revisar';
     if (m.status === 'pendiente') return m.avisadoAt ? 'Oficina avisada' : 'Aprobado (privado)';
     if (m.status === 'rechazado') return 'Anulado';
     if (m.status === 'resuelto') return 'Cerrado';
@@ -190,7 +226,6 @@ const REGISTRO_TIPO_CIERRE = [
   { value: 'anulado', label: 'Anulado' },
   { value: 'vencido', label: 'Vencido' },
   { value: 'oficina', label: 'Oficina avisada' },
-  { value: '', label: 'Todo tipo de cierre' },
 ];
 
 const REGISTRO_CATEGORIA = [
@@ -198,23 +233,26 @@ const REGISTRO_CATEGORIA = [
   { value: 'perros_gatos', label: 'Perros y gatos' },
   { value: 'familias', label: 'Familias' },
   { value: 'cosas_perdidas', label: 'Cosas perdidas' },
-  { value: '', label: 'Todas las categorías' },
 ];
 
-const POR_APROBAR_CATEGORIA = [
-  { value: '', label: 'Todas las categorías' },
-  { value: 'reparaciones', label: 'Reparaciones' },
-  { value: 'familias', label: 'Familias' },
-  { value: 'perros_gatos', label: 'Perros y gatos' },
-  { value: 'cosas_perdidas', label: 'Cosas perdidas' },
-];
+/** Categorías posibles según el tipo de cierre (el tipo manda; la categoría se adapta). */
+const REGISTRO_CATEGORIAS_POR_TIPO = {
+  oficina: ['familias'], // solo familias pasan a Registro al avisar oficina
+  vencido: ['perros_gatos', 'cosas_perdidas'], // vencimiento automático 15 días
+  resuelto: ['reparaciones', 'perros_gatos', 'cosas_perdidas'],
+  anulado: ['reparaciones', 'perros_gatos', 'familias', 'cosas_perdidas'],
+};
+
+const opcionesRegistroCategoria = (tipo) => {
+  const keys = REGISTRO_CATEGORIAS_POR_TIPO[tipo] || REGISTRO_CATEGORIA.map((c) => c.value);
+  return REGISTRO_CATEGORIA.filter((c) => keys.includes(c.value));
+};
 
 const REGISTRO_PERIODO = [
   { value: '7', label: 'Últimos 7 días' },
   { value: '30', label: 'Últimos 30 días' },
   { value: '90', label: 'Últimos 90 días' },
   { value: 'personalizado', label: 'Personalizado' },
-  { value: '', label: 'Cualquier fecha' },
 ];
 
 const PERDIDA_LABEL = {
@@ -261,10 +299,13 @@ const lineaCategoria = (m) => {
 
 const metaCasoLista = (m) => lineaCategoria(m);
 
-const buildImageUrl = (path) => {
+const buildImageUrl = (path, userId) => {
   if (!path) return null;
   if (path.startsWith('http')) return path;
-  return `${API}${path}`;
+  const base = `${API}${path}`;
+  if (!userId || userId === 'anonimo') return base;
+  const sep = base.includes('?') ? '&' : '?';
+  return `${base}${sep}userId=${encodeURIComponent(userId)}`;
 };
 
 const whatsappUrlAdmin = (contacto, texto = '') => {
@@ -428,9 +469,10 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   const vistaInicial = useMemo(() => {
     const guardada = leerVistaAdminGuardada() || {};
     const foco = leerFocoSuperCasos() || {};
-    const seccion = SECCIONES_ADMIN.has(foco.seccion)
+    const seccionRaw = SECCIONES_ADMIN.has(foco.seccion)
       ? foco.seccion
       : (SECCIONES_ADMIN.has(guardada.seccion) ? guardada.seccion : 'inicio');
+    const seccion = normalizarSeccionAdmin(seccionRaw);
     const casoDesdeFoco = foco.casoId || foco.markerId || null;
     const caseNumberRaw = foco.caseNumber != null ? Number(foco.caseNumber) : NaN;
     const caseNumber = Number.isFinite(caseNumberRaw) && caseNumberRaw > 0
@@ -447,13 +489,13 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         ? foco.estado
         : (guardada.estado || 'pendiente'),
       registroTipo: Object.prototype.hasOwnProperty.call(foco, 'registroTipo')
-        ? String(foco.registroTipo || '')
+        ? (String(foco.registroTipo || '') || 'resuelto')
         : 'resuelto',
       registroCategoria: Object.prototype.hasOwnProperty.call(foco, 'registroCategoria')
-        ? String(foco.registroCategoria || '')
+        ? (String(foco.registroCategoria || '') || 'reparaciones')
         : 'reparaciones',
       registroPeriodo: Object.prototype.hasOwnProperty.call(foco, 'registroPeriodo')
-        ? String(foco.registroPeriodo || '')
+        ? (String(foco.registroPeriodo || '') || '7')
         : '7',
       sinTenant: !!foco.sinTenant,
       tenantId: Object.prototype.hasOwnProperty.call(foco, 'tenantId')
@@ -499,13 +541,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   }, []);
   const [filtroEstado, setFiltroEstado] = useState(vistaInicial.estado || 'pendiente');
   const [filtroCola, setFiltroCola] = useState('pendientes');
+  const [filtroAnimalesVista, setFiltroAnimalesVista] = useState('oficina');
   const [filtroAtencion, setFiltroAtencion] = useState(vistaInicial.atencion || '');
+  const [muniOpenSignal, setMuniOpenSignal] = useState(0);
   const [filtroRegistroTipo, setFiltroRegistroTipo] = useState(vistaInicial.registroTipo);
   const [filtroRegistroCategoria, setFiltroRegistroCategoria] = useState(vistaInicial.registroCategoria);
   const [filtroRegistroPeriodo, setFiltroRegistroPeriodo] = useState(vistaInicial.registroPeriodo);
   const [filtroRegistroDesde, setFiltroRegistroDesde] = useState('');
   const [filtroRegistroHasta, setFiltroRegistroHasta] = useState('');
-  const [filtroPorAprobarCategoria, setFiltroPorAprobarCategoria] = useState('');
   const [filtroSinTenant, setFiltroSinTenant] = useState(!!vistaInicial.sinTenant);
   const [filtroTenantId, setFiltroTenantId] = useState(
     vistaInicial.tenantId != null ? vistaInicial.tenantId : ''
@@ -518,21 +561,29 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   const [operariosTenants, setOperariosTenants] = useState([]);
   const [nuevoOperarioEmail, setNuevoOperarioEmail] = useState('');
   const [nuevoOperarioTenantId, setNuevoOperarioTenantId] = useState('');
+  const [soporteLista, setSoporteLista] = useState([]);
+  const [soporteFiltro, setSoporteFiltro] = useState('pendiente');
+  const [soporteCargando, setSoporteCargando] = useState(false);
+  const [soportePendientes, setSoportePendientes] = useState(0);
+  const [mostrarPerfil, setMostrarPerfil] = useState(false);
   const [stats, setStats] = useState({
     total: 0,
     reportes: 0,
+    reparaciones: 0,
     perdidas: 0,
     porAprobar: 0,
     enProceso: 0,
     cierresPendientes: 0,
     registro: 0,
     nuevosReportes: 0,
+    nuevosReparaciones: 0,
     nuevasPerdidas: 0,
     urgentes: 0,
     resueltosVecino: 0,
     respuestasDatos: 0,
     derivados: 0,
     nuevosDerivados: 0,
+    porMunicipio: null,
   });
   const [cargando, setCargando] = useState(true);
   const [accionando, setAccionando] = useState(false);
@@ -544,11 +595,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   const [dialogo, setDialogo] = useState(null); // { tipo, marker }
   const [dialogoTexto, setDialogoTexto] = useState('');
   const [dialogoError, setDialogoError] = useState('');
+  const [perfilReportante, setPerfilReportante] = useState(null);
   // IDs de casos recién aprobados a sombrear al abrir Reportes / Cosas perdidas
   const [idsNuevosDestacados, setIdsNuevosDestacados] = useState(() => new Set());
   // Mientras está abierta la ficha, seguir mostrando el aviso aunque ya se marcó vista
   const [avisoRespuestaCasoId, setAvisoRespuestaCasoId] = useState(null);
   const seccionVistosRef = useRef('');
+  /** Evita reemplazar la lista por “Cargando…” al cambiar un filtro (solo spinner al entrar a la sección). */
+  const listaSeccionCargadaRef = useRef('');
   const respuestaVistaRef = useRef('');
 
   const headers = useMemo(() => ({ 'x-user-id': userId }), [userId]);
@@ -600,7 +654,8 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       if (!filtroSinTenant && filtroTenantId) params.tenantId = filtroTenantId;
     };
     // #caso exacto: no aplicar estado / período / atención (el backend solo usa caseId + jurisdicción)
-    if (esBusquedaCaseId) {
+    // Por aprobar no usa buscador: listar todos los pendientes
+    if (esBusquedaCaseId && seccion !== 'por_aprobar') {
       params.q = qLimpio;
       params.soloCaseId = 1;
       if (filtroSinTenant) params.sinTenant = 1;
@@ -609,9 +664,10 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     }
     if (!filtroSinTenant) {
       if (seccion === 'cosas_perdidas') params.category = 'cosas_perdidas';
+      if (seccion === 'reparaciones') params.category = 'reparaciones';
       if (seccion === 'reportes') {
-        // Cola municipal: sin cosas perdidas ni adopción / animal perdido (Radar)
-        params.excludeCategory = 'cosas_perdidas';
+        // Sin cosas perdidas, sin Radar, sin reparaciones (van a su sección)
+        params.excludeCategory = 'cosas_perdidas,reparaciones';
         params.excludeAnimalTipos = 'adopcion,perdido';
       }
     }
@@ -635,17 +691,25 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       if (busquedaDebounced) params.q = busquedaDebounced;
       return params;
     }
-    // Por aprobar: solo pendientes de revisión (+ categoría opcional)
+    // Por aprobar: todos los pendientes de revisión (lista corta, sin buscador)
     if (seccion === 'por_aprobar') {
       params.status = 'pendiente_aprobacion';
-      if (filtroPorAprobarCategoria) params.category = filtroPorAprobarCategoria;
       aplicarTenant();
-      if (busquedaDebounced) params.q = busquedaDebounced;
       return params;
     }
-    // Derivados: oficina avisada, siguen en el mapa (no Registro)
-    if (seccion === 'derivados') {
-      params.atencion = 'derivados';
+    // Animales: abandonados (con o sin oficina) + perdidos/adopción
+    if (seccion === 'animales' || seccion === 'derivados') {
+      params.category = 'perros_gatos';
+      if (filtroAnimalesVista === 'oficina') {
+        params.animalTipo = 'abandonado';
+        params.atencion = 'derivados';
+      } else if (filtroAnimalesVista === 'perdido') {
+        params.animalTipo = 'perdido';
+        params.status = 'pendiente';
+      } else if (filtroAnimalesVista === 'adopcion') {
+        params.animalTipo = 'adopcion';
+        params.status = 'pendiente';
+      }
       aplicarTenant();
       if (busquedaDebounced) params.q = busquedaDebounced;
       return params;
@@ -671,11 +735,19 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     if (filtroSinTenant) {
       params.sinTenant = 1;
     } else {
-      params.status = filtroEstado || 'pendiente';
-      // Reportes / Cosas: no mezclar casos ya derivados a oficina
-      if (seccion === 'reportes' || seccion === 'cosas_perdidas') {
+      // Cosas perdidas: lista abierta (sin cola FIFO ni estado en proceso)
+      if (seccion === 'cosas_perdidas') {
         params.excludeAvisados = 1;
-        if (filtroCola && filtroCola !== 'todos') params.cola = filtroCola;
+        params.status = 'pendiente';
+      } else {
+        params.status = filtroEstado || 'pendiente';
+        if (esSeccionConCola(seccion)) {
+          params.excludeAvisados = 1;
+          // Cola omitidos solo en Reportes (Reparaciones ya no omite)
+          if (seccion === 'reportes' && filtroCola && filtroEstado !== 'en_proceso') {
+            params.cola = filtroCola === 'omitidos' ? 'diferidos' : filtroCola;
+          }
+        }
       }
       aplicarTenant();
     }
@@ -686,13 +758,13 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     page,
     filtroEstado,
     filtroCola,
+    filtroAnimalesVista,
     filtroAtencion,
     filtroRegistroTipo,
     filtroRegistroCategoria,
     filtroRegistroPeriodo,
     filtroRegistroDesde,
     filtroRegistroHasta,
-    filtroPorAprobarCategoria,
     filtroTenantId,
     filtroSinTenant,
     busquedaDebounced,
@@ -719,11 +791,13 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
 
   const cargarLista = useCallback(async () => {
     if (!userId) return;
-    if (seccion === 'inicio') {
+    if (seccion === 'inicio' || seccion === 'estadisticas' || seccion === 'operarios' || seccion === 'usuarios' || seccion === 'soporte') {
       setCargando(false);
+      listaSeccionCargadaRef.current = '';
       return;
     }
-    setCargando(true);
+    const primeraCargaSeccion = listaSeccionCargadaRef.current !== seccion;
+    if (primeraCargaSeccion) setCargando(true);
     try {
       const params = { ...paramsLista };
       if (seccion === 'mapa') {
@@ -747,14 +821,15 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         hasMore: !!data.hasMore,
         limit: data.limit || 20,
       });
+      listaSeccionCargadaRef.current = seccion;
 
-      // Primera carga de Reportes / Cosas / Derivados: sombrear nuevos y bajar el badge
+      // Primera carga de Reportes / Cosas / Animales: sombrear nuevos y bajar el badge
       if (
-        (seccion === 'reportes' || seccion === 'cosas_perdidas' || seccion === 'derivados')
+        (esSeccionConCola(seccion) || seccion === 'cosas_perdidas' || seccion === 'animales')
         && seccionVistosRef.current !== seccion
       ) {
         seccionVistosRef.current = seccion;
-        if (seccion === 'derivados') {
+        if (seccion === 'animales' && filtroAnimalesVista === 'oficina') {
           // Sombrear no vistos (true) o legacy sin flag; siempre limpiar badge al abrir
           const nuevosDeriv = items.filter((m) => (
             Boolean(m.avisadoAt)
@@ -802,18 +877,23 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   }, [cargarAuthYStats]);
 
   useEffect(() => {
+    // Compat: filtro viejo “Esperando cuadrilla” → Omitidos
+    if (filtroCola === 'cuadrilla') setFiltroCola('omitidos');
+  }, [filtroCola]);
+
+  useEffect(() => {
     setPage(1);
   }, [
     seccion,
     filtroEstado,
     filtroCola,
+    filtroAnimalesVista,
     filtroAtencion,
     filtroRegistroTipo,
     filtroRegistroCategoria,
     filtroRegistroPeriodo,
     filtroRegistroDesde,
     filtroRegistroHasta,
-    filtroPorAprobarCategoria,
     filtroTenantId,
     filtroSinTenant,
     busquedaDebounced,
@@ -821,6 +901,20 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
 
   const esSuperOperando = roleInfo.role === 'SUPER_ADMIN' || Boolean(onVolverSuper);
   const tenantsSuperListosRef = useRef(false);
+
+  const categoriasRegistro = useMemo(
+    () => opcionesRegistroCategoria(filtroRegistroTipo),
+    [filtroRegistroTipo]
+  );
+
+  // Solo el tipo de cierre condiciona la categoría (no al revés)
+  useEffect(() => {
+    if (seccion !== 'registro') return;
+    const cats = opcionesRegistroCategoria(filtroRegistroTipo);
+    if (!cats.some((c) => c.value === filtroRegistroCategoria) && cats[0]) {
+      setFiltroRegistroCategoria(cats[0].value);
+    }
+  }, [seccion, filtroRegistroTipo, filtroRegistroCategoria]);
 
   useEffect(() => {
     if (!userId || !esSuperOperando) return undefined;
@@ -863,32 +957,52 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     if (sec === 'registro') {
       return Boolean(m.eliminadoAt) || m.status === 'resuelto' || m.status === 'rechazado';
     }
-    if (sec === 'derivados') {
-      return Boolean(m.avisadoAt) && !m.eliminadoAt
-        && m.status !== 'resuelto' && m.status !== 'rechazado' && m.status !== 'pendiente_aprobacion';
+    if (sec === 'animales' || sec === 'derivados') {
+      if (m.category !== 'perros_gatos') return false;
+      if (m.eliminadoAt || m.status === 'resuelto' || m.status === 'rechazado' || m.status === 'pendiente_aprobacion') {
+        return false;
+      }
+      if (filtroAnimalesVista === 'oficina') {
+        return m.animalTipo === 'abandonado' && Boolean(m.avisadoAt);
+      }
+      if (filtroAnimalesVista === 'perdido') {
+        return m.animalTipo === 'perdido' && !m.avisadoAt;
+      }
+      if (filtroAnimalesVista === 'adopcion') {
+        return m.animalTipo === 'adopcion' && !m.avisadoAt;
+      }
+      return false;
     }
     if (sec === 'cosas_perdidas') {
       if (m.eliminadoAt || m.status === 'pendiente_aprobacion' || m.status === 'rechazado') return false;
       if (m.avisadoAt) return false;
-      if (filtroCola === 'pendientes' && m.colaAdminAt) return false;
-      if (filtroCola === 'diferidos' && !m.colaAdminAt) return false;
       return m.category === 'cosas_perdidas';
+    }
+    if (sec === 'reparaciones') {
+      if (m.eliminadoAt || m.status === 'pendiente_aprobacion' || m.status === 'rechazado') return false;
+      if (m.category !== 'reparaciones') return false;
+      if (filtroEstado && m.status !== filtroEstado) return false;
+      return true;
     }
     if (sec === 'reportes') {
       if (m.eliminadoAt || m.status === 'pendiente_aprobacion' || m.status === 'rechazado') return false;
-      if (m.category === 'cosas_perdidas') return false;
+      if (m.category === 'cosas_perdidas' || m.category === 'reparaciones') return false;
       if (m.category === 'perros_gatos'
         && (m.animalTipo === 'adopcion' || m.animalTipo === 'perdido')) {
         return false;
       }
+      // Abandonados ya avisados a oficina viven en Animales
       if (m.avisadoAt) return false;
       if (filtroEstado && m.status !== filtroEstado) return false;
-      if (filtroCola === 'pendientes' && m.colaAdminAt) return false;
-      if (filtroCola === 'diferidos' && !m.colaAdminAt) return false;
+      if (filtroEstado !== 'en_proceso') {
+        const diferido = Boolean(m.colaAdminAt);
+        if (filtroCola === 'pendientes' && diferido) return false;
+        if (filtroCola === 'omitidos' && !diferido) return false;
+      }
       return true;
     }
     return true;
-  }, [seccion, filtroEstado, filtroCola]);
+  }, [seccion, filtroEstado, filtroCola, filtroAnimalesVista]);
 
   const actualizarLocal = (actualizado, { alFinal = false } = {}) => {
     const merged = { ...actualizado, canManage: true };
@@ -901,7 +1015,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       const resto = prev.filter((m) => String(m._id) !== idMerged);
       const anterior = prev.find((m) => String(m._id) === idMerged);
       const item = anterior ? { ...anterior, ...merged } : merged;
-      // Tras avisar a la cuadrilla: al final de la cola (como en el servidor)
+      // Tras omitir: al final de la cola (como en el servidor)
       if (alFinal) return [...resto, item];
       if (!anterior) return [item, ...prev];
       return prev.map((m) => (String(m._id) === idMerged ? item : m));
@@ -1053,11 +1167,12 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
   const irSeccion = (id, opciones = {}) => {
     if (id !== seccion) {
       seccionVistosRef.current = '';
-      if (id !== 'reportes' && id !== 'cosas_perdidas' && id !== 'derivados') {
+      if (!esSeccionConCola(id) && id !== 'cosas_perdidas' && id !== 'animales') {
         setIdsNuevosDestacados(new Set());
       }
     }
-    setSeccion(id);
+    setSeccion(normalizarSeccionAdmin(id));
+    listaSeccionCargadaRef.current = '';
     setCasoId(null);
     setCasoDetalle(null);
     setVerResolucion(false);
@@ -1065,14 +1180,20 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     setPage(1);
     setFiltroAtencion(opciones.atencion || '');
     setFiltroSinTenant(!!opciones.sinTenant);
+    if (id === 'por_aprobar') {
+      setBusqueda('');
+      setBusquedaDebounced('');
+    }
     // Tras aprobar, los nuevos quedan en estado "pendiente"
     // Cosas perdidas: sin "en proceso" (flujo entre vecinos)
-    if (id === 'reportes' || id === 'cosas_perdidas') {
+    if (esSeccionConCola(id) || id === 'cosas_perdidas') {
       setFiltroEstado(
         id === 'cosas_perdidas'
           ? 'pendiente'
           : (opciones.atencion ? 'pendiente' : (opciones.estado || 'pendiente'))
       );
+      if (id === 'cosas_perdidas') setFiltroCola('pendientes');
+      else if (!opciones.atencion) setFiltroCola('pendientes');
     }
     if (id === 'registro') {
       setFiltroRegistroTipo(
@@ -1100,19 +1221,73 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     }
   };
 
+  /** Super: un solo municipio → salta ahí; varios → abre sección (chips para elegir). */
+  const irSeccionConMunicipios = (id, listaMunicipios, opciones = {}) => {
+    const lista = Array.isArray(listaMunicipios) ? listaMunicipios : [];
+    if (lista.length === 1 && lista[0]?.tenantId) {
+      irSeccion(id, { ...opciones, tenantId: String(lista[0].tenantId) });
+      return;
+    }
+    irSeccion(id, opciones);
+  };
+
+  const CHIPS_MUNI_MAX = 5;
+
+  const abrirSelectorMunicipio = () => {
+    setMuniOpenSignal((n) => n + 1);
+  };
+
+  const chipsMunicipio = (lista, seccionDestino, opciones = {}) => {
+    if (!esSuperOperando || !lista?.length) return null;
+    const visibles = lista.slice(0, CHIPS_MUNI_MAX);
+    const resto = lista.length - visibles.length;
+    const irYAbrirMas = () => {
+      const mismaSeccion = seccion === seccionDestino
+        && String(filtroAtencion || '') === String(opciones.atencion || '');
+      if (!mismaSeccion) {
+        irSeccion(seccionDestino, opciones);
+        window.setTimeout(abrirSelectorMunicipio, 80);
+      } else {
+        abrirSelectorMunicipio();
+      }
+    };
+    return (
+      <div className="admin-dash-muni-chips" role="group" aria-label="Municipios con pendientes">
+        {visibles.map((m) => (
+          <button
+            key={m.tenantId}
+            type="button"
+            className={`admin-dash-muni-chip${String(filtroTenantId) === String(m.tenantId) ? ' activo' : ''}`}
+            onClick={() => irSeccion(seccionDestino, { ...opciones, tenantId: String(m.tenantId) })}
+          >
+            {m.name}
+            <em>{m.n}</em>
+          </button>
+        ))}
+        {resto > 0 && (
+          <button
+            type="button"
+            className="admin-dash-muni-chip admin-dash-muni-chip-mas"
+            onClick={irYAbrirMas}
+            title="Ver el resto en el selector de municipio"
+          >
+            +{resto} más
+          </button>
+        )}
+      </div>
+    );
+  };
+
   const selectJurisdiccionSuper = esSuperOperando ? (
-    <select
+    <SelectMunicipio
       value={filtroTenantId}
-      onChange={(e) => setFiltroTenantId(e.target.value)}
-      aria-label="Municipio o comuna"
-    >
-      {tenantsSuper.map((t) => (
-        <option key={t.id} value={t.id}>
-          {t.name} ({t.typeLabel})
-        </option>
-      ))}
-      <option value="">Todas las jurisdicciones</option>
-    </select>
+      onChange={setFiltroTenantId}
+      options={tenantsSuper}
+      placeholder="Buscar municipio o comuna…"
+      ariaLabel="Municipio o comuna"
+      allowEmpty={false}
+      openSignal={muniOpenSignal}
+    />
   ) : null;
 
   const aprobar = async (marker = caso) => {
@@ -1122,12 +1297,17 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       const { data } = await axios.patch(`${API}/api/markers/admin/${marker._id}/approve`, {}, { headers });
       actualizarLocal(data);
       const esFamilia = data.category === 'familias' || data.category === 'persona';
+      const esAnimal = data.category === 'perros_gatos';
       mostrarAviso(
         data.category === 'cosas_perdidas'
           ? `Caso #${data.caseId} aprobado · pasó a Cosas perdidas`
-          : esFamilia
-            ? `Caso #${data.caseId} aprobado (privado) · pasó a Reportes`
-            : `Caso #${data.caseId} aprobado · pasó a Reportes (Publicado)`
+          : data.category === 'reparaciones'
+            ? `Caso #${data.caseId} aprobado · pasó a Reparaciones`
+            : esFamilia
+              ? `Caso #${data.caseId} aprobado (privado) · pasó a Reportes`
+              : esAnimal
+                ? `Caso #${data.caseId} aprobado · pasó a Animales`
+                : `Caso #${data.caseId} aprobado · pasó a Reportes`
       );
     } catch (err) {
       mostrarAviso(err.response?.data?.message || 'No se pudo aprobar');
@@ -1160,6 +1340,21 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
 
   const pedirDatos = (marker = caso) => abrirDialogo('pedir_datos', marker);
   const avisarCuadrilla = (marker = caso) => abrirDialogo('avisar_cuadrilla', marker);
+  const reabrirDesdeRegistro = (marker = caso) => abrirDialogo('reabrir_registro', marker);
+
+  /** Omitir / retomar cola: solo Reportes (no Reparaciones, Animales ni Cosas perdidas). */
+  const puedeOmitirColaCaso = (m) => {
+    if (!m) return false;
+    if (m.category === 'cosas_perdidas') return false;
+    if (m.category === 'reparaciones') return false;
+    if (m.category === 'perros_gatos') return false;
+    return true;
+  };
+
+  const destinoOmitidosDe = (m) => {
+    if (!m) return 'Omitidos';
+    return 'Reportes → Omitidos';
+  };
 
   const omitirCola = async (marker = caso) => {
     if (!marker || accionando) return;
@@ -1170,13 +1365,31 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         {},
         { headers }
       );
+      const destino = destinoOmitidosDe(data || marker);
+      // Solo aviso: no cambiar de pestaña ni saltar de sección
       actualizarLocal(data, { alFinal: true });
-      setCasoId(null);
-      setCasoDetalle(null);
-      setMapaCaso(null);
-      mostrarAviso('Omitido · pasó al final de la cola');
+      mostrarAviso(`Omitido · caso #${data.caseId || marker.caseId} pasó a ${destino}`);
     } catch (err) {
       mostrarAviso(err.response?.data?.message || 'No se pudo omitir');
+    } finally {
+      setAccionando(false);
+    }
+  };
+
+  const retomarCola = async (marker = caso) => {
+    if (!marker || accionando) return;
+    setAccionando(true);
+    try {
+      const { data } = await axios.patch(
+        `${API}/api/markers/admin/${marker._id}/retomar-cola`,
+        {},
+        { headers }
+      );
+      // Solo aviso: no cambiar de pestaña ni saltar de sección
+      actualizarLocal(data);
+      mostrarAviso(`Caso #${data.caseId || marker.caseId} · volvió a Por atender`);
+    } catch (err) {
+      mostrarAviso(err.response?.data?.message || 'No se pudo retomar');
     } finally {
       setAccionando(false);
     }
@@ -1217,9 +1430,106 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     }
   }, [userId, headers, nuevoOperarioTenantId]);
 
+  const cargarSoporte = useCallback(async (estado = soporteFiltro) => {
+    if (!userId) return;
+    setSoporteCargando(true);
+    try {
+      const { data } = await axios.get(`${API}/api/usuarios/admin/soporte`, {
+        headers,
+        params: { estado },
+      });
+      setSoporteLista(data.items || []);
+      if (estado === 'pendiente') {
+        setSoportePendientes((data.items || []).length);
+      }
+    } catch {
+      setSoporteLista([]);
+    } finally {
+      setSoporteCargando(false);
+    }
+  }, [userId, headers, soporteFiltro]);
+
+  const refrescarBadgeSoporte = useCallback(async () => {
+    if (!userId) return;
+    try {
+      const { data } = await axios.get(`${API}/api/usuarios/admin/soporte`, {
+        headers,
+        params: { estado: 'pendiente' },
+      });
+      setSoportePendientes((data.items || []).length);
+    } catch {
+      /* ignore */
+    }
+  }, [userId, headers]);
+
   useEffect(() => {
     if (seccion === 'operarios') cargarOperarios();
   }, [seccion, cargarOperarios]);
+
+  useEffect(() => {
+    if (seccion === 'soporte') cargarSoporte(soporteFiltro);
+  }, [seccion, soporteFiltro, cargarSoporte]);
+
+  useEffect(() => {
+    refrescarBadgeSoporte();
+    const id = setInterval(refrescarBadgeSoporte, 60000);
+    return () => clearInterval(id);
+  }, [refrescarBadgeSoporte]);
+
+  const liberarCampoSoporte = async (item) => {
+    if (!item?.email || accionando) return;
+    const etiqueta = item.soporteCampoLabel || item.soporteCampo || 'dato pedido';
+    const ok = window.confirm(
+      `¿Liberar ${etiqueta} de ${item.nombre || item.email}?\nSolo se libera ese dato para que el vecino lo cargue de nuevo.`
+    );
+    if (!ok) return;
+    setAccionando(true);
+    try {
+      await axios.post(
+        `${API}/api/usuarios/admin/soporte/${encodeURIComponent(item.email)}/resetear`,
+        {
+          campo: item.soporteCampo || undefined,
+          nota: `Se liberó tu ${etiqueta}. Volvé a entrar y cargalo de nuevo.`,
+        },
+        { headers }
+      );
+      mostrarAviso(`Liberado · ${etiqueta} · ${item.email}`);
+      await cargarSoporte(soporteFiltro);
+      await refrescarBadgeSoporte();
+    } catch (err) {
+      mostrarAviso(err.response?.data?.message || 'No se pudo liberar');
+    } finally {
+      setAccionando(false);
+    }
+  };
+
+  const rechazarSoporte = async (item) => {
+    if (!item?.email || accionando) return;
+    const nota = window.prompt(
+      'Motivo para el vecino (se le notifica, sin liberar el dato):',
+      'Los datos cargados se ven correctos. Si el error continúa, escribinos de nuevo.'
+    );
+    if (nota == null) return;
+    if (String(nota).trim().length < 5) {
+      mostrarAviso('Escribí un motivo breve');
+      return;
+    }
+    setAccionando(true);
+    try {
+      await axios.post(
+        `${API}/api/usuarios/admin/soporte/${encodeURIComponent(item.email)}/rechazar`,
+        { nota: String(nota).trim() },
+        { headers }
+      );
+      mostrarAviso(`Pedido respondido sin liberar · ${item.email}`);
+      await cargarSoporte(soporteFiltro);
+      await refrescarBadgeSoporte();
+    } catch (err) {
+      mostrarAviso(err.response?.data?.message || 'No se pudo responder');
+    } finally {
+      setAccionando(false);
+    }
+  };
 
   const asignarOperario = async (event) => {
     event.preventDefault();
@@ -1282,6 +1592,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
       || tipo === 'avisar_cuadrilla'
       || tipo === 'anular'
       || tipo === 'no_aprobar'
+      || tipo === 'reabrir_registro'
     ) {
       if (texto.length < 5) {
         setDialogoError('Escribí al menos unas palabras');
@@ -1306,8 +1617,8 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           { mensaje: texto },
           { headers }
         );
-        actualizarLocal(data, { alFinal: true });
-        mostrarAviso('Aviso enviado · el caso pasó al final de la cola');
+        actualizarLocal(data);
+        mostrarAviso(`Aviso enviado a la cuadrilla · caso #${data.caseId || marker.caseId}`);
       } else if (tipo === 'reabrir_cierre') {
         const { data } = await axios.patch(
           `${API}/api/markers/admin/${marker._id}/reabrir-cierre`,
@@ -1318,6 +1629,34 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         mostrarAviso(`Caso #${data.caseId} reabierto · en proceso`);
         setFiltroAtencion('');
         setFiltroEstado('en_proceso');
+      } else if (tipo === 'reabrir_registro') {
+        const { data } = await axios.patch(
+          `${API}/api/markers/admin/${marker._id}/reabrir-registro`,
+          { mensaje: texto },
+          { headers }
+        );
+        setDialogo(null);
+        setDialogoTexto('');
+        const dest = data.status === 'pendiente_aprobacion'
+          ? 'por_aprobar'
+          : data.category === 'cosas_perdidas'
+            ? 'cosas_perdidas'
+            : data.category === 'reparaciones'
+              ? 'reparaciones'
+              : data.category === 'perros_gatos' && data.avisadoAt
+                ? 'animales'
+                : 'reportes';
+        const etiquetaDest = {
+          por_aprobar: 'Por aprobar',
+          cosas_perdidas: 'Cosas perdidas',
+          reparaciones: 'Reparaciones',
+          animales: 'Animales',
+          reportes: 'Reportes',
+        }[dest] || 'Reportes';
+        // Solo aviso: no saltar de sección
+        actualizarLocal(data);
+        mostrarAviso(`Caso #${data.caseId || marker.caseId} reabierto · pasó a ${etiquetaDest}`);
+        return;
       } else if (tipo === 'cerrar') {
         const { data } = await axios.patch(
           `${API}/api/markers/admin/${marker._id}/status`,
@@ -1363,6 +1702,33 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
     abrirDialogo('avisar_oficina', marker);
   };
 
+  const puedeVolverAReportes = (m) => (
+    m
+    && m.category === 'perros_gatos'
+    && m.animalTipo === 'abandonado'
+    && Boolean(m.avisadoAt)
+    && !m.eliminadoAt
+    && !['resuelto', 'rechazado', 'pendiente_aprobacion'].includes(m.status)
+  );
+
+  const volverAReportes = async (marker = caso) => {
+    if (!marker || accionando || !puedeVolverAReportes(marker)) return;
+    setAccionando(true);
+    try {
+      const { data } = await axios.patch(
+        `${API}/api/markers/admin/${marker._id}/volver-reportes`,
+        {},
+        { headers }
+      );
+      actualizarLocal(data);
+      mostrarAviso(`Caso #${data.caseId || marker.caseId} volvió a Reportes`);
+    } catch (err) {
+      mostrarAviso(err.response?.data?.message || 'No se pudo volver a Reportes');
+    } finally {
+      setAccionando(false);
+    }
+  };
+
   const confirmarAvisarOficina = async (marker) => {
     if (!marker || accionando) return;
     setAccionando(true);
@@ -1382,8 +1748,12 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
         mostrarAviso(`Caso #${data.caseId || marker.caseId}: oficina avisada · pasó al Registro`);
         return;
       }
-      // Abandonados: siguen en el mapa (Derivados); nos quedamos en la cola actual
-      mostrarAviso(`Caso #${data.caseId || marker.caseId}: oficina avisada · pasó a Derivados`);
+      // Abandonados: siguen en el mapa → sección Animales (oficina avisada)
+      mostrarAviso(`Caso #${data.caseId || marker.caseId}: oficina avisada · pasó a Animales`);
+      setFiltroAnimalesVista('oficina');
+      irSeccion('animales');
+      setCasoId(String(data._id));
+      setCasoDetalle(data);
       return;
     } catch (err) {
       setDialogoError(err.response?.data?.message || 'No se pudo registrar el aviso');
@@ -1431,13 +1801,18 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           ? 'Cierres propuestos por la cuadrilla'
           : ({
             inicio: 'Dashboard',
+            estadisticas: 'Estadísticas',
             reportes: 'Reportes',
+            reparaciones: 'Reparaciones',
             cosas_perdidas: 'Cosas perdidas',
             por_aprobar: 'Por aprobar',
-            derivados: 'Derivados a oficina',
+            animales: 'Animales',
+            derivados: 'Animales',
             registro: 'Registro',
             mapa: 'Mapa',
             operarios: 'Cuadrilla / Operarios',
+            usuarios: 'Usuarios',
+            soporte: 'Soporte identidad',
           }[seccion] || 'Dashboard');
 
   const totalPaginas = Math.max(1, Math.ceil((meta.total || 0) / (meta.limit || 20)));
@@ -1460,75 +1835,92 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                 ? (meta.total
                   ? `${meta.total} caso${meta.total === 1 ? '' : 's'} dados de baja (baja lógica)`
                   : 'Todavía no hay bajas en el registro')
-                : seccion === 'derivados'
-                  ? (meta.total
-                    ? `${meta.total} caso${meta.total === 1 ? '' : 's'} con oficina avisada (siguen en el mapa)`
-                    : 'Todavía no hay casos derivados a oficina')
+                : seccion === 'animales'
+                  ? `${meta.total || 0} caso${meta.total === 1 ? '' : 's'} · ${
+                    filtroAnimalesVista === 'oficina'
+                      ? 'Abandonados'
+                      : filtroAnimalesVista === 'perdido'
+                        ? 'Perdidos'
+                        : 'En adopción'
+                  }`
                   : `Mostrando ${lista.length} de ${meta.total} casos${meta.hasMore ? ' · usá filtros o pasá de página' : ''}`}
           </p>
         </div>
         <div className="admin-dash-filtros">
-            <input
-              type="search"
-              placeholder={
-                seccion === 'por_aprobar'
-                  ? 'Buscar #caso…'
-                  : seccion === 'registro' && esSuperOperando
-                    ? 'Buscar por #caso…'
-                    : seccion === 'registro'
-                      ? 'Buscar #caso, zona, objeto, motivo…'
-                      : 'Buscar #caso…'
-              }
-              value={busqueda}
-              onChange={(e) => setBusqueda(e.target.value)}
-            />
-            {esSuperOperando && !filtroSinTenant && selectJurisdiccionSuper}
-            {seccion === 'por_aprobar' && (
-              <select
-                value={filtroPorAprobarCategoria}
-                onChange={(e) => setFiltroPorAprobarCategoria(e.target.value)}
-                aria-label="Categoría"
-              >
-                {POR_APROBAR_CATEGORIA.map((opt) => (
-                  <option key={opt.value || 'todas'} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
+            {seccion !== 'por_aprobar' && (
+              <label className="admin-dash-filtro admin-dash-filtro-buscar">
+                <span>Buscar</span>
+                <input
+                  type="search"
+                  placeholder={
+                    seccion === 'registro' && esSuperOperando
+                      ? 'Buscar por #caso…'
+                      : seccion === 'registro'
+                        ? 'Buscar #caso, zona, objeto, motivo…'
+                        : 'Buscar #caso…'
+                  }
+                  value={busqueda}
+                  onChange={(e) => setBusqueda(e.target.value)}
+                />
+              </label>
+            )}
+            {esSuperOperando && !filtroSinTenant && (
+              <label className="admin-dash-filtro admin-dash-filtro-municipio">
+                <span>Municipio o comuna</span>
+                {selectJurisdiccionSuper}
+              </label>
             )}
             {seccion === 'registro' && (
               <>
-                <select
-                  value={filtroRegistroTipo}
-                  onChange={(e) => setFiltroRegistroTipo(e.target.value)}
-                  aria-label="Tipo de cierre"
-                >
-                  {REGISTRO_TIPO_CIERRE.map((opt) => (
-                    <option key={opt.value || 'todos'} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-                <select
-                  value={filtroRegistroCategoria}
-                  onChange={(e) => setFiltroRegistroCategoria(e.target.value)}
-                  aria-label="Categoría"
-                >
-                  {REGISTRO_CATEGORIA.map((opt) => (
-                    <option key={opt.value || 'todas'} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-                <select
-                  value={filtroRegistroPeriodo}
-                  onChange={(e) => {
-                    setFiltroRegistroPeriodo(e.target.value);
-                    if (e.target.value !== 'personalizado') {
-                      setFiltroRegistroDesde('');
-                      setFiltroRegistroHasta('');
-                    }
-                  }}
-                  aria-label="Período"
-                >
-                  {REGISTRO_PERIODO.map((opt) => (
-                    <option key={opt.value || 'siempre'} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
+                <label className="admin-dash-filtro">
+                  <span>Tipo de cierre</span>
+                  <select
+                    value={filtroRegistroTipo}
+                    onChange={(e) => {
+                      const tipo = e.target.value;
+                      setFiltroRegistroTipo(tipo);
+                      const cats = opcionesRegistroCategoria(tipo);
+                      if (!cats.some((c) => c.value === filtroRegistroCategoria) && cats[0]) {
+                        setFiltroRegistroCategoria(cats[0].value);
+                      }
+                    }}
+                    aria-label="Tipo de cierre"
+                  >
+                    {REGISTRO_TIPO_CIERRE.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="admin-dash-filtro">
+                  <span>Categoría</span>
+                  <select
+                    value={filtroRegistroCategoria}
+                    onChange={(e) => setFiltroRegistroCategoria(e.target.value)}
+                    aria-label="Categoría"
+                  >
+                    {categoriasRegistro.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="admin-dash-filtro">
+                  <span>Período</span>
+                  <select
+                    value={filtroRegistroPeriodo}
+                    onChange={(e) => {
+                      setFiltroRegistroPeriodo(e.target.value);
+                      if (e.target.value !== 'personalizado') {
+                        setFiltroRegistroDesde('');
+                        setFiltroRegistroHasta('');
+                      }
+                    }}
+                    aria-label="Período"
+                  >
+                    {REGISTRO_PERIODO.map((opt) => (
+                      <option key={opt.value || 'siempre'} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </label>
                 {filtroRegistroPeriodo === 'personalizado' && (
                   <div className="admin-dash-fechas-rango" role="group" aria-label="Rango de fechas">
                     <label className="admin-dash-fecha">
@@ -1555,28 +1947,56 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                 )}
               </>
             )}
-            {(seccion === 'reportes' || seccion === 'cosas_perdidas') && !filtroAtencion && (
-              <select
-                value={filtroCola}
-                onChange={(e) => setFiltroCola(e.target.value)}
-                aria-label="Cola"
-              >
-                {COLA_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
+            {/* Reportes: Estado + Cola (omitidos). Reparaciones: solo Estado. */}
+            {esSeccionConCola(seccion) && !filtroAtencion && (
+              <div className="admin-dash-filtros-pares" role="group" aria-label="Filtros de cola">
+                <label className="admin-dash-filtro">
+                  <span>Estado</span>
+                  <select
+                    value={filtroEstado}
+                    onChange={(e) => setFiltroEstado(e.target.value)}
+                    aria-label="Estado"
+                  >
+                    {STATUS_OPTIONS_ACTIVOS.map((s) => (
+                      <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                    ))}
+                  </select>
+                </label>
+                {seccion === 'reportes' && (
+                  <label className={`admin-dash-filtro${filtroEstado === 'en_proceso' ? ' admin-dash-filtro-inactivo' : ''}`}>
+                    <span>Cola</span>
+                    <select
+                      value={filtroEstado === 'en_proceso' ? '' : filtroCola}
+                      onChange={(e) => setFiltroCola(e.target.value)}
+                      aria-label="Cola"
+                      disabled={filtroEstado === 'en_proceso'}
+                      title={filtroEstado === 'en_proceso' ? 'No aplica con En proceso' : undefined}
+                    >
+                      {filtroEstado === 'en_proceso' ? (
+                        <option value="">—</option>
+                      ) : (
+                        COLA_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                )}
+              </div>
             )}
-            {seccion !== 'registro'
-              && seccion !== 'por_aprobar'
-              && seccion !== 'derivados'
-              && seccion !== 'mapa'
-              && seccion !== 'cosas_perdidas'
-              && !filtroAtencion && (
-              <select value={filtroEstado} onChange={(e) => setFiltroEstado(e.target.value)}>
-                {STATUS_OPTIONS_ACTIVOS.map((s) => (
-                  <option key={s} value={s}>{STATUS_LABEL[s]}</option>
-                ))}
-              </select>
+            {seccion === 'animales' && (
+              <label className="admin-dash-filtro admin-dash-filtro-animales-vista">
+                <span>Vista</span>
+                <select
+                  value={filtroAnimalesVista}
+                  onChange={(e) => setFiltroAnimalesVista(e.target.value)}
+                  aria-label="Vista de animales"
+                >
+                  {ANIMALES_VISTA.map((opt) => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </label>
             )}
             {filtroAtencion && (
               <button
@@ -1605,21 +2025,70 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
             )}
           </div>
       </header>
+      {esSuperOperando
+        && (esSeccionConCola(seccion) || seccion === 'por_aprobar' || seccion === 'cosas_perdidas' || seccion === 'animales')
+        && (() => {
+          const pm = stats.porMunicipio || {};
+          let listaMuni = null;
+          let opts = {};
+          if (seccion === 'reparaciones' && !filtroAtencion) listaMuni = pm.nuevosReparaciones;
+          else if (seccion === 'reportes' && !filtroAtencion) listaMuni = pm.nuevosReportes;
+          else if (seccion === 'reparaciones' && filtroAtencion === 'urgentes') listaMuni = pm.urgentes;
+          else if (seccion === 'reparaciones' && filtroAtencion === 'resolucion') listaMuni = pm.resueltosVecino;
+          else if (esSeccionConCola(seccion) && filtroAtencion === 'respuestas') listaMuni = pm.respuestasDatos;
+          else if (seccion === 'reparaciones' && filtroAtencion === 'cierres') listaMuni = pm.cierresPendientes;
+          else if (seccion === 'por_aprobar') listaMuni = pm.porAprobar;
+          else if (seccion === 'cosas_perdidas') listaMuni = pm.nuevasPerdidas;
+          // Animales: siempre la misma franja (Abandonados / Perdidos / Adopción) para que no salte al cambiar Vista
+          else if (seccion === 'animales') {
+            listaMuni = filtroAnimalesVista === 'oficina' ? (pm.nuevosDerivados || []) : [];
+          }
+          if (filtroAtencion) opts = { atencion: filtroAtencion };
+          const esAnimales = seccion === 'animales';
+          return (
+            <div className={`admin-dash-muni-aviso-slot${esAnimales ? ' admin-dash-muni-aviso-slot-fijo' : ''}`} aria-live="polite">
+              {listaMuni?.length ? (
+                <div className="admin-dash-muni-aviso" role="status">
+                  <span>Pendientes en:</span>
+                  {chipsMunicipio(listaMuni, seccion, opts)}
+                </div>
+              ) : esAnimales ? (
+                <div className="admin-dash-muni-aviso admin-dash-muni-aviso-neutro" aria-hidden="true">
+                  <span>
+                    {filtroAnimalesVista === 'oficina'
+                      ? 'Sin pendientes nuevos de abandonados'
+                      : 'Elegí municipio arriba · esta vista no usa avisos de oficina'}
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          );
+        })()}
       {cargando ? (
         <p className="admin-dash-vacio">Cargando casos…</p>
       ) : !lista.length ? (
         <p className="admin-dash-vacio">
           {seccion === 'por_aprobar'
-            ? (busquedaDebounced || filtroPorAprobarCategoria
-              ? 'Ningún caso por aprobar coincide con esos filtros.'
-              : 'No hay nada para aprobar por ahora.')
+            ? 'No hay nada para aprobar por ahora.'
             : seccion === 'registro'
               ? 'No hay casos en el registro.'
-              : ((seccion === 'reportes' || seccion === 'cosas_perdidas') && filtroCola === 'pendientes'
-                ? 'No quedan casos por atender · cambiá a Diferidos si querés retomar omitidos o avisados'
-                : ((seccion === 'reportes' || seccion === 'cosas_perdidas') && filtroCola === 'diferidos'
-                  ? 'No hay casos diferidos'
-                  : 'No hay casos con esos filtros.'))}
+              : esSeccionConCola(seccion) && filtroEstado === 'en_proceso'
+                ? 'No hay casos en proceso'
+                : seccion === 'reportes' && filtroCola === 'pendientes'
+                ? 'No quedan casos por atender · mirá Omitidos'
+                : seccion === 'reportes' && filtroCola === 'omitidos'
+                  ? 'No hay casos omitidos'
+                  : seccion === 'reparaciones'
+                    ? 'No hay casos de reparación con ese estado.'
+                  : seccion === 'animales'
+                    ? (filtroAnimalesVista === 'oficina'
+                      ? 'No hay abandonados con oficina avisada.'
+                      : filtroAnimalesVista === 'perdido'
+                        ? 'No hay avisos de animales perdidos.'
+                        : 'No hay avisos de adopción.')
+                  : seccion === 'cosas_perdidas'
+                    ? 'No hay avisos de cosas perdidas publicados.'
+                    : 'No hay casos con esos filtros.'}
         </p>
       ) : (
         <>
@@ -1630,8 +2099,18 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
               const direccion = String(m.direccion || '').trim();
               const esNuevo = idsNuevosDestacados.has(String(m._id)) || !!m.nuevoParaAdmin;
               const respondioDatos = Boolean(m.respuestaDatosAt);
+              // Retomar omitidos: solo en Reportes
+              const puedeRetomar = Boolean(m.colaAdminAt)
+                && puedeOmitirColaCaso(m)
+                && seccion === 'reportes'
+                && !m.eliminadoAt
+                && !['resuelto', 'rechazado', 'pendiente_aprobacion'].includes(m.status);
+              const puedeVolverReportesLista = seccion === 'animales'
+                && filtroAnimalesVista === 'oficina'
+                && puedeVolverAReportes(m);
+              const conAccionLista = puedeRetomar || puedeVolverReportesLista;
               return (
-                <li key={m._id}>
+                <li key={m._id} className={conAccionLista ? 'admin-dash-tarjeta-con-accion' : undefined}>
                   <button
                     type="button"
                     className={`tarjeta-mi-reporte admin-dash-tarjeta${esNuevo || respondioDatos ? ' admin-dash-tarjeta-nueva' : ''}`}
@@ -1674,12 +2153,43 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                         <span className="tarjeta-mi-reporte-desc">{descripcion}</span>
                       )}
                       <small>
+                        {m.reportante?.nombre
+                          ? `${m.reportante.nombre} · `
+                          : ''}
                         {m.jurisdictionName || 'Sin municipio'}
                         {m.createdAt ? ` · ${fechaTexto(m.createdAt)}` : ''}
                         {m.eliminadoAt ? ` · Baja: ${fechaTexto(m.eliminadoAt)}` : ''}
                       </small>
                     </span>
                   </button>
+                  {puedeRetomar && (
+                    <button
+                      type="button"
+                      className="admin-dash-btn admin-dash-btn-retomar"
+                      disabled={accionando}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        retomarCola(m);
+                      }}
+                    >
+                      Sacar de omitidos
+                    </button>
+                  )}
+                  {puedeVolverReportesLista && (
+                    <button
+                      type="button"
+                      className="admin-dash-btn admin-dash-btn-retomar"
+                      disabled={accionando}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        volverAReportes(m);
+                      }}
+                    >
+                      Volver a Reportes
+                    </button>
+                  )}
                 </li>
               );
             })}
@@ -1710,28 +2220,57 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
 
   const breadcrumb = [
     'Inicio',
+    seccion === 'estadisticas' ? 'Estadísticas' : null,
     seccion === 'reportes'
-      || (caso && !caso.eliminadoAt && !caso.avisadoAt && caso.category !== 'cosas_perdidas'
-        && seccion !== 'registro' && seccion !== 'derivados' && seccion !== 'por_aprobar')
+      || (caso && !caso.eliminadoAt && !caso.avisadoAt
+        && caso.category !== 'cosas_perdidas' && caso.category !== 'reparaciones'
+        && seccion !== 'registro' && seccion !== 'animales' && seccion !== 'por_aprobar'
+        && seccion !== 'reparaciones' && seccion !== 'cosas_perdidas')
       ? 'Reportes' : null,
+    seccion === 'reparaciones'
+      || (caso && !caso.eliminadoAt && caso.category === 'reparaciones'
+        && seccion !== 'registro' && seccion !== 'animales' && seccion !== 'por_aprobar'
+        && seccion !== 'reportes' && seccion !== 'cosas_perdidas')
+      ? 'Reparaciones' : null,
     seccion === 'cosas_perdidas'
       || (caso && !caso.eliminadoAt && !caso.avisadoAt && caso.category === 'cosas_perdidas'
-        && seccion !== 'registro' && seccion !== 'derivados')
+        && seccion !== 'registro' && seccion !== 'animales')
       ? 'Cosas perdidas' : null,
     seccion === 'mapa' ? 'Mapa' : null,
     seccion === 'por_aprobar' ? 'Por aprobar' : null,
-    seccion === 'derivados' || (caso && caso.avisadoAt && !caso.eliminadoAt) ? 'Derivados' : null,
+    seccion === 'animales'
+      || (caso && caso.category === 'perros_gatos' && (
+        (caso.animalTipo === 'abandonado' && caso.avisadoAt && !caso.eliminadoAt)
+        || caso.animalTipo === 'perdido'
+        || caso.animalTipo === 'adopcion'
+      ))
+      ? 'Animales' : null,
     seccion === 'registro' || (caso && caso.eliminadoAt) ? 'Registro' : null,
     caso ? `Caso #${caso.caseId}` : null,
   ].filter(Boolean);
 
-  const casoEnRegistro = Boolean(caso?.eliminadoAt);
+  const casoEnRegistro = Boolean(
+    caso
+    && (
+      caso.eliminadoAt
+      || caso.status === 'resuelto'
+      || caso.status === 'rechazado'
+      || seccion === 'registro'
+    )
+  );
 
   const navActivo = (id) => (
     seccion === id
-    || (caso && id === 'derivados' && caso.avisadoAt && !caso.eliminadoAt)
+    || (caso && id === 'animales' && caso.category === 'perros_gatos' && (
+      (caso.animalTipo === 'abandonado' && caso.avisadoAt && !caso.eliminadoAt)
+      || ((caso.animalTipo === 'perdido' || caso.animalTipo === 'adopcion') && !caso.eliminadoAt)
+    ))
     || (caso && id === 'cosas_perdidas' && caso.category === 'cosas_perdidas' && !caso.avisadoAt && !caso.eliminadoAt)
-    || (caso && id === 'reportes' && caso.category !== 'cosas_perdidas' && !caso.avisadoAt && !caso.eliminadoAt)
+    || (caso && id === 'reparaciones' && caso.category === 'reparaciones' && !caso.eliminadoAt)
+    || (caso && id === 'reportes' && caso.category !== 'cosas_perdidas' && caso.category !== 'reparaciones'
+      && !(caso.category === 'perros_gatos' && caso.avisadoAt)
+      && !caso.avisadoAt && !caso.eliminadoAt
+      && !(caso.category === 'perros_gatos' && (caso.animalTipo === 'perdido' || caso.animalTipo === 'adopcion')))
   );
 
   return (
@@ -1748,20 +2287,78 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           <button type="button" className={navActivo('inicio') && !caso ? 'activo' : ''} onClick={() => irSeccion('inicio')}>
             <IconoInicio /> Inicio
           </button>
-          <button type="button" className={navActivo('reportes') ? 'activo' : ''} onClick={() => irSeccion('reportes')}>
-            <IconoReportes /> Reportes
-            {stats.nuevosReportes > 0 && <em className="admin-dash-tab-badge">{stats.nuevosReportes}</em>}
-          </button>
-          <button type="button" className={navActivo('por_aprobar') ? 'activo' : ''} onClick={() => irSeccion('por_aprobar')}>
+          {/* Super ya tiene Estadísticas en su panel; acá solo el admin municipal */}
+          {!esSuperOperando && (
+            <button type="button" className={navActivo('estadisticas') ? 'activo' : ''} onClick={() => irSeccion('estadisticas')}>
+              <IconoEstadisticas /> Estadísticas
+            </button>
+          )}
+          <button
+            type="button"
+            className={navActivo('por_aprobar') ? 'activo' : ''}
+            onClick={() => irSeccionConMunicipios('por_aprobar', stats.porMunicipio?.porAprobar)}
+            title={
+              stats.porMunicipio?.porAprobar?.length
+                ? stats.porMunicipio.porAprobar.map((m) => `${m.name} (${m.n})`).join(' · ')
+                : undefined
+            }
+          >
             <IconoCheck /> Por aprobar
             {stats.porAprobar > 0 && <em className="admin-dash-tab-badge">{stats.porAprobar}</em>}
           </button>
-          <button type="button" className={navActivo('cosas_perdidas') ? 'activo' : ''} onClick={() => irSeccion('cosas_perdidas')}>
+          <button
+            type="button"
+            className={navActivo('reportes') ? 'activo' : ''}
+            onClick={() => irSeccionConMunicipios('reportes', stats.porMunicipio?.nuevosReportes)}
+            title={
+              stats.porMunicipio?.nuevosReportes?.length
+                ? stats.porMunicipio.nuevosReportes.map((m) => `${m.name} (${m.n})`).join(' · ')
+                : undefined
+            }
+          >
+            <IconoReportes /> Reportes
+            {stats.nuevosReportes > 0 && <em className="admin-dash-tab-badge">{stats.nuevosReportes}</em>}
+          </button>
+          <button
+            type="button"
+            className={navActivo('reparaciones') ? 'activo' : ''}
+            onClick={() => irSeccionConMunicipios('reparaciones', stats.porMunicipio?.nuevosReparaciones)}
+            title={
+              stats.porMunicipio?.nuevosReparaciones?.length
+                ? stats.porMunicipio.nuevosReparaciones.map((m) => `${m.name} (${m.n})`).join(' · ')
+                : undefined
+            }
+          >
+            <IconoCuadrilla /> Reparaciones
+            {stats.nuevosReparaciones > 0 && <em className="admin-dash-tab-badge">{stats.nuevosReparaciones}</em>}
+          </button>
+          <button
+            type="button"
+            className={navActivo('cosas_perdidas') ? 'activo' : ''}
+            onClick={() => irSeccionConMunicipios('cosas_perdidas', stats.porMunicipio?.nuevasPerdidas)}
+            title={
+              stats.porMunicipio?.nuevasPerdidas?.length
+                ? stats.porMunicipio.nuevasPerdidas.map((m) => `${m.name} (${m.n})`).join(' · ')
+                : undefined
+            }
+          >
             <IconoPerdidas /> Cosas perdidas
             {stats.nuevasPerdidas > 0 && <em className="admin-dash-tab-badge">{stats.nuevasPerdidas}</em>}
           </button>
-          <button type="button" className={navActivo('derivados') ? 'activo' : ''} onClick={() => irSeccion('derivados')}>
-            <IconoDerivados /> Derivados
+          <button
+            type="button"
+            className={navActivo('animales') ? 'activo' : ''}
+            onClick={() => {
+              setFiltroAnimalesVista('oficina');
+              irSeccionConMunicipios('animales', stats.porMunicipio?.nuevosDerivados);
+            }}
+            title={
+              stats.porMunicipio?.nuevosDerivados?.length
+                ? stats.porMunicipio.nuevosDerivados.map((m) => `${m.name} (${m.n})`).join(' · ')
+                : undefined
+            }
+          >
+            <IconoAnimales /> Animales
             {stats.nuevosDerivados > 0 && (
               <em className="admin-dash-tab-badge">{stats.nuevosDerivados}</em>
             )}
@@ -1769,15 +2366,27 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           <button type="button" className={navActivo('registro') ? 'activo' : ''} onClick={() => irSeccion('registro')}>
             <IconoRegistro /> Registro
           </button>
-          {(roleInfo.role === 'JURISDICTION_ADMIN' || roleInfo.role === 'SUPER_ADMIN' || onVolverSuper) && (
+          {/* Super gestiona cuadrillas en su panel propio; acá solo el admin municipal */}
+          {roleInfo.role === 'JURISDICTION_ADMIN' && !onVolverSuper && (
             <button type="button" className={navActivo('operarios') ? 'activo' : ''} onClick={() => irSeccion('operarios')}>
               <IconoCuadrilla /> Cuadrilla
             </button>
           )}
+          <button type="button" className={navActivo('usuarios') ? 'activo' : ''} onClick={() => irSeccion('usuarios')}>
+            <IconoAdmins /> Usuarios
+          </button>
+          <button type="button" className={navActivo('soporte') ? 'activo' : ''} onClick={() => irSeccion('soporte')}>
+            <IconoSoporte /> Soporte
+            {soportePendientes > 0 && <em className="admin-dash-tab-badge">{soportePendientes}</em>}
+          </button>
         </nav>
         <div className="admin-dash-sidebar-pie">
           {onVolverSuper && (
-            <button type="button" className="admin-dash-sidebar-sec" onClick={onVolverSuper}>
+            <button
+              type="button"
+              className="admin-dash-sidebar-sec admin-dash-nav-operar"
+              onClick={onVolverSuper}
+            >
               <IconoInicio /> Panel super
             </button>
           )}
@@ -1786,6 +2395,13 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
               <IconoMapa /> Vista vecino
             </button>
           )}
+          <button
+            type="button"
+            className="admin-dash-sidebar-sec"
+            onClick={() => setMostrarPerfil(true)}
+          >
+            Mi perfil
+          </button>
           <button
             type="button"
             className="admin-dash-sidebar-salir"
@@ -1802,6 +2418,14 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           </button>
         </div>
       </aside>
+
+      {mostrarPerfil && auth.currentUser && (
+        <MiPerfil
+          usuario={auth.currentUser}
+          rol={roleInfo.role === 'SUPER_ADMIN' || onVolverSuper ? 'SUPER_ADMIN' : 'JURISDICTION_ADMIN'}
+          onCerrar={() => setMostrarPerfil(false)}
+        />
+      )}
 
       <div className="admin-dash-contenido">
         <div className="admin-dash-breadcrumb">
@@ -1867,9 +2491,24 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
               ) : (
               <>
               {casoEnRegistro ? (
-                <p className="admin-dash-aviso-registro">
-                  Baja lógica · no aparece en el mapa · queda como historial
-                </p>
+                <>
+                  <p className="admin-dash-aviso-registro">
+                    Baja lógica · no aparece en el mapa · queda como historial
+                  </p>
+                  <div className="admin-dash-acciones">
+                    <button
+                      type="button"
+                      className="admin-dash-btn primario"
+                      onClick={() => reabrirDesdeRegistro()}
+                      disabled={accionando}
+                    >
+                      <IconoCheck /> Reabrir caso
+                    </button>
+                    <button type="button" className="admin-dash-btn" onClick={() => verEnMapa(caso)}>
+                      <IconoMapa /> Ver en el mapa
+                    </button>
+                  </div>
+                </>
               ) : (
                 <>
                   {(caso.respuestaDatosAt || avisoRespuestaCasoId === caso._id) && (
@@ -1991,14 +2630,25 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                         <IconoCuadrilla /> Avisar a cuadrilla
                       </button>
                     )}
-                    {caso.status !== 'pendiente_aprobacion'
+                    {puedeOmitirColaCaso(caso)
+                      && caso.status !== 'pendiente_aprobacion'
                       && caso.status !== 'resuelto'
                       && caso.status !== 'rechazado'
-                      && !caso.eliminadoAt && (
-                      <button type="button" className="admin-dash-btn" onClick={() => omitirCola()} disabled={accionando}>
-                        Omitir · al final
-                      </button>
-                    )}
+                      && !caso.eliminadoAt
+                      && (caso.colaAdminAt ? (
+                        <button
+                          type="button"
+                          className="admin-dash-btn primario"
+                          onClick={() => retomarCola()}
+                          disabled={accionando}
+                        >
+                          Sacar de omitidos
+                        </button>
+                      ) : (
+                        <button type="button" className="admin-dash-btn" onClick={() => omitirCola()} disabled={accionando}>
+                          Omitir por ahora
+                        </button>
+                      ))}
                     {caso.category === 'reparaciones'
                       && caso.status === 'pendiente' && (
                       <button
@@ -2034,6 +2684,16 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                         {caso.avisadoAt ? 'Oficina ya avisada' : 'Avisar oficina'}
                       </button>
                     )}
+                    {puedeVolverAReportes(caso) && (
+                      <button
+                        type="button"
+                        className="admin-dash-btn primario"
+                        onClick={() => volverAReportes()}
+                        disabled={accionando}
+                      >
+                        Volver a Reportes
+                      </button>
+                    )}
                     <button type="button" className="admin-dash-btn" onClick={() => verEnMapa(caso)}>
                       <IconoMapa /> Ver en el mapa
                     </button>
@@ -2047,7 +2707,27 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   <dl className="admin-dash-dl">
                     <div>
                       <dt>Reportado por</dt>
-                      <dd>{caso.createdBy || '—'}</dd>
+                      <dd>
+                        {(() => {
+                          const r = caso.reportante || {};
+                          const nombre = r.nombre || caso.createdBy || 'Sin nombre';
+                          const hayDatos = !!(r.nombre || r.dni || r.telefono || r.email || caso.createdBy);
+                          if (!hayDatos) return '—';
+                          return (
+                            <button
+                              type="button"
+                              className="admin-dash-reportante-link"
+                              onClick={() => setPerfilReportante({
+                                ...r,
+                                email: r.email || caso.createdBy || '',
+                                caseId: caso.caseId,
+                              })}
+                            >
+                              {nombre}
+                            </button>
+                          );
+                        })()}
+                      </dd>
                     </div>
                     <div>
                       <dt>Categoría</dt>
@@ -2275,6 +2955,97 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
               </>
               )}
             </div>
+          ) : seccion === 'usuarios' ? (
+            <UsuariosPanel userId={userId} esSuper={false} />
+          ) : seccion === 'soporte' ? (
+            <div className="super-seccion">
+              <header className="super-seccion-cabecera">
+                <div>
+                  <h1>Soporte · identidad</h1>
+                  <p>
+                    Pedidos para editar un dato (nombre, DNI, fotos o municipio). Liberá solo ese campo, o respondé sin liberar.
+                  </p>
+                </div>
+              </header>
+              <div className="admin-dash-filtros" style={{ marginBottom: '1rem' }}>
+                {[
+                  { id: 'pendiente', label: 'Pendientes' },
+                  { id: 'reseteado', label: 'Liberados' },
+                  { id: 'rechazado', label: 'Respondidos' },
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={`admin-dash-btn${soporteFiltro === f.id ? ' primario' : ''}`}
+                    onClick={() => setSoporteFiltro(f.id)}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+              {soporteCargando ? (
+                <p className="admin-dash-vacio">Cargando pedidos…</p>
+              ) : soporteLista.length === 0 ? (
+                <p className="admin-dash-vacio">
+                  {soporteFiltro === 'pendiente'
+                    ? 'No hay pedidos de soporte pendientes.'
+                    : 'No hay pedidos en este filtro.'}
+                </p>
+              ) : (
+                <ul className="super-lista">
+                  {soporteLista.map((item) => (
+                    <li key={item.email} className="super-tarjeta">
+                      <div className="super-tarjeta-info">
+                        <strong>{item.nombre || '(sin nombre)'}</strong>
+                        <span className="super-meta">{item.email}</span>
+                        <span className="super-meta">
+                          DNI {item.dni || '—'} · Cel. {item.telefono || '—'}
+                        </span>
+                        <span className="super-meta">
+                          Municipio: {item.soporteTenantName || '—'}
+                        </span>
+                        <span className="super-meta">
+                          Pide editar: {item.soporteCampoLabel || item.soporteCampo || 'identidad'}
+                          {item.soporteAt
+                            ? ` · ${new Date(item.soporteAt).toLocaleString('es-AR')}`
+                            : ''}
+                        </span>
+                        {item.soporteMensaje && (
+                          <p className="admin-dash-sub" style={{ margin: '0.35rem 0 0' }}>
+                            Motivo: {item.soporteMensaje}
+                          </p>
+                        )}
+                        {item.soporteNotaAdmin && item.soporteEstado !== 'pendiente' && (
+                          <p className="admin-dash-sub" style={{ margin: '0.35rem 0 0' }}>
+                            Nota admin: {item.soporteNotaAdmin}
+                          </p>
+                        )}
+                      </div>
+                      {item.soporteEstado === 'pendiente' && (
+                        <div className="super-tarjeta-acciones">
+                          <button
+                            type="button"
+                            className="admin-dash-btn admin-dash-btn-primario"
+                            disabled={accionando}
+                            onClick={() => liberarCampoSoporte(item)}
+                          >
+                            Liberar {item.soporteCampoLabel || 'dato'}
+                          </button>
+                          <button
+                            type="button"
+                            className="admin-dash-btn"
+                            disabled={accionando}
+                            onClick={() => rechazarSoporte(item)}
+                          >
+                            Responder sin liberar
+                          </button>
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           ) : seccion === 'operarios' ? (
             <div className="super-seccion">
               <header className="super-seccion-cabecera">
@@ -2295,16 +3066,20 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   onChange={(e) => setNuevoOperarioEmail(e.target.value)}
                   required
                 />
-                <select
+                <SelectMunicipio
                   value={nuevoOperarioTenantId}
-                  onChange={(e) => setNuevoOperarioTenantId(e.target.value)}
+                  onChange={setNuevoOperarioTenantId}
+                  options={operariosTenants.map((t) => ({
+                    id: t.id,
+                    name: t.name,
+                    typeLabel: t.typeLabel || t.type || '',
+                  }))}
+                  emptyLabel="Elegí municipio…"
+                  placeholder="Buscar municipio…"
+                  ariaLabel="Municipio"
                   required
-                  aria-label="Municipio"
-                >
-                  {operariosTenants.map((t) => (
-                    <option key={t.id} value={t.id}>{t.name}</option>
-                  ))}
-                </select>
+                  allowEmpty={false}
+                />
                 <button type="submit" className="admin-dash-btn admin-dash-btn-primario" disabled={accionando}>
                   Sumar operario
                 </button>
@@ -2333,7 +3108,15 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                 </ul>
               )}
             </div>
-          ) : seccion === 'inicio' ? (
+          ) : seccion === 'estadisticas' && !esSuperOperando ? (
+            <EstadisticasPanel
+              url={`${API}/api/markers/admin/dashboard`}
+              headers={headers}
+              titulo="Estadísticas"
+              subtitulo="Control de casos y publicaciones de vecinos en tu municipio"
+              extraParams={filtroTenantId ? { tenantId: filtroTenantId } : {}}
+            />
+          ) : seccion === 'inicio' || (seccion === 'estadisticas' && esSuperOperando) ? (
             <div className="admin-dash-inicio">
               <h1>El administrador interviene</h1>
               <p>
@@ -2348,7 +3131,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   <button
                     type="button"
                     className={stats.porAprobar > 0 ? 'admin-dash-stat-alerta' : ''}
-                    onClick={() => irSeccion('por_aprobar')}
+                    onClick={() => irSeccionConMunicipios('por_aprobar', stats.porMunicipio?.porAprobar)}
                   >
                     <strong>{stats.porAprobar || 0}</strong>
                     <span>Por aprobar</span>
@@ -2356,7 +3139,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   <button
                     type="button"
                     className={stats.urgentes > 0 ? 'admin-dash-stat-alerta' : ''}
-                    onClick={() => irSeccion('reportes', { atencion: 'urgentes' })}
+                    onClick={() => irSeccionConMunicipios('reparaciones', stats.porMunicipio?.urgentes, { atencion: 'urgentes' })}
                   >
                     <strong>{stats.urgentes || 0}</strong>
                     <span>Varios vecinos</span>
@@ -2364,7 +3147,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   <button
                     type="button"
                     className={stats.resueltosVecino > 0 ? 'admin-dash-stat-alerta' : ''}
-                    onClick={() => irSeccion('reportes', { atencion: 'resolucion' })}
+                    onClick={() => irSeccionConMunicipios('reparaciones', stats.porMunicipio?.resueltosVecino, { atencion: 'resolucion' })}
                   >
                     <strong>{stats.resueltosVecino || 0}</strong>
                     <span>Resolución del vecino</span>
@@ -2372,7 +3155,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   <button
                     type="button"
                     className={stats.respuestasDatos > 0 ? 'admin-dash-stat-alerta' : ''}
-                    onClick={() => irSeccion('reportes', { atencion: 'respuestas' })}
+                    onClick={() => irSeccionConMunicipios('reparaciones', stats.porMunicipio?.respuestasDatos, { atencion: 'respuestas' })}
                   >
                     <strong>{stats.respuestasDatos || 0}</strong>
                     <span>Respondieron datos</span>
@@ -2380,7 +3163,7 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   <button
                     type="button"
                     className={stats.cierresPendientes > 0 ? 'admin-dash-stat-alerta' : ''}
-                    onClick={() => irSeccion('reportes', { atencion: 'cierres' })}
+                    onClick={() => irSeccionConMunicipios('reparaciones', stats.porMunicipio?.cierresPendientes, { atencion: 'cierres' })}
                   >
                     <strong>{stats.cierresPendientes || 0}</strong>
                     <span>Cierres de cuadrilla</span>
@@ -2394,24 +3177,44 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
                   <button
                     type="button"
                     className="admin-dash-stat-principal"
-                    onClick={() => irSeccion('reportes')}
+                    onClick={() => irSeccionConMunicipios('reportes', stats.porMunicipio?.nuevosReportes)}
                   >
                     <strong>{stats.reportes || 0}</strong>
                     <span>Reportes</span>
                   </button>
-                  <button type="button" onClick={() => irSeccion('cosas_perdidas')}>
+                  <button
+                    type="button"
+                    onClick={() => irSeccionConMunicipios('reparaciones', stats.porMunicipio?.nuevosReparaciones)}
+                  >
+                    <strong>{stats.reparaciones || 0}</strong>
+                    <span>Reparaciones</span>
+                  </button>
+                  <button type="button" onClick={() => irSeccionConMunicipios('cosas_perdidas', stats.porMunicipio?.nuevasPerdidas)}>
                     <strong>{stats.perdidas || 0}</strong>
                     <span>Cosas perdidas</span>
                   </button>
-                  <button type="button" onClick={() => irSeccion('derivados')}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFiltroAnimalesVista('oficina');
+                      irSeccionConMunicipios('animales', stats.porMunicipio?.nuevosDerivados);
+                    }}
+                  >
                     <strong>{stats.derivados || 0}</strong>
-                    <span>Derivados</span>
+                    <span>Animales</span>
                   </button>
                   <button type="button" onClick={() => irSeccion('registro')}>
                     <strong>{stats.registro || 0}</strong>
                     <span>Registro</span>
                   </button>
                 </div>
+                {!esSuperOperando && (
+                  <p className="estadisticas-inicio-link">
+                    <button type="button" className="admin-dash-btn" onClick={() => irSeccion('estadisticas')}>
+                      Ver estadísticas de casos y uso
+                    </button>
+                  </p>
+                )}
               </section>
 
             </div>
@@ -2420,6 +3223,87 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           )}
         </div>
       </div>
+
+      {perfilReportante && (
+        <div
+          className="admin-dash-modal-fondo"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Perfil del reportante"
+          onClick={() => setPerfilReportante(null)}
+        >
+          <div
+            className="admin-dash-modal admin-dash-modal-perfil"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="admin-dash-modal-cabecera">
+              <h2>Perfil del reportante</h2>
+              <button
+                type="button"
+                className="admin-dash-btn"
+                onClick={() => setPerfilReportante(null)}
+              >
+                Cerrar
+              </button>
+            </div>
+            {perfilReportante.caseId ? (
+              <p className="admin-dash-modal-meta">Caso #{perfilReportante.caseId}</p>
+            ) : null}
+            <dl className="admin-dash-perfil-dl">
+              <div>
+                <dt>Nombre</dt>
+                <dd>{perfilReportante.nombre || '—'}</dd>
+              </div>
+              <div>
+                <dt>DNI</dt>
+                <dd>{perfilReportante.dni || '—'}</dd>
+              </div>
+              <div>
+                <dt>Celular</dt>
+                <dd>
+                  {perfilReportante.telefono
+                    ? `${perfilReportante.telefono}${
+                      perfilReportante.telefonoConfirmado ? ' · confirmado' : ' · sin confirmar'
+                    }`
+                    : '—'}
+                </dd>
+              </div>
+              <div>
+                <dt>Correo</dt>
+                <dd>{perfilReportante.email || '—'}</dd>
+              </div>
+            </dl>
+            {(perfilReportante.dniFotoFrenteUrl || perfilReportante.dniFotoDorsoUrl) ? (
+              <div className="admin-dash-dni-fotos">
+                {perfilReportante.dniFotoFrenteUrl && (
+                  <figure>
+                    <img
+                      src={buildImageUrl(perfilReportante.dniFotoFrenteUrl, userId)}
+                      alt="Frente del DNI"
+                    />
+                    <figcaption>Frente del DNI</figcaption>
+                  </figure>
+                )}
+                {perfilReportante.dniFotoDorsoUrl && (
+                  <figure>
+                    <img
+                      src={buildImageUrl(perfilReportante.dniFotoDorsoUrl, userId)}
+                      alt="Dorso del DNI"
+                    />
+                    <figcaption>Dorso del DNI</figcaption>
+                  </figure>
+                )}
+              </div>
+            ) : (
+              <p className="admin-dash-dni-sin-foto">
+                {perfilReportante.dniFotosCargadas === false
+                  ? 'Sin fotos de DNI cargadas'
+                  : 'No hay fotos de DNI para mostrar'}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       {verResolucion && casoDetalle?.resolvedBy && (
         <div
@@ -2582,11 +3466,11 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
           },
           avisar_cuadrilla: {
             titulo: 'Avisar a la cuadrilla',
-            meta: `Caso ${casoId} · los operarios reciben el mensaje en Avisos (campanita)`,
-            label: 'Mensaje o pedido de información',
-            placeholder: 'Ej: ¿Pueden confirmar si ya fue reparado? / Priorizar este caso mañana…',
+            meta: `Caso ${casoId} · los operarios lo ven en Avisos (campanita); el caso sigue en la cola`,
+            label: 'Mensaje para la cuadrilla',
+            placeholder: 'Ej: Priorizar este caso urgente / confirmar si ya fue reparado…',
             obligatorio: true,
-            confirmar: 'Enviar a cuadrilla',
+            confirmar: 'Enviar aviso',
             peligro: false,
           },
           reabrir_cierre: {
@@ -2596,6 +3480,15 @@ const AdminDashboard = ({ userId, onSalirMapaVecino, onVolverSuper }) => {
             placeholder: 'Ej: Falta foto del trabajo / no está completo…',
             obligatorio: false,
             confirmar: 'Reabrir',
+            peligro: false,
+          },
+          reabrir_registro: {
+            titulo: 'Reabrir caso del Registro',
+            meta: `Caso ${casoId} · vuelve a la bandeja activa (mapa) y se notifica al vecino`,
+            label: 'Motivo de la reapertura',
+            placeholder: 'Ej: Se cerró por error / el problema continúa…',
+            obligatorio: true,
+            confirmar: 'Reabrir caso',
             peligro: false,
           },
           cerrar: {

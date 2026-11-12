@@ -48,8 +48,15 @@ const markerSchema = new mongoose.Schema({
   notaCuadrilla: { type: String, default: '' },
   notaCuadrillaAt: { type: Date, default: null },
   notaCuadrillaPor: { type: String, default: null },
-  // Cola admin (FIFO): al avisar cuadrilla se actualiza → el caso va al final
+  // Cola admin (FIFO): al avisar cuadrilla / omitir se actualiza → el caso va al final
   colaAdminAt: { type: Date, default: null, index: true },
+  // Por qué salió de Por atender: omitido (retomar) vs cuadrilla (esperando operarios)
+  motivoCola: {
+    type: String,
+    enum: ['omitido', 'cuadrilla', null],
+    default: null,
+    index: true,
+  },
   // Respuesta de la cuadrilla al último aviso del admin
   respuestaCuadrilla: { type: String, default: '' },
   respuestaCuadrillaAt: { type: Date, default: null },

@@ -180,9 +180,33 @@ const CASOS = [
 ];
 
 const USUARIOS = [
-  { email: CORREOS_PRUEBA[0], telefono: '3815550101', proveedor: 'correo', nombre: 'Vecino Prueba 1' },
-  { email: CORREOS_PRUEBA[1], telefono: '3815550102', proveedor: 'correo', nombre: 'Vecino Prueba 2' },
-  { email: CORREOS_PRUEBA[2], telefono: '3815550103', proveedor: 'google', nombre: 'Vecino Prueba 3' },
+  {
+    email: CORREOS_PRUEBA[0],
+    telefono: '3815550101',
+    dni: '30000001',
+    proveedor: 'correo',
+    nombre: 'Vecino Prueba 1',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
+  {
+    email: CORREOS_PRUEBA[1],
+    telefono: '3815550102',
+    dni: '30000002',
+    proveedor: 'correo',
+    nombre: 'Vecino Prueba 2',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
+  {
+    email: CORREOS_PRUEBA[2],
+    telefono: '3815550103',
+    dni: '30000003',
+    proveedor: 'google',
+    nombre: 'Vecino Prueba 3',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
 ];
 
 const filtroPrueba = {

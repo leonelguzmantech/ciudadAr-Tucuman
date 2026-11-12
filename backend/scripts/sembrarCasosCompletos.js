@@ -1,10 +1,21 @@
-// Crea un set completo de casos de demo (todas las categorías, estados y flujos)
-// con fotos embebidas. Ideal después de: node scripts/borrarCasos.js --si
-//
-// Uso (desde backend/):
-//   node scripts/sembrarCasosCompletos.js
-//   node scripts/sembrarCasosCompletos.js --agregar   (no exige base vacía)
+/**
+ * Inyección completa de casos de prueba (todas las categorías / estados / colas)
+ * con fotos PNG visibles embebidas.
+ *
+ * Uso (desde backend/):
+ *   node scripts/borrarCasos.js --si          # opcional: limpia casos/chats/notifs
+ *   node scripts/sembrarCasosCompletos.js     # exige base sin casos
+ *   node scripts/sembrarCasosCompletos.js --agregar
+ *   node scripts/sembrarCasosCompletos.js --agregar --solo-smt-talitas
+ *     → solo San Miguel de Tucumán y Las Talitas (sin Yerba Buena ni fuera de límites)
+ *
+ * npm:
+ *   npm run seed:completo
+ *   npm run seed:completo -- --agregar
+ *   npm run seed:completo:smt-talitas
+ */
 require('dotenv').config();
+const zlib = require('zlib');
 const mongoose = require('mongoose');
 const Marker = require('../models/marker');
 const Usuario = require('../models/usuario');
@@ -18,24 +29,84 @@ const VECINOS = [
   'vecino.demo.3@ciudadar.test',
 ];
 const ADMIN_LOCAL = 'admin.demo@ciudadar.test';
+const OPERARIO = 'operario.demo@ciudadar.test';
 
-// PNGs 1x1 válidos (alcanza para probar /image en el panel)
-const PNG_B64 = {
-  rojo: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-  verde: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-  azul: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMUb802QAAAABJRU5ErkJggg==',
-  amarillo: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==',
-  gris: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMUb802QAAAABJRU5ErkJggg==',
+const COLORES = {
+  rojo: [220, 38, 38],
+  verde: [22, 163, 74],
+  azul: [37, 99, 235],
+  amarillo: [202, 138, 4],
+  gris: [100, 116, 139],
+  naranja: [234, 88, 12],
+  violeta: [124, 58, 237],
+};
+
+/** CRC32 para chunks PNG */
+const crcTabla = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+const crc32 = (buf) => {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) c = crcTabla[(c ^ buf[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+};
+const pngChunk = (type, data) => {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const typeBuf = Buffer.from(type);
+  const td = Buffer.concat([typeBuf, data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(td));
+  return Buffer.concat([len, td, crc]);
+};
+
+/** PNG RGB sólido visible en tarjetas (~180×120) */
+const pngSolido = (rgb, w = 180, h = 120) => {
+  const [r, g, b] = rgb;
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  for (let y = 0; y < h; y += 1) {
+    const row = y * (w * 3 + 1);
+    raw[row] = 0;
+    // Franja superior más clara (para que no parezca un pixel)
+    const factor = y < 18 ? 1.25 : (y > h - 18 ? 0.75 : 1);
+    const rr = Math.min(255, Math.round(r * factor));
+    const gg = Math.min(255, Math.round(g * factor));
+    const bb = Math.min(255, Math.round(b * factor));
+    for (let x = 0; x < w; x += 1) {
+      const i = row + 1 + x * 3;
+      raw[i] = rr;
+      raw[i + 1] = gg;
+      raw[i + 2] = bb;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // RGB
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
 };
 
 const foto = (tono = 'rojo') => ({
-  data: Buffer.from(PNG_B64[tono] || PNG_B64.rojo, 'base64'),
+  data: pngSolido(COLORES[tono] || COLORES.rojo),
   contentType: 'image/png',
 });
 
-const diasAtras = (dias) => {
+const diasAtras = (dias, horas = 0) => {
   const fecha = new Date();
   fecha.setDate(fecha.getDate() - dias);
+  if (horas) fecha.setHours(fecha.getHours() - horas);
   return fecha;
 };
 const fechaTexto = (fecha) => fecha.toISOString().slice(0, 10);
@@ -46,7 +117,7 @@ const getNextCaseId = async () => {
   return last && typeof last.caseId === 'number' ? last.caseId + 1 : 1;
 };
 
-// Puntos en municipios conocidos + uno fuera (sin jurisdicción local)
+// Puntos en municipios conocidos + uno fuera
 const P = {
   sm1: { lat: -26.8245, lng: -65.2227, direccion: 'San Martín 500, S.M. de Tucumán' },
   sm2: { lat: -26.8302, lng: -65.2048, direccion: 'Muñecas 200, S.M. de Tucumán' },
@@ -55,20 +126,60 @@ const P = {
   yb2: { lat: -26.8180, lng: -65.3025, direccion: 'Perú 450, Yerba Buena' },
   lt1: { lat: -26.7840, lng: -65.2005, direccion: 'Av. Perón, Las Talitas' },
   lt2: { lat: -26.7905, lng: -65.2055, direccion: 'Barrio Norte, Las Talitas' },
-  // Fuera de Tucumán → suele quedar sin municipio local
   fuera: { lat: -27.4500, lng: -65.6000, direccion: 'Punto fuera de límites (demo)' },
 };
 
 const USUARIOS = [
-  { email: VECINOS[0], telefono: '3815551001', proveedor: 'correo', nombre: 'Ana Demo' },
-  { email: VECINOS[1], telefono: '3815551002', proveedor: 'correo', nombre: 'Bruno Demo' },
-  { email: VECINOS[2], telefono: '3815551003', proveedor: 'google', nombre: 'Carla Demo' },
-  { email: ADMIN_LOCAL, telefono: '3815551999', proveedor: 'correo', nombre: 'Admin Demo' },
+  {
+    email: VECINOS[0],
+    telefono: '3815551001',
+    dni: '31000001',
+    proveedor: 'correo',
+    nombre: 'Ana Demo',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
+  {
+    email: VECINOS[1],
+    telefono: '3815551002',
+    dni: '31000002',
+    proveedor: 'correo',
+    nombre: 'Bruno Demo',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
+  {
+    email: VECINOS[2],
+    telefono: '3815551003',
+    dni: '31000003',
+    proveedor: 'google',
+    nombre: 'Carla Demo',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
+  {
+    email: ADMIN_LOCAL,
+    telefono: '3815551999',
+    dni: '31000099',
+    proveedor: 'correo',
+    nombre: 'Admin Demo',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
+  {
+    email: OPERARIO,
+    telefono: '3815551888',
+    dni: '31000088',
+    proveedor: 'correo',
+    nombre: 'Operario Demo',
+    telefonoConfirmado: true,
+    telefonoConfirmadoAt: new Date(),
+  },
 ];
 
 /**
- * Cada ítem cubre un flujo distinto del producto.
- * Campos especiales se aplican después del create (imageUrl, chats, etc.).
+ * Cada ítem cubre un flujo del producto actual.
+ * tono → color de la foto principal.
  */
 const definirCasos = () => [
   // ——— Por aprobar ———
@@ -79,7 +190,6 @@ const definirCasos = () => [
     description: `${MARCA} Bache profundo — esperando aprobación.`,
     createdBy: VECINOS[0],
     tono: 'rojo',
-    nuevoParaAdmin: false,
     dias: 0,
   },
   {
@@ -105,8 +215,21 @@ const definirCasos = () => [
     tono: 'amarillo',
     dias: 1,
   },
+  {
+    ...P.lt1,
+    lat: -26.7860,
+    lng: -65.1980,
+    category: 'familias',
+    familiasTipo: 'calle',
+    status: 'pendiente_aprobacion',
+    visibility: 'private',
+    description: `${MARCA} Persona en situación de calle — por aprobar.`,
+    createdBy: VECINOS[0],
+    tono: 'gris',
+    dias: 0,
+  },
 
-  // ——— Publicados / urgentes (con confirmaciones) ———
+  // ——— Reparaciones: Por atender / urgentes / proceso ———
   {
     ...P.sm2,
     category: 'reparaciones',
@@ -119,45 +242,43 @@ const definirCasos = () => [
     dias: 3,
     confirmations: [
       { userId: VECINOS[1], description: 'Lo vi hoy a la mañana.', tono: 'gris' },
-      { userId: VECINOS[2], description: 'Sigue fallando en hora pico.', tono: 'gris' },
+      { userId: VECINOS[2], description: 'Sigue fallando en hora pico.', tono: 'naranja' },
     ],
   },
   {
     ...P.yb2,
     category: 'reparaciones',
     status: 'en_proceso',
-    description: `${MARCA} Cordón roto — municipio en proceso.`,
+    description: `${MARCA} Cordón roto — cuadrilla en proceso.`,
     createdBy: VECINOS[1],
     aprobadoAt: diasAtras(5),
-    atendidoPor: 'operario.demo@ciudadar.test',
+    atendidoPor: OPERARIO,
     atendidoAt: diasAtras(2),
     tono: 'verde',
     dias: 5,
   },
-
-  // ——— Pedir datos / respuesta vecino ———
   {
     ...P.sm3,
     category: 'reparaciones',
     status: 'pendiente',
-    description: `${MARCA} Tapa de alcantarilla floja.`,
+    description: `${MARCA} Tapa de alcantarilla floja — respondió datos.`,
     createdBy: VECINOS[0],
     aprobadoAt: diasAtras(4),
     pideDatosMensaje: '¿Podés indicar entre qué calles exactas está?',
     pideDatosAt: diasAtras(2),
+    respuestaDatosMensaje: 'Entre San Martín y Congreso, vereda impar.',
     respuestaDatosAt: diasAtras(1),
     ultimaRespuestaDatosAt: diasAtras(1),
     nuevoParaAdmin: true,
     tono: 'azul',
+    tonoRespuesta: 'azul',
     dias: 4,
   },
-
-  // ——— Resolución reportada por vecino (pendiente de cierre admin) ———
   {
     ...P.lt2,
     category: 'reparaciones',
     status: 'en_proceso',
-    description: `${MARCA} Pozo ya tapado por cuadrilla — vecino pidió cierre.`,
+    description: `${MARCA} Pozo — vecino pidió cierre (resolución).`,
     createdBy: VECINOS[2],
     aprobadoAt: diasAtras(10),
     resolvedBy: VECINOS[2],
@@ -166,6 +287,76 @@ const definirCasos = () => [
     tonoResolucion: 'verde',
     tono: 'gris',
     dias: 10,
+  },
+  {
+    ...P.sm3,
+    lat: -26.8095,
+    lng: -65.2190,
+    category: 'reparaciones',
+    status: 'pendiente_cierre',
+    description: `${MARCA} Vereda rota — cuadrilla propuso cierre.`,
+    createdBy: VECINOS[0],
+    aprobadoAt: diasAtras(8),
+    atendidoPor: OPERARIO,
+    atendidoAt: diasAtras(3),
+    cierrePropuestoPor: OPERARIO,
+    cierrePropuestoAt: diasAtras(1),
+    resolutionDescription: 'Se rellenó y compactó el tramo.',
+    tonoResolucion: 'verde',
+    nuevoParaAdmin: true,
+    tono: 'verde',
+    dias: 8,
+  },
+  // Aviso a cuadrilla (solo mensaje; sigue en Por atender)
+  {
+    ...P.sm1,
+    lat: -26.8230,
+    lng: -65.2200,
+    category: 'reparaciones',
+    status: 'pendiente',
+    description: `${MARCA} Bache urgente — admin avisó a cuadrilla (sin sacar de cola).`,
+    createdBy: VECINOS[1],
+    aprobadoAt: diasAtras(2),
+    notaCuadrilla: 'Priorizar este caso mañana temprano.',
+    notaCuadrillaAt: diasAtras(0, 3),
+    notaCuadrillaPor: ADMIN_LOCAL,
+    nuevoParaAdmin: false,
+    tono: 'naranja',
+    dias: 2,
+  },
+  // Omitido → Reparaciones → Omitidos
+  {
+    ...P.yb1,
+    lat: -26.8115,
+    lng: -65.2920,
+    category: 'reparaciones',
+    status: 'pendiente',
+    description: `${MARCA} Luminaria — omitido (Reparaciones → Omitidos).`,
+    createdBy: VECINOS[2],
+    aprobadoAt: diasAtras(6),
+    colaAdminAt: diasAtras(1),
+    motivoCola: 'omitido',
+    nuevoParaAdmin: false,
+    tono: 'violeta',
+    dias: 6,
+  },
+  // Legacy diferido con motivo cuadrilla → hoy aparece en Omitidos
+  {
+    ...P.lt1,
+    lat: -26.7830,
+    lng: -65.2020,
+    category: 'reparaciones',
+    status: 'pendiente',
+    description: `${MARCA} Cordón — diferido legacy (Omitidos).`,
+    createdBy: VECINOS[0],
+    aprobadoAt: diasAtras(7),
+    colaAdminAt: diasAtras(2),
+    motivoCola: 'cuadrilla',
+    notaCuadrilla: 'Confirmen si ya fue reparado.',
+    notaCuadrillaAt: diasAtras(2),
+    notaCuadrillaPor: ADMIN_LOCAL,
+    tono: 'amarillo',
+    dias: 7,
   },
 
   // ——— Animales ———
@@ -198,7 +389,6 @@ const definirCasos = () => [
     tono: 'verde',
     dias: 1,
   },
-  // Abandonado publicado (aún sin avisar oficina) → Reportes / mapa
   {
     ...P.sm2,
     lat: -26.8290,
@@ -206,7 +396,7 @@ const definirCasos = () => [
     category: 'perros_gatos',
     animalTipo: 'abandonado',
     status: 'pendiente',
-    description: `${MARCA} Perro abandonado en vereda — sin avisar aún.`,
+    description: `${MARCA} Perro abandonado — sin avisar oficina (Reportes).`,
     createdBy: VECINOS[1],
     contacto: '3815551002',
     aprobadoAt: diasAtras(1),
@@ -214,7 +404,6 @@ const definirCasos = () => [
     tono: 'amarillo',
     dias: 1,
   },
-  // Abandonado con oficina avisada → Derivados (badge + sombreado)
   {
     ...P.yb2,
     lat: -26.8175,
@@ -222,7 +411,7 @@ const definirCasos = () => [
     category: 'perros_gatos',
     animalTipo: 'abandonado',
     status: 'pendiente',
-    description: `${MARCA} Gato abandonado — oficina avisada (Derivados nuevo).`,
+    description: `${MARCA} Gato abandonado — oficina avisada (Animales nuevo).`,
     createdBy: VECINOS[2],
     contacto: '3815551003',
     aprobadoAt: diasAtras(3),
@@ -232,7 +421,6 @@ const definirCasos = () => [
     tono: 'gris',
     dias: 3,
   },
-  // Otro derivado ya “visto” (sin badge)
   {
     ...P.lt1,
     lat: -26.7855,
@@ -240,18 +428,18 @@ const definirCasos = () => [
     category: 'perros_gatos',
     animalTipo: 'abandonado',
     status: 'en_proceso',
-    description: `${MARCA} Perro flaco — derivado ya visto por admin.`,
+    description: `${MARCA} Perro flaco — Animales ya visto.`,
     createdBy: VECINOS[0],
     contacto: '3815551001',
     aprobadoAt: diasAtras(6),
     avisadoAt: diasAtras(4),
     nuevoParaAdmin: false,
     nuevoDerivadoParaAdmin: false,
-    tono: 'amarillo',
+    tono: 'naranja',
     dias: 6,
   },
 
-  // ——— Familias (privado) ———
+  // ——— Reportes: familias ———
   {
     ...P.sm2,
     lat: -26.8285,
@@ -260,27 +448,31 @@ const definirCasos = () => [
     familiasTipo: 'violencia',
     status: 'pendiente',
     visibility: 'private',
-    description: `${MARCA} Alerta confidencial — situación de violencia.`,
+    description: `${MARCA} Alerta confidencial — Reportes Por atender.`,
     createdBy: VECINOS[2],
     aprobadoAt: diasAtras(1),
     nuevoParaAdmin: true,
     tono: 'rojo',
     dias: 1,
   },
+  // Omitido → Reportes → Omitidos
   {
-    ...P.lt1,
-    lat: -26.7860,
-    lng: -65.1980,
+    ...P.sm3,
+    lat: -26.8075,
+    lng: -65.2160,
     category: 'familias',
-    familiasTipo: 'calle',
-    status: 'pendiente_aprobacion',
+    familiasTipo: 'hijos',
+    status: 'pendiente',
     visibility: 'private',
-    description: `${MARCA} Persona en situación de calle — por aprobar.`,
-    createdBy: VECINOS[0],
-    tono: 'gris',
-    dias: 0,
+    description: `${MARCA} Familia — omitido (Reportes → Omitidos).`,
+    createdBy: VECINOS[1],
+    aprobadoAt: diasAtras(4),
+    colaAdminAt: diasAtras(1, 2),
+    motivoCola: 'omitido',
+    nuevoParaAdmin: false,
+    tono: 'violeta',
+    dias: 4,
   },
-  // Familia avisada → sale a Registro (no Derivados / no mapa)
   {
     ...P.yb1,
     lat: -26.8130,
@@ -289,41 +481,18 @@ const definirCasos = () => [
     familiasTipo: 'hijos',
     status: 'pendiente',
     visibility: 'private',
-    description: `${MARCA} Familia — oficina avisada (en Registro).`,
+    description: `${MARCA} Familia — oficina avisada (Registro).`,
     createdBy: VECINOS[1],
     aprobadoAt: diasAtras(4),
     avisadoAt: diasAtras(2),
     eliminadoAt: diasAtras(2),
     eliminadoPor: ADMIN_LOCAL,
     motivoEliminacion: 'Oficina correspondiente avisada',
-    nuevoParaAdmin: false,
-    nuevoDerivadoParaAdmin: false,
     tono: 'azul',
     dias: 4,
   },
 
-  // ——— Cuadrilla: pendiente de cierre ———
-  {
-    ...P.sm3,
-    lat: -26.8095,
-    lng: -65.2190,
-    category: 'reparaciones',
-    status: 'pendiente_cierre',
-    description: `${MARCA} Vereda rota — cuadrilla propuso cierre.`,
-    createdBy: VECINOS[0],
-    aprobadoAt: diasAtras(8),
-    atendidoPor: 'operario.demo@ciudadar.test',
-    atendidoAt: diasAtras(3),
-    cierrePropuestoPor: 'operario.demo@ciudadar.test',
-    cierrePropuestoAt: diasAtras(1),
-    resolutionDescription: 'Se rellenó y compactó el tramo.',
-    tonoResolucion: 'verde',
-    nuevoParaAdmin: true,
-    tono: 'verde',
-    dias: 8,
-  },
-
-  // ——— Cosas perdidas con chat / reclamo ———
+  // ——— Cosas perdidas ———
   {
     ...P.sm3,
     lat: -26.8110,
@@ -353,7 +522,7 @@ const definirCasos = () => [
     perdidaTipo: 'perdi',
     objeto: 'Documento DNI',
     status: 'pendiente',
-    description: `${MARCA} Perdí DNI — ambas partes confirmaron recuperación.`,
+    description: `${MARCA} Perdí DNI — ambas partes confirmaron.`,
     createdBy: VECINOS[2],
     contacto: '3815551003',
     aprobadoAt: diasAtras(6),
@@ -369,14 +538,14 @@ const definirCasos = () => [
     dias: 6,
   },
 
-  // ——— Registro: resuelto / anulado / vencido ———
+  // ——— Registro ———
   {
     ...P.sm1,
     lat: -26.8220,
     lng: -65.2250,
     category: 'reparaciones',
     status: 'resuelto',
-    description: `${MARCA} Luminaria reparada — en registro.`,
+    description: `${MARCA} Luminaria reparada — Registro.`,
     createdBy: VECINOS[0],
     aprobadoAt: diasAtras(20),
     resolvedAt: diasAtras(2),
@@ -410,7 +579,7 @@ const definirCasos = () => [
     perdidaTipo: 'encontre',
     objeto: 'Paraguas',
     status: 'rechazado',
-    description: `${MARCA} Aviso vencido sin reclamo — registro.`,
+    description: `${MARCA} Aviso vencido — Registro.`,
     createdBy: VECINOS[2],
     aprobadoAt: diasAtras(40),
     eliminadoAt: diasAtras(1),
@@ -420,12 +589,12 @@ const definirCasos = () => [
     dias: 40,
   },
 
-  // ——— Sin jurisdicción (punto fuera) ———
+  // ——— Sin jurisdicción ———
   {
     ...P.fuera,
     category: 'reparaciones',
     status: 'pendiente_aprobacion',
-    description: `${MARCA} Reporte fuera de límites — cola Sin jurisdicción.`,
+    description: `${MARCA} Reporte fuera de límites — Sin jurisdicción.`,
     createdBy: VECINOS[0],
     forzarSinTenant: true,
     tono: 'rojo',
@@ -482,6 +651,7 @@ async function crearCaso(def, caseId) {
     avisadoAt: def.avisadoAt || null,
     pideDatosMensaje: def.pideDatosMensaje || '',
     pideDatosAt: def.pideDatosAt || null,
+    respuestaDatosMensaje: def.respuestaDatosMensaje || '',
     respuestaDatosAt: def.respuestaDatosAt || null,
     ultimaRespuestaDatosAt: def.ultimaRespuestaDatosAt || null,
     nuevoParaAdmin: !!def.nuevoParaAdmin,
@@ -490,6 +660,11 @@ async function crearCaso(def, caseId) {
     atendidoAt: def.atendidoAt || null,
     cierrePropuestoPor: def.cierrePropuestoPor || null,
     cierrePropuestoAt: def.cierrePropuestoAt || null,
+    notaCuadrilla: def.notaCuadrilla || '',
+    notaCuadrillaAt: def.notaCuadrillaAt || null,
+    notaCuadrillaPor: def.notaCuadrillaPor || null,
+    colaAdminAt: def.colaAdminAt || null,
+    motivoCola: def.motivoCola || null,
     eliminadoAt: def.eliminadoAt || null,
     eliminadoPor: def.eliminadoPor || null,
     motivoEliminacion: def.motivoEliminacion || '',
@@ -513,14 +688,19 @@ async function crearCaso(def, caseId) {
   };
 
   if (def.tonoResolucion || def.resolutionDescription) {
-    const rImg = foto(def.tonoResolucion || 'verde');
-    doc.resolutionImage = rImg;
+    doc.resolutionImage = foto(def.tonoResolucion || 'verde');
+  }
+  if (def.respuestaDatosAt || def.respuestaDatosMensaje) {
+    doc.respuestaDatosImage = foto(def.tonoRespuesta || def.tono || 'azul');
   }
 
   const marker = await Marker.create(doc);
   marker.imageUrl = `/api/markers/${marker._id}/image`;
   if (marker.resolutionImage?.data) {
     marker.resolutionImageUrl = `/api/markers/${marker._id}/resolution-image`;
+  }
+  if (marker.respuestaDatosImage?.data) {
+    marker.respuestaDatosImageUrl = `/api/markers/${marker._id}/respuesta-datos-image`;
   }
   if (marker.confirmations?.length) {
     marker.confirmations = marker.confirmations.map((c, idx) => {
@@ -559,12 +739,48 @@ async function crearCaso(def, caseId) {
   }
 
   const lugar = tenant ? 'con municipio' : 'SIN jurisdicción';
-  console.log(`  #${caseId} ${def.category}/${def.status} — ${lugar}`);
+  const cola = def.motivoCola ? ` · cola=${def.motivoCola}` : '';
+  console.log(`  #${caseId} ${def.category}/${def.status}${cola} — ${lugar}`);
   return marker;
 }
 
+/** Remapea Yerba Buena → SM / Las Talitas y omite “fuera de límites”. */
+const filtrarSoloSmtTalitas = (defs) => {
+  // Puntos propios (no reutilizar coords de P.sm*/lt* para no apilar pines)
+  const altSm = [
+    { lat: -26.8218, lng: -65.2260, direccion: 'San Juan 400, S.M. de Tucumán' },
+    { lat: -26.8275, lng: -65.2110, direccion: 'Laprida 350, S.M. de Tucumán' },
+    { lat: -26.8142, lng: -65.2205, direccion: 'Córdoba 600, S.M. de Tucumán' },
+    { lat: -26.8190, lng: -65.2080, direccion: 'Congreso 300, S.M. de Tucumán' },
+    { lat: -26.8330, lng: -65.2165, direccion: 'Mate de Luna 1000, S.M. de Tucumán' },
+  ];
+  const altLt = [
+    { lat: -26.7815, lng: -65.1970, direccion: 'Av. Perón 900, Las Talitas' },
+    { lat: -26.7920, lng: -65.2080, direccion: 'Barrio Norte, Las Talitas' },
+    { lat: -26.7875, lng: -65.2010, direccion: 'Centro, Las Talitas' },
+    { lat: -26.7790, lng: -65.2040, direccion: 'Av. Mitre, Las Talitas' },
+  ];
+  let iSm = 0;
+  let iLt = 0;
+  let n = 0;
+  return defs
+    .filter((d) => !d.forzarSinTenant)
+    .map((d) => {
+      const enYb = String(d.direccion || '').includes('Yerba Buena')
+        || (Number(d.lng) < -65.27 && Number(d.lat) > -26.835 && Number(d.lat) < -26.80);
+      if (!enYb) return d;
+      const usarLt = n % 2 === 1;
+      n += 1;
+      const punto = usarLt
+        ? altLt[iLt++ % altLt.length]
+        : altSm[iSm++ % altSm.length];
+      return { ...d, ...punto };
+    });
+};
+
 async function run() {
   const agregar = process.argv.includes('--agregar');
+  const soloSmtTalitas = process.argv.includes('--solo-smt-talitas');
   if (!process.env.MONGODB_URI) {
     console.error('Falta MONGODB_URI en .env');
     process.exit(1);
@@ -579,22 +795,33 @@ async function run() {
     console.log('  node scripts/borrarCasos.js --si');
     console.log('  node scripts/sembrarCasosCompletos.js');
     console.log('  node scripts/sembrarCasosCompletos.js --agregar');
+    console.log('  node scripts/sembrarCasosCompletos.js --agregar --solo-smt-talitas');
     await mongoose.disconnect();
     process.exit(1);
   }
 
   await asegurarUsuarios();
   let caseId = await getNextCaseId();
-  const defs = definirCasos();
-  console.log(`Creando ${defs.length} casos de demo…`);
+  let defs = definirCasos();
+  if (soloSmtTalitas) {
+    defs = filtrarSoloSmtTalitas(defs);
+    console.log('Filtro: solo San Miguel de Tucumán y Las Talitas (sin YB ni fuera de límites).');
+  }
+  console.log(`Creando ${defs.length} casos de demo con fotos…`);
   for (const def of defs) {
-    await crearCaso(def, caseId++);
+    await crearCaso(def, caseId);
+    caseId += 1;
   }
 
   console.log('');
-  console.log('Listo. Cuentas vecino:');
+  console.log('Listo. Revisá en el admin:');
+  console.log('  Por aprobar · Reparaciones (Por atender / Omitidos)');
+  console.log('  Reportes (Por atender / Omitidos) · Cosas perdidas · Animales · Registro');
+  console.log('');
+  console.log('Cuentas vecino:');
   VECINOS.forEach((e) => console.log(`  ${e}`));
-  console.log(`Admin demo (usuario, no asignado a municipio): ${ADMIN_LOCAL}`);
+  console.log(`Admin demo: ${ADMIN_LOCAL}`);
+  console.log(`Operario demo: ${OPERARIO}`);
   console.log('Para borrar todo: node scripts/borrarCasos.js --si');
 
   await mongoose.disconnect();

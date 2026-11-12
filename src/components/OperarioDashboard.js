@@ -5,6 +5,7 @@ import appFirebase from './credenciales';
 import logoCiudad from '../assets/ciudadar-logo-circulo-estilo.jpg';
 import MapComponent from './MapComponent';
 import CamaraEnVivo from './CamaraEnVivo';
+import MiPerfil from './MiPerfil';
 
 const dataUrlAFile = async (dataUrl, nombre = `cierre-${Date.now()}.jpg`) => {
   const res = await fetch(dataUrl);
@@ -162,6 +163,8 @@ const OperarioDashboard = ({ userId }) => {
   const [noLeidas, setNoLeidas] = useState(0);
   const [mostrarNotifs, setMostrarNotifs] = useState(false);
   const [mapaCaso, setMapaCaso] = useState(null);
+  const [perfilReportante, setPerfilReportante] = useState(null);
+  const [mostrarPerfil, setMostrarPerfil] = useState(false);
   const [autoGuia, setAutoGuia] = useState(false);
   const [ofertaGuia, setOfertaGuia] = useState(false);
   const [respuestaCuadrillaTexto, setRespuestaCuadrillaTexto] = useState('');
@@ -570,11 +573,26 @@ const OperarioDashboard = ({ userId }) => {
           </button>
         </nav>
         <div className="admin-dash-sidebar-pie">
+          <button
+            type="button"
+            className="admin-dash-sidebar-sec"
+            onClick={() => setMostrarPerfil(true)}
+          >
+            Mi perfil
+          </button>
           <button type="button" className="admin-dash-sidebar-salir" onClick={() => signOut(auth).catch(() => {})}>
             <IconoSalir /> Cerrar sesión
           </button>
         </div>
       </aside>
+
+      {mostrarPerfil && auth.currentUser && (
+        <MiPerfil
+          usuario={auth.currentUser}
+          rol="OPERARIO"
+          onCerrar={() => setMostrarPerfil(false)}
+        />
+      )}
 
       <div className="admin-dash-contenido">
         <div className="admin-dash-breadcrumb">
@@ -805,7 +823,27 @@ const OperarioDashboard = ({ userId }) => {
                       <dl className="admin-dash-dl">
                         <div>
                           <dt>Reportado por</dt>
-                          <dd>{caso.createdBy || '—'}</dd>
+                          <dd>
+                            {(() => {
+                              const r = caso.reportante || {};
+                              const nombre = r.nombre || caso.createdBy || 'Sin nombre';
+                              const hayDatos = !!(r.nombre || r.dni || r.telefono || r.email || caso.createdBy);
+                              if (!hayDatos) return '—';
+                              return (
+                                <button
+                                  type="button"
+                                  className="admin-dash-reportante-link"
+                                  onClick={() => setPerfilReportante({
+                                    ...r,
+                                    email: r.email || caso.createdBy || '',
+                                    caseId: caso.caseId,
+                                  })}
+                                >
+                                  {nombre}
+                                </button>
+                              );
+                            })()}
+                          </dd>
                         </div>
                         <div>
                           <dt>Categoría</dt>
@@ -1015,7 +1053,6 @@ const OperarioDashboard = ({ userId }) => {
                 {!enRegistro && (
                   <div className="admin-dash-filtros">
                     <select value={filtroEstado} onChange={(e) => setFiltroEstado(e.target.value)} aria-label="Estado">
-                      <option value="">Todos (operativos)</option>
                       <option value="pendiente">Por tomar</option>
                       <option value="en_proceso">En atención</option>
                       <option value="pendiente_cierre">Cierre propuesto · esperando al admin</option>
@@ -1258,6 +1295,59 @@ const OperarioDashboard = ({ userId }) => {
           </div>
         );
       })()}
+
+      {perfilReportante && (
+        <div
+          className="admin-dash-modal-fondo"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Perfil del reportante"
+          onClick={() => setPerfilReportante(null)}
+        >
+          <div
+            className="admin-dash-modal admin-dash-modal-perfil"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="admin-dash-modal-cabecera">
+              <h2>Perfil del reportante</h2>
+              <button
+                type="button"
+                className="admin-dash-btn"
+                onClick={() => setPerfilReportante(null)}
+              >
+                Cerrar
+              </button>
+            </div>
+            {perfilReportante.caseId ? (
+              <p className="admin-dash-modal-meta">Caso #{perfilReportante.caseId}</p>
+            ) : null}
+            <dl className="admin-dash-perfil-dl">
+              <div>
+                <dt>Nombre</dt>
+                <dd>{perfilReportante.nombre || '—'}</dd>
+              </div>
+              <div>
+                <dt>DNI</dt>
+                <dd>{perfilReportante.dni || '—'}</dd>
+              </div>
+              <div>
+                <dt>Celular</dt>
+                <dd>
+                  {perfilReportante.telefono
+                    ? `${perfilReportante.telefono}${
+                      perfilReportante.telefonoConfirmado ? ' · confirmado' : ' · sin confirmar'
+                    }`
+                    : '—'}
+                </dd>
+              </div>
+              <div>
+                <dt>Correo</dt>
+                <dd>{perfilReportante.email || '—'}</dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

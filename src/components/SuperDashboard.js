@@ -3,11 +3,15 @@ import axios from 'axios';
 import { getAuth, signOut } from 'firebase/auth';
 import appFirebase from './credenciales';
 import logoCiudad from '../assets/ciudadar-logo-circulo-estilo.jpg';
+import EstadisticasPanel from './EstadisticasPanel';
+import SelectMunicipio from './SelectMunicipio';
+import MiPerfil from './MiPerfil';
+import UsuariosPanel from './UsuariosPanel';
 
 const auth = getAuth(appFirebase);
 const API = 'http://localhost:5001';
 const SUPER_VISTA_KEY = 'ciudadar-super-seccion';
-const SECCIONES = new Set(['inicio', 'jurisdicciones', 'admins', 'cuadrillas', 'sin_jurisdiccion']);
+const SECCIONES = new Set(['inicio', 'estadisticas', 'jurisdicciones', 'admins', 'cuadrillas', 'usuarios', 'sin_jurisdiccion']);
 
 const CATEGORY_LABEL = {
   reparaciones: 'Reparación',
@@ -18,6 +22,11 @@ const CATEGORY_LABEL = {
 
 const IconoInicio = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3 4 9v12h5v-7h6v7h5V9z" /></svg>
+);
+const IconoEstadisticas = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="currentColor" d="M4 20h16v2H2V2h2v18zm3-1h2V10H7v9zm4 0h2V6h-2v13zm4 0h2v-5h-2v5zm4 0h2V8h-2v11z" />
+  </svg>
 );
 const IconoJuris = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z" /></svg>
@@ -30,6 +39,12 @@ const IconoCuadrilla = () => (
 );
 const IconoCasos = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 2h9l5 5v15H6V2zm8 1.5V8h4.5L14 3.5zM8 12h8v2H8v-2zm0 4h8v2H8v-2z" /></svg>
+);
+const IconoSinJurisdiccion = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="currentColor" d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z" />
+    <path fill="currentColor" d="M3.4 4.8 4.8 3.4 20.6 19.2 19.2 20.6z" />
+  </svg>
 );
 const IconoMapa = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z" /></svg>
@@ -97,6 +112,7 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
   const [nuevoTenantId, setNuevoTenantId] = useState('');
   const [nuevoOperarioEmail, setNuevoOperarioEmail] = useState('');
   const [nuevoOperarioTenantId, setNuevoOperarioTenantId] = useState('');
+  const [mostrarPerfil, setMostrarPerfil] = useState(false);
 
   const headers = useMemo(() => ({ 'x-user-id': userId }), [userId]);
 
@@ -184,12 +200,17 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
             .catch(() => {})
         );
       }
-      if (seccion === 'inicio') await cargarStats();
-      else if (seccion === 'jurisdicciones') await Promise.all([cargarJurisdicciones(), ...extras]);
+      if (seccion === 'inicio') {
+        await Promise.all([cargarStats(), ...extras]);
+      } else if (seccion === 'estadisticas') {
+        await Promise.all([cargarTenantsAsignacion(), ...extras]);
+      } else if (seccion === 'jurisdicciones') await Promise.all([cargarJurisdicciones(), ...extras]);
       else if (seccion === 'admins') {
         await Promise.all([cargarAdmins(), cargarTenantsAsignacion(), ...extras]);
       } else if (seccion === 'cuadrillas') {
         await Promise.all([cargarOperarios(), cargarTenantsAsignacion(), ...extras]);
+      } else if (seccion === 'usuarios') {
+        await Promise.all([cargarTenantsAsignacion(), ...extras]);
       } else if (seccion === 'sin_jurisdiccion') {
         await Promise.all([cargarSinTenant(1), cargarTenantsAsignacion(), ...extras]);
       } else {
@@ -385,9 +406,11 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
 
   const titulo = {
     inicio: 'Tablero global',
+    estadisticas: 'Estadísticas',
     jurisdicciones: 'Jurisdicciones',
     admins: 'Administradores municipales',
     cuadrillas: 'Cuadrillas',
+    usuarios: 'Usuarios',
     sin_jurisdiccion: 'Sin jurisdicción',
   }[seccion] || 'Super administración';
 
@@ -423,6 +446,9 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           <button type="button" className={seccion === 'inicio' ? 'activo' : ''} onClick={() => irSeccion('inicio')}>
             <IconoInicio /> Inicio
           </button>
+          <button type="button" className={seccion === 'estadisticas' ? 'activo' : ''} onClick={() => irSeccion('estadisticas')}>
+            <IconoEstadisticas /> Estadísticas
+          </button>
           <button type="button" className={seccion === 'jurisdicciones' ? 'activo' : ''} onClick={() => irSeccion('jurisdicciones')}>
             <IconoJuris /> Jurisdicciones
           </button>
@@ -432,18 +458,25 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           <button type="button" className={seccion === 'cuadrillas' ? 'activo' : ''} onClick={() => irSeccion('cuadrillas')}>
             <IconoCuadrilla /> Cuadrillas
           </button>
+          <button type="button" className={seccion === 'usuarios' ? 'activo' : ''} onClick={() => irSeccion('usuarios')}>
+            <IconoAdmins /> Usuarios
+          </button>
           <button
             type="button"
             className={seccion === 'sin_jurisdiccion' ? 'activo' : ''}
             onClick={() => irSeccion('sin_jurisdiccion')}
           >
-            <IconoCasos /> Sin jurisdicción
+            <IconoSinJurisdiccion /> Sin jurisdicción
             {(stats?.sinTenant > 0) && (
               <em className="admin-dash-tab-badge">{stats.sinTenant}</em>
             )}
           </button>
           {onOperarCasos && (
-            <button type="button" className="admin-dash-nav-secundario" onClick={() => operarCasos()}>
+            <button
+              type="button"
+              className="admin-dash-nav-secundario admin-dash-nav-operar"
+              onClick={() => operarCasos()}
+            >
               <IconoCasos /> Operar casos
             </button>
           )}
@@ -454,6 +487,13 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
               <IconoMapa /> Vista vecino
             </button>
           )}
+          <button
+            type="button"
+            className="admin-dash-sidebar-sec"
+            onClick={() => setMostrarPerfil(true)}
+          >
+            Mi perfil
+          </button>
           <button
             type="button"
             className="admin-dash-sidebar-salir"
@@ -471,6 +511,14 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
           </button>
         </div>
       </aside>
+
+      {mostrarPerfil && auth.currentUser && (
+        <MiPerfil
+          usuario={auth.currentUser}
+          rol="SUPER_ADMIN"
+          onCerrar={() => setMostrarPerfil(false)}
+        />
+      )}
 
       <div className="admin-dash-contenido">
         <div className="admin-dash-breadcrumb">
@@ -587,6 +635,11 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                     <span>Sin jurisdicción</span>
                   </button>
                 </div>
+                <p className="estadisticas-inicio-link">
+                  <button type="button" className="admin-dash-btn" onClick={() => irSeccion('estadisticas')}>
+                    Ver estadísticas de casos y uso
+                  </button>
+                </p>
               </section>
 
               <section className="admin-dash-bloque">
@@ -660,6 +713,18 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
             </div>
           )}
 
+          {seccion === 'estadisticas' && (
+            <div className="super-seccion">
+              <EstadisticasPanel
+                url={`${API}/api/super/dashboard`}
+                headers={headers}
+                titulo="Estadísticas de casos"
+                subtitulo="Uso y control de publicaciones por municipio"
+                tenants={tenantsParaSelect}
+              />
+            </div>
+          )}
+
           {seccion === 'sin_jurisdiccion' && (
             <div className="super-seccion">
               <header className="super-seccion-cabecera">
@@ -703,21 +768,17 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                           <small className="super-admins-linea">{fechaTexto(c.createdAt)}</small>
                         </div>
                         <div className="super-tarjeta-acciones super-asignar-caso">
-                          <select
+                          <SelectMunicipio
                             value={asignacionLocal[c.id] || ''}
-                            onChange={(e) => setAsignacionLocal((prev) => ({
+                            onChange={(id) => setAsignacionLocal((prev) => ({
                               ...prev,
-                              [c.id]: e.target.value,
+                              [c.id]: id,
                             }))}
-                            aria-label={`Asignar jurisdicción al caso ${c.caseId || ''}`}
-                          >
-                            <option value="">Elegir municipio/comuna…</option>
-                            {tenantsParaSelect.map((t) => (
-                              <option key={t.id} value={t.id}>
-                                {t.name} ({t.typeLabel})
-                              </option>
-                            ))}
-                          </select>
+                            options={tenantsParaSelect}
+                            emptyLabel="Elegir jurisdicción…"
+                            placeholder="Buscar municipio o comuna…"
+                            ariaLabel={`Asignar jurisdicción al caso ${c.caseId || ''}`}
+                          />
                           <button
                             type="button"
                             className="admin-dash-btn admin-dash-btn-primario"
@@ -732,7 +793,13 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                             onClick={() => operarCasos({
                               seccion: c.status === 'pendiente_aprobacion'
                                 ? 'por_aprobar'
-                                : (c.category === 'cosas_perdidas' ? 'cosas_perdidas' : 'reportes'),
+                                : (c.category === 'cosas_perdidas'
+                                  ? 'cosas_perdidas'
+                                  : c.category === 'reparaciones'
+                                    ? 'reparaciones'
+                                    : c.category === 'perros_gatos'
+                                      ? 'animales'
+                                      : 'reportes'),
                               casoId: c.id,
                               sinTenant: true,
                             })}
@@ -798,7 +865,6 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                   <option value="municipality">Municipio</option>
                   <option value="commune">Comuna</option>
                   <option value="province">Provincia</option>
-                  <option value="">Todos los tipos</option>
                 </select>
                 <select
                   value={filtroJurisEstado}
@@ -812,7 +878,6 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                   <option value="active">Activas</option>
                   <option value="inactive">Inactivas</option>
                   <option value="pending">Pendientes</option>
-                  <option value="">Todos los estados</option>
                 </select>
               </div>
 
@@ -916,19 +981,15 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                   required
                   aria-label="Email del admin"
                 />
-                <select
+                <SelectMunicipio
                   value={nuevoTenantId}
-                  onChange={(e) => setNuevoTenantId(e.target.value)}
+                  onChange={setNuevoTenantId}
+                  options={tenantsParaSelect}
+                  emptyLabel="Elegí jurisdicción…"
+                  placeholder="Buscar municipio…"
+                  ariaLabel="Jurisdicción"
                   required
-                  aria-label="Jurisdicción"
-                >
-                  <option value="">Elegí jurisdicción…</option>
-                  {tenantsParaSelect.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name} ({t.typeLabel})
-                    </option>
-                  ))}
-                </select>
+                />
                 <button type="submit" className="admin-dash-btn admin-dash-btn-primario" disabled={accionando}>
                   Asignar
                 </button>
@@ -993,19 +1054,15 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                   required
                   aria-label="Email del operario"
                 />
-                <select
+                <SelectMunicipio
                   value={nuevoOperarioTenantId}
-                  onChange={(e) => setNuevoOperarioTenantId(e.target.value)}
+                  onChange={setNuevoOperarioTenantId}
+                  options={tenantsParaSelect}
+                  emptyLabel="Elegí municipio…"
+                  placeholder="Buscar municipio…"
+                  ariaLabel="Municipio"
                   required
-                  aria-label="Municipio"
-                >
-                  <option value="">Elegí municipio…</option>
-                  {tenantsParaSelect.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name} ({t.typeLabel})
-                    </option>
-                  ))}
-                </select>
+                />
                 <button type="submit" className="admin-dash-btn admin-dash-btn-primario" disabled={accionando}>
                   Sumar operario
                 </button>
@@ -1052,6 +1109,14 @@ const SuperDashboard = ({ userId, onOperarCasos, onSalirMapaVecino }) => {
                 </ul>
               )}
             </div>
+          )}
+
+          {seccion === 'usuarios' && (
+            <UsuariosPanel
+              userId={userId}
+              esSuper
+              tenantsOptions={tenantsParaSelect}
+            />
           )}
         </div>
       </div>

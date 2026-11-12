@@ -9,6 +9,10 @@
     "admins": "node scripts/manageAdmins.js",
     "seed": "node scripts/seedPruebas.js",
     "seed:limpiar": "node scripts/seedPruebas.js limpiar",
+    "seed:completo": "node scripts/sembrarCasosCompletos.js",
+    "seed:completo:agregar": "node scripts/sembrarCasosCompletos.js --agregar",
+    "seed:completo:smt-talitas": "node scripts/sembrarCasosCompletos.js --agregar --solo-smt-talitas",
+    "seed:borrar": "node scripts/borrarCasos.js --si",
     "probar:limite": "node scripts/probarLimiteReportes.js",
     "probar:limite:limpiar": "node scripts/probarLimiteReportes.js limpiar",
     "test": "echo \"Error: no test specified\" && exit 1"

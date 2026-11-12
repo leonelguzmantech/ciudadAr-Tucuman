@@ -9,6 +9,11 @@ const celularValido = (valor) => {
   return digitos.length >= 8 && digitos.length <= 15;
 };
 
+const dniValido = (valor) => {
+  const digitos = String(valor || '').replace(/\D/g, '');
+  return digitos.length >= 7 && digitos.length <= 8;
+};
+
 const guardarCuenta = (datos) => axios.post('http://localhost:5001/api/usuarios', datos);
 
 const auth = getAuth(appFirebase);
@@ -17,6 +22,8 @@ const Login = () => {
   const [registrando, setRegistrando] = useState(false);
   const [correo, setCorreo] = useState('');
   const [contrasena, setContrasena] = useState('');
+  const [nombre, setNombre] = useState('');
+  const [dni, setDni] = useState('');
   const [celular, setCelular] = useState('');
   const [mensaje, setMensaje] = useState('');
   const [mostrarRecupero, setMostrarRecupero] = useState(false);
@@ -54,15 +61,27 @@ const Login = () => {
     e.preventDefault();
     const correoIngresado = correo.trim();
     const contraseña = contrasena;
+    const nombreIngresado = nombre.trim();
+    const dniIngresado = String(dni || '').replace(/\D/g, '');
     const celularIngresado = celular;
 
     if (!correoIngresado || !contraseña) {
       setMensaje('Completá correo y contraseña.');
       return;
     }
-    if (registrando && !celularValido(celularIngresado)) {
-      setMensaje('Escribí un celular válido.');
-      return;
+    if (registrando) {
+      if (!nombreIngresado || nombreIngresado.length < 3) {
+        setMensaje('Escribí tu nombre y apellido.');
+        return;
+      }
+      if (!dniValido(dniIngresado)) {
+        setMensaje('El DNI debe tener 7 u 8 números.');
+        return;
+      }
+      if (!celularValido(celularIngresado)) {
+        setMensaje('Escribí un celular válido.');
+        return;
+      }
     }
 
     setEnviando(true);
@@ -73,15 +92,29 @@ const Login = () => {
         try {
           await guardarCuenta({
             email: correoIngresado,
+            nombre: nombreIngresado,
+            dni: dniIngresado,
             telefono: celularIngresado.trim(),
             proveedor: 'correo',
           });
-        } catch (_) {
-          // La cuenta de Firebase ya quedó: el celular se pide después
+        } catch (errGuardar) {
+          // La cuenta de Firebase ya quedó: los datos se piden después si faltan
+          const msg = errGuardar.response?.data?.message;
+          if (msg) {
+            setMensaje(`Cuenta creada en Firebase, pero: ${msg}. Completá los datos al ingresar.`);
+            setCorreo('');
+            setContrasena('');
+            setNombre('');
+            setDni('');
+            setCelular('');
+            return;
+          }
         }
         setMensaje('¡Usuario registrado! Revisá el correo para confirmar la cuenta.');
         setCorreo('');
         setContrasena('');
+        setNombre('');
+        setDni('');
         setCelular('');
       } else {
         await signInWithEmailAndPassword(auth, correoIngresado, contraseña);
@@ -195,7 +228,10 @@ const Login = () => {
               {registrando && (
                 <>
                   <h2 className="verificacion-titulo">Crear cuenta</h2>
-                  <p className="verificacion-texto">Completá el correo, una contraseña de al menos 6 caracteres y tu celular.</p>
+                  <p className="verificacion-texto">
+                    Correo, contraseña, nombre y apellido, DNI y celular.
+                    El DNI evita cuentas duplicadas y spam.
+                  </p>
                 </>
               )}
               <form onSubmit={functauth} autoComplete="on">
@@ -221,17 +257,40 @@ const Login = () => {
                   minLength={registrando ? 6 : undefined}
                 />
                 {registrando && (
-                  <input
-                    type="tel"
-                    placeholder="Celular"
-                    className="caja-texto"
-                    name="tel"
-                    autoComplete="tel"
-                    value={celular}
-                    onChange={(event) => setCelular(event.target.value)}
-                    inputMode="numeric"
-                    required
-                  />
+                  <>
+                    <input
+                      type="text"
+                      placeholder="Nombre y apellido"
+                      className="caja-texto"
+                      name="name"
+                      autoComplete="name"
+                      value={nombre}
+                      onChange={(event) => setNombre(event.target.value)}
+                      required
+                    />
+                    <input
+                      type="text"
+                      placeholder="DNI (solo números)"
+                      className="caja-texto"
+                      name="dni"
+                      autoComplete="off"
+                      value={dni}
+                      onChange={(event) => setDni(event.target.value.replace(/\D/g, '').slice(0, 8))}
+                      inputMode="numeric"
+                      required
+                    />
+                    <input
+                      type="tel"
+                      placeholder="Celular"
+                      className="caja-texto"
+                      name="tel"
+                      autoComplete="tel"
+                      value={celular}
+                      onChange={(event) => setCelular(event.target.value)}
+                      inputMode="numeric"
+                      required
+                    />
+                  </>
                 )}
                 <button className="btnform" type="submit" disabled={enviando}>
                   {enviando

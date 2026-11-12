@@ -38,6 +38,7 @@ const notificacionSchema = new mongoose.Schema({
       'vencido',
       'renovado',
       'cuadrilla',
+      'soporte',
     ],
     required: true,
   },

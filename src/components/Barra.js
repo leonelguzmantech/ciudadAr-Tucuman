@@ -91,6 +91,7 @@ const Barra = ({
   conSidebar = false,
   esAdmin = false,
   esOperario = false,
+  esSuper = false,
   onReportar,
   onMisReportes,
   onCosasPerdidas,
@@ -119,6 +120,7 @@ const Barra = ({
     try {
       sessionStorage.removeItem('ciudadar-mis-reportes-vista');
       sessionStorage.removeItem('ciudadar-radar-vista');
+      localStorage.removeItem('ciudadar-radar-prefs');
     } catch {
       /* ignore */
     }
@@ -238,7 +240,9 @@ const Barra = ({
             >
               <span className="sidebar-item-contenido">
                 <IconoDashboard />
-                {esOperario ? 'Panel cuadrilla' : 'Dashboard admin'}
+                {esOperario
+                  ? 'Panel cuadrilla'
+                  : (esSuper ? 'Dashboard de super admin' : 'Dashboard admin')}
               </span>
             </button>
           )}
@@ -289,10 +293,18 @@ const Barra = ({
       {mostrarPerfil && (
         <MiPerfil
           usuario={usuario}
+          rol={esSuper ? 'SUPER_ADMIN' : (esOperario ? 'OPERARIO' : (esAdmin ? 'JURISDICTION_ADMIN' : 'PUBLIC_USER'))}
           onCerrar={() => setMostrarPerfil(false)}
-          onDatosGuardados={(nombreNuevo) => {
+          onDatosGuardados={(datos) => {
+            const nombreNuevo = typeof datos === 'string' ? datos : datos?.nombre;
             setNombrePerfil(nombreNuevo || usuario?.email || '');
-            if (onPerfilActualizado) onPerfilActualizado(nombreNuevo);
+            if (onPerfilActualizado) {
+              onPerfilActualizado(
+                typeof datos === 'string'
+                  ? { nombre: datos }
+                  : (datos || {})
+              );
+            }
           }}
         />
       )}

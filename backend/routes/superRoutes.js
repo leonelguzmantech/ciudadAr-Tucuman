@@ -3,6 +3,7 @@ const Tenant = require('../models/tenant');
 const Marker = require('../models/marker');
 const { getRequestUser, normalizeUserId, isAdminUser } = require('../utils/users');
 const { getAdminScope } = require('../utils/jurisdictions');
+const { buildDashboardStats } = require('../utils/dashboardStats');
 
 const router = express.Router();
 
@@ -96,6 +97,22 @@ router.get('/stats', async (req, res) => {
       registro,
       sinTenant,
     });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Estadísticas de casos / uso (provincia o un municipio)
+router.get('/dashboard', async (req, res) => {
+  try {
+    const tenantId = String(req.query.tenantId || '').trim();
+    const filtro = tenantId ? { tenant: tenantId } : {};
+    const data = await buildDashboardStats(Marker, filtro, {
+      dias: req.query.dias,
+      fechaDesde: req.query.fechaDesde,
+      fechaHasta: req.query.fechaHasta,
+    });
+    res.json(data);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

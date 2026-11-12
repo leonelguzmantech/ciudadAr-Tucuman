@@ -16,6 +16,7 @@ const {
   buildManagedMarkersFilter,
 } = require('../utils/jurisdictions');
 const { removeExpiredMarkers } = require('../utils/markerExpiry');
+const { buildDashboardStats } = require('../utils/dashboardStats');
 const {
   avisarCambioEstado,
   avisarOficina,
@@ -61,9 +62,9 @@ const ANIMAL_TIPOS = ['abandonado', 'perdido', 'adopcion'];
 const PERDIDA_TIPOS = ['perdi', 'encontre'];
 const LIMITE_REPORTES_POR_DIA = 5;
 const MS_UN_DIA = 24 * 60 * 60 * 1000;
-const LIMITE_MAPA_DEFAULT = 60;
+const LIMITE_MAPA_DEFAULT = 100;
 const LIMITE_ADMIN_DEFAULT = 20;
-const LIMITE_MAX = 100;
+const LIMITE_MAX = 200;
 
 const parsePageLimit = (query, defaultLimit) => {
   const page = Math.max(1, parseInt(query.page, 10) || 1);
@@ -327,8 +328,14 @@ const buildListQuery = ({
     }
   }
 
-  if (excludeCategory && CATEGORY_VALUES.includes(excludeCategory)) {
-    and.push({ category: { $ne: excludeCategory } });
+  const catsExcluidas = String(excludeCategory || '')
+    .split(',')
+    .map((c) => c.trim())
+    .filter((c) => CATEGORY_VALUES.includes(c));
+  if (catsExcluidas.length === 1) {
+    and.push({ category: { $ne: catsExcluidas[0] } });
+  } else if (catsExcluidas.length > 1) {
+    and.push({ category: { $nin: catsExcluidas } });
   }
 
   if (animalTipo && animalTipo !== 'todos' && ANIMAL_TIPOS.includes(animalTipo)) {
@@ -416,6 +423,68 @@ const nombreDesdeUsuario = async (userId) => {
     if (usuario?.nombre) return usuario.nombre;
   } catch (_) { /* ignore */ }
   return email.split('@')[0] || 'Vecino';
+};
+
+const tieneFotoDniUsuario = (foto) => !!(foto && (foto.contentType || foto.data));
+
+/** Datos de identidad del vecino: staff gestiona el caso; fotos DNI solo admin municipal. */
+const datosReportantePublicos = (usuario, emailFallback = '', opts = {}) => {
+  const dniFotosCargadas = tieneFotoDniUsuario(usuario?.dniFotoFrente)
+    && tieneFotoDniUsuario(usuario?.dniFotoDorso);
+  const base = {
+    email: (usuario && usuario.email) || emailFallback || '',
+    nombre: (usuario && usuario.nombre) || '',
+    dni: (usuario && usuario.dni) || '',
+    telefono: (usuario && usuario.telefono) || '',
+    telefonoConfirmado: !!(usuario && usuario.telefonoConfirmado),
+    dniFotosCargadas,
+  };
+  if (opts.incluirDniFotos && opts.markerId && dniFotosCargadas) {
+    base.dniFotoFrenteUrl = `/api/markers/admin/${opts.markerId}/reportante/dni/frente`;
+    base.dniFotoDorsoUrl = `/api/markers/admin/${opts.markerId}/reportante/dni/dorso`;
+  }
+  return base;
+};
+
+const mapaUsuariosPorEmail = async (emails) => {
+  const unicos = [...new Set(
+    (emails || [])
+      .map((e) => normalizeUserId(e))
+      .filter((e) => e && e !== 'anonimo')
+  )];
+  const mapa = new Map();
+  if (!unicos.length) return mapa;
+  const usuarios = await Usuario.find({ email: { $in: unicos } })
+    .select('email nombre dni telefono telefonoConfirmado dniFotoFrente.contentType dniFotoDorso.contentType')
+    .lean();
+  usuarios.forEach((u) => {
+    mapa.set(normalizeUserId(u.email), u);
+  });
+  return mapa;
+};
+
+/** Adjunta `reportante` a marcadores que el scope puede gestionar. */
+const enriquecerConReportante = async (markers, scope = null) => {
+  const lista = Array.isArray(markers) ? markers.filter(Boolean) : [];
+  if (!lista.length) return lista;
+  const emails = lista
+    .filter((m) => m.canManage)
+    .map((m) => m.createdBy);
+  const mapa = await mapaUsuariosPorEmail(emails);
+  // Fotos del DNI: solo admin municipal / super (no cuadrilla)
+  const incluirDniFotos = isScopeAdmin(scope);
+  return lista.map((marker) => {
+    if (!marker.canManage) return marker;
+    const email = normalizeUserId(marker.createdBy);
+    return {
+      ...marker,
+      reportante: datosReportantePublicos(
+        mapa.get(email),
+        marker.createdBy || '',
+        { incluirDniFotos, markerId: marker._id }
+      ),
+    };
+  });
 };
 
 // Escribir: solo quien publicó y quien reclamó
@@ -1085,12 +1154,68 @@ router.delete('/:id', async (req, res) => {
 });
 
 // Contadores livianos para el dashboard (sin traer los documentos)
+// Dashboard de estadísticas (casos + uso) · período 7 / 30 / 90 días
+router.get('/admin/dashboard', requireStaff, async (req, res) => {
+  try {
+    const geo = buildManagedMarkersFilter(req.adminScope);
+    const matchBase = req.adminScope.isSuperAdmin ? {} : geo;
+    const tenantId = String(req.query.tenantId || '').trim();
+    let filtro = matchBase;
+    if (tenantId && req.adminScope.isSuperAdmin) {
+      filtro = { tenant: tenantId };
+    } else if (tenantId && !req.adminScope.isSuperAdmin) {
+      const ids = (req.adminScope.tenantIds || []).map(String);
+      if (!ids.includes(tenantId)) {
+        return res.status(403).json({ message: 'No administrás esa jurisdicción' });
+      }
+      filtro = { tenant: tenantId };
+    }
+    const data = await buildDashboardStats(Marker, filtro, {
+      dias: req.query.dias,
+      fechaDesde: req.query.fechaDesde,
+      fechaHasta: req.query.fechaHasta,
+    });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+/** Super admin: dónde están los pendientes (sin listar todos los casos juntos). */
+const contarPorMunicipio = async (match) => {
+  const rows = await Marker.aggregate([
+    { $match: match },
+    { $group: { _id: '$tenant', n: { $sum: 1 } } },
+    { $match: { _id: { $ne: null } } },
+    {
+      $lookup: {
+        from: 'tenants',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'tenantDoc',
+      },
+    },
+    { $unwind: { path: '$tenantDoc', preserveNullAndEmptyArrays: true } },
+    {
+      $project: {
+        _id: 0,
+        tenantId: { $toString: '$_id' },
+        name: { $ifNull: ['$tenantDoc.name', 'Sin nombre'] },
+        n: 1,
+      },
+    },
+    { $sort: { n: -1, name: 1 } },
+  ]);
+  return rows;
+};
+
 router.get('/admin/stats', requireStaff, async (req, res) => {
   try {
     const geo = buildManagedMarkersFilter(req.adminScope);
     const esOperario = isScopeOperario(req.adminScope);
+    const esSuper = !!req.adminScope.isSuperAdmin;
     const conGeo = (extra) => (
-      req.adminScope.isSuperAdmin ? extra : { $and: [geo, extra] }
+      esSuper ? extra : { $and: [geo, extra] }
     );
     // Activos en mapa (alineado a listas Reportes / Cosas): sin por aprobar / cierre / rechazados
     // y sin derivados (avisadoAt) — esos van solo a la sección Derivados
@@ -1102,14 +1227,18 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
         { avisadoAt: { $exists: false } },
       ],
     };
-    // Reportes = intervención municipal (no adopción / animal perdido del Radar)
+    // Reportes = resto municipal (familias / abandonados…). Reparaciones → sección propia.
     const filtroColaReportes = {
       ...publicados,
-      category: { $ne: 'cosas_perdidas' },
+      category: { $nin: ['cosas_perdidas', 'reparaciones'] },
       $nor: [{
         category: 'perros_gatos',
         animalTipo: { $in: ['adopcion', 'perdido'] },
       }],
+    };
+    const filtroColaReparaciones = {
+      ...publicados,
+      category: 'reparaciones',
     };
     // Cuadrilla: contadores solo de reparaciones
     const soloReparaciones = esOperario ? { category: 'reparaciones' } : {};
@@ -1144,12 +1273,14 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
     const [
       total,
       reportes,
+      reparaciones,
       perdidas,
       porAprobar,
       pendientes,
       enProceso,
       registro,
       nuevosReportes,
+      nuevosReparaciones,
       nuevasPerdidas,
       urgentes,
       resueltosVecino,
@@ -1160,6 +1291,7 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
     ] = await Promise.all([
       Marker.countDocuments(conGeo({ ...publicados })),
       Marker.countDocuments(conGeo(filtroColaReportes)),
+      Marker.countDocuments(conGeo(filtroColaReparaciones)),
       Marker.countDocuments(conGeo({ ...publicados, category: 'cosas_perdidas' })),
       Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente_aprobacion' })),
       Marker.countDocuments(conGeo({ eliminadoAt: null, status: 'pendiente', ...soloReparaciones })),
@@ -1167,6 +1299,10 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
       Marker.countDocuments(conGeo({ eliminadoAt: { $ne: null } })),
       Marker.countDocuments(conGeo({
         ...filtroColaReportes,
+        nuevoParaAdmin: true,
+      })),
+      Marker.countDocuments(conGeo({
+        ...filtroColaReparaciones,
         nuevoParaAdmin: true,
       })),
       Marker.countDocuments(conGeo({
@@ -1192,15 +1328,67 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
       })),
     ]);
 
+    // Desglose por municipio (solo super): el badge indica dónde saltar, sin listar todo
+    let porMunicipio = null;
+    if (esSuper) {
+      const [
+        pmNuevosReportes,
+        pmNuevosReparaciones,
+        pmNuevasPerdidas,
+        pmNuevosDerivados,
+        pmPorAprobar,
+        pmUrgentes,
+        pmResueltosVecino,
+        pmRespuestasDatos,
+        pmCierres,
+      ] = await Promise.all([
+        contarPorMunicipio(conGeo({ ...filtroColaReportes, nuevoParaAdmin: true })),
+        contarPorMunicipio(conGeo({ ...filtroColaReparaciones, nuevoParaAdmin: true })),
+        contarPorMunicipio(conGeo({
+          ...publicados,
+          nuevoParaAdmin: true,
+          category: 'cosas_perdidas',
+        })),
+        contarPorMunicipio(conGeo({
+          eliminadoAt: null,
+          avisadoAt: { $ne: null },
+          status: { $nin: ['resuelto', 'rechazado', 'pendiente_aprobacion'] },
+          nuevoDerivadoParaAdmin: true,
+        })),
+        contarPorMunicipio(conGeo({ eliminadoAt: null, status: 'pendiente_aprobacion' })),
+        contarPorMunicipio(urgentesFiltro),
+        contarPorMunicipio(resolucionFiltro),
+        contarPorMunicipio(respuestasFiltro),
+        contarPorMunicipio(conGeo({
+          eliminadoAt: null,
+          status: 'pendiente_cierre',
+          ...soloReparaciones,
+        })),
+      ]);
+      porMunicipio = {
+        nuevosReportes: pmNuevosReportes,
+        nuevosReparaciones: pmNuevosReparaciones,
+        nuevasPerdidas: pmNuevasPerdidas,
+        nuevosDerivados: pmNuevosDerivados,
+        porAprobar: pmPorAprobar,
+        urgentes: pmUrgentes,
+        resueltosVecino: pmResueltosVecino,
+        respuestasDatos: pmRespuestasDatos,
+        cierresPendientes: pmCierres,
+      };
+    }
+
     res.json({
       total,
       reportes,
+      reparaciones,
       perdidas,
       porAprobar,
       pendientes,
       enProceso,
       registro,
       nuevosReportes,
+      nuevosReparaciones,
       nuevasPerdidas,
       urgentes,
       resueltosVecino,
@@ -1208,6 +1396,7 @@ router.get('/admin/stats', requireStaff, async (req, res) => {
       cierresPendientes,
       derivados,
       nuevosDerivados,
+      porMunicipio,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -1245,14 +1434,18 @@ router.patch('/admin/marcar-vistos', requireStaff, async (req, res) => {
     };
     if (seccion === 'cosas_perdidas') {
       base.category = 'cosas_perdidas';
+    } else if (seccion === 'reparaciones') {
+      base.category = 'reparaciones';
     } else if (seccion === 'reportes') {
-      base.category = { $ne: 'cosas_perdidas' };
+      base.category = { $nin: ['cosas_perdidas', 'reparaciones'] };
       base.$nor = [{
         category: 'perros_gatos',
         animalTipo: { $in: ['adopcion', 'perdido'] },
       }];
     } else {
-      return res.status(400).json({ message: 'Indicá la sección: reportes, cosas_perdidas o derivados' });
+      return res.status(400).json({
+        message: 'Indicá la sección: reportes, reparaciones, cosas_perdidas o derivados',
+      });
     }
     const filtro = req.adminScope.isSuperAdmin ? base : { $and: [geo, base] };
     const result = await Marker.updateMany(filtro, { $set: { nuevoParaAdmin: false } });
@@ -1343,29 +1536,70 @@ router.get('/admin', requireStaff, async (req, res) => {
       }
     }
 
-    // Cola FIFO: pendientes (sin colaAdminAt) vs diferidos (omitidos / avisados a cuadrilla)
+    // Cola FIFO: pendientes | omitidos | cuadrilla (diferidos = omitidos+cuadrilla, compat)
     const cola = String(req.query.cola || '').trim();
-    if (cola === 'pendientes' || cola === 'diferidos') {
-      const condCola = cola === 'pendientes'
-        ? { $or: [{ colaAdminAt: null }, { colaAdminAt: { $exists: false } }] }
-        : { colaAdminAt: { $ne: null } };
-      filtroFinal = { $and: [filtroFinal, condCola] };
+    if (cola === 'pendientes') {
+      filtroFinal = {
+        $and: [
+          filtroFinal,
+          { $or: [{ colaAdminAt: null }, { colaAdminAt: { $exists: false } }] },
+        ],
+      };
+    } else if (cola === 'omitidos') {
+      // Omitidos a retomar (legacy sin motivoCola: con colaAdminAt y sin aviso a cuadrilla)
+      filtroFinal = {
+        $and: [
+          filtroFinal,
+          { colaAdminAt: { $ne: null } },
+          {
+            $or: [
+              { motivoCola: 'omitido' },
+              {
+                $and: [
+                  { $or: [{ motivoCola: null }, { motivoCola: { $exists: false } }] },
+                  { $or: [{ notaCuadrillaAt: null }, { notaCuadrillaAt: { $exists: false } }] },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    } else if (cola === 'cuadrilla') {
+      // Legacy: casos que quedaron en “esperando cuadrilla” (el aviso ya no mueve la cola)
+      filtroFinal = {
+        $and: [
+          filtroFinal,
+          { colaAdminAt: { $ne: null } },
+          {
+            $or: [
+              { motivoCola: 'cuadrilla' },
+              {
+                $and: [
+                  { $or: [{ motivoCola: null }, { motivoCola: { $exists: false } }] },
+                  { notaCuadrillaAt: { $ne: null } },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    } else if (cola === 'diferidos') {
+      filtroFinal = { $and: [filtroFinal, { colaAdminAt: { $ne: null } }] };
     }
 
-    // Cola FIFO (más antiguos primero). En bandejas activas: no vistos arriba, luego FIFO.
-    // Tras avisar/omitir, colaAdminAt empuja el caso (nulls primero si se listan todos).
-    // Registro: los cierres más recientes primero.
+    // Cola FIFO (más antiguos primero). “Nuevo” solo sombrea; no salta al frente.
+    // Tras omitir, colaAdminAt empuja el caso. Registro: cierres más recientes primero.
     let orden;
     if (soloEliminados) {
       orden = { eliminadoAt: -1, createdAt: -1 };
     } else if (statusQuery === 'pendiente_aprobacion') {
       orden = { createdAt: 1 };
     } else if (atencion === 'derivados') {
-      orden = { nuevoDerivadoParaAdmin: -1, createdAt: 1 };
-    } else if (cola === 'diferidos') {
+      orden = { createdAt: 1 };
+    } else if (cola === 'omitidos' || cola === 'cuadrilla' || cola === 'diferidos') {
       orden = { colaAdminAt: 1, createdAt: 1 };
     } else {
-      orden = { nuevoParaAdmin: -1, colaAdminAt: 1, createdAt: 1 };
+      orden = { colaAdminAt: 1, createdAt: 1 };
     }
 
     const [total, markers] = await Promise.all([
@@ -1378,9 +1612,12 @@ router.get('/admin', requireStaff, async (req, res) => {
         .limit(limit),
     ]);
 
-    const items = markers
-      .filter((marker) => canManageMarker(req.adminScope, marker))
-      .map((marker) => sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+    const items = await enriquecerConReportante(
+      markers
+        .filter((marker) => canManageMarker(req.adminScope, marker))
+        .map((marker) => sanitizeMarkerResponse(marker, req.adminScope, req.requester)),
+      req.adminScope
+    );
 
     res.json({
       items,
@@ -1389,6 +1626,46 @@ router.get('/admin', requireStaff, async (req, res) => {
       limit,
       hasMore: skip + limit < total,
     });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+/** Foto del DNI del reportante: solo admin municipal/super (no operario). */
+router.get('/admin/:id/reportante/dni/:lado', async (req, res) => {
+  try {
+    const lado = String(req.params.lado || '').toLowerCase();
+    if (lado !== 'frente' && lado !== 'dorso') {
+      return res.status(400).json({ message: 'Lado inválido (frente o dorso)' });
+    }
+    // <img> no manda x-user-id: aceptamos ?userId= como en el chat
+    const viewer = normalizeUserId(req.query.userId || req.requester);
+    const scope = viewer && viewer === req.requester
+      ? req.adminScope
+      : await getAdminScope(viewer);
+    if (!isScopeAdmin(scope)) {
+      return res.status(403).json({ message: 'Acceso de administrador requerido' });
+    }
+    const marker = await Marker.findById(req.params.id).select('createdBy tenant province');
+    if (!marker) {
+      return res.status(404).json({ message: 'Caso no encontrado' });
+    }
+    if (!canManageMarker(scope, marker)) {
+      return res.status(403).json({ message: 'No tenés permiso para ver este caso' });
+    }
+    const email = normalizeUserId(marker.createdBy);
+    if (!email || email === 'anonimo') {
+      return res.status(404).json({ message: 'Este caso no tiene reportante registrado' });
+    }
+    const campo = lado === 'frente' ? 'dniFotoFrente' : 'dniFotoDorso';
+    const usuario = await Usuario.findOne({ email }).select(campo);
+    const foto = usuario?.[campo];
+    if (!foto?.data || !foto.contentType) {
+      return res.status(404).json({ message: 'No hay foto de DNI cargada' });
+    }
+    res.set('Content-Type', foto.contentType);
+    res.set('Cache-Control', 'private, max-age=300');
+    res.send(foto.data);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -1666,7 +1943,68 @@ router.patch('/admin/:id/reabrir-cierre', requireJurisdictionAdmin, async (req, 
   }
 });
 
-// Admin omite el caso por ahora → va al final de la cola FIFO (sin cambiar estado)
+// Admin: reabre un caso del Registro → vuelve a la cola activa (mapa / bandejas)
+router.patch('/admin/:id/reabrir-registro', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    const enRegistro = Boolean(marker.eliminadoAt)
+      || marker.status === 'resuelto'
+      || marker.status === 'rechazado';
+    if (!enRegistro) {
+      return res.status(400).json({ message: 'Este caso no está en el Registro' });
+    }
+    const motivo = String(req.body.mensaje || req.body.motivo || '').trim().slice(0, 500);
+    if (motivo.length < 5) {
+      return res.status(400).json({ message: 'Escribí el motivo de la reapertura' });
+    }
+    const estadoAnterior = marker.status;
+    // Si nunca se había aprobado (no aprobar), vuelve a Por aprobar
+    const nuevoStatus = (estadoAnterior === 'rechazado' && !marker.aprobadoAt)
+      ? 'pendiente_aprobacion'
+      : 'pendiente';
+
+    marker.status = nuevoStatus;
+    marker.eliminadoAt = null;
+    marker.eliminadoPor = null;
+    marker.motivoEliminacion = '';
+    marker.resolvedAt = null;
+    // Sale de Derivados / oficina: vuelve a la bandeja operativa
+    marker.avisadoAt = null;
+    marker.nuevoDerivadoParaAdmin = false;
+    marker.colaAdminAt = null;
+    marker.motivoCola = null;
+    marker.nuevoParaAdmin = true;
+    marker.cierrePropuestoPor = null;
+    marker.cierrePropuestoAt = null;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+
+    await avisarCambioEstado(marker, estadoAnterior, nuevoStatus).catch(() => {});
+    const caso = marker.caseId ? `#${marker.caseId}` : '';
+    if (marker.createdBy) {
+      await crearNotificacion({
+        userId: marker.createdBy,
+        markerId: marker._id,
+        caseId: marker.caseId,
+        tenantId: marker.tenant,
+        tipo: 'estado',
+        mensaje: `Tu caso ${caso} fue reabierto por el municipio. ${motivo}`,
+      }).catch(() => {});
+    }
+
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Admin omite el caso por ahora → bandeja Omitidos (retomar después)
 router.patch('/admin/:id/omitir-cola', requireJurisdictionAdmin, async (req, res) => {
   try {
     const marker = await Marker.findById(req.params.id);
@@ -1681,7 +2019,35 @@ router.patch('/admin/:id/omitir-cola', requireJurisdictionAdmin, async (req, res
       return res.status(400).json({ message: 'Este caso no está en la cola activa' });
     }
     marker.colaAdminAt = new Date();
+    marker.motivoCola = 'omitido';
     marker.nuevoParaAdmin = false;
+    await marker.save();
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Admin retoma un caso omitido / diferido → vuelve a Por atender
+router.patch('/admin/:id/retomar-cola', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    if (['resuelto', 'rechazado', 'pendiente_aprobacion'].includes(marker.status)) {
+      return res.status(400).json({ message: 'Este caso no está en la cola activa' });
+    }
+    if (!marker.colaAdminAt) {
+      return res.status(400).json({ message: 'Este caso no está omitido' });
+    }
+    marker.colaAdminAt = null;
+    marker.motivoCola = null;
     await marker.save();
     await marker.populate('tenant', JURISDICTION_FIELDS);
     res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
@@ -1716,9 +2082,7 @@ router.patch('/admin/:id/avisar-cuadrilla', requireJurisdictionAdmin, async (req
     marker.notaCuadrilla = mensaje;
     marker.notaCuadrillaAt = new Date();
     marker.notaCuadrillaPor = req.requester;
-    // Vuelve al final de la cola admin (FIFO): ya se pidió movimiento a la cuadrilla
-    marker.colaAdminAt = new Date();
-    marker.nuevoParaAdmin = false;
+    // Solo notifica: no saca el caso de la cola activa
     // Nuevo pedido: limpia la respuesta anterior
     marker.respuestaCuadrilla = '';
     marker.respuestaCuadrillaAt = null;
@@ -1927,13 +2291,50 @@ router.patch('/admin/:id/avisar', requireJurisdictionAdmin, async (req, res) => 
       marker.motivoEliminacion = 'Oficina correspondiente avisada';
       marker.nuevoDerivadoParaAdmin = false;
     } else if (!esFamilia) {
-      // Abandonados: siguen en el mapa; badge + sombreado en Derivados
+      // Abandonados: siguen en el mapa → sección Animales (oficina avisada)
       marker.nuevoDerivadoParaAdmin = true;
+      marker.colaAdminAt = null;
+      marker.motivoCola = null;
     }
     await marker.save();
     if (eraNuevoAviso) {
       await avisarOficina(marker).catch(() => {});
     }
+    await marker.populate('tenant', JURISDICTION_FIELDS);
+    res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+/** Abandonado con oficina avisada → vuelve a Reportes (deshace la derivación a Animales). */
+router.patch('/admin/:id/volver-reportes', requireJurisdictionAdmin, async (req, res) => {
+  try {
+    const marker = await Marker.findById(req.params.id);
+    if (!marker) {
+      return res.status(404).json({ message: 'Marker not found' });
+    }
+    if (rejectIfEliminado(marker, res)) return;
+    if (!canManageMarker(req.adminScope, marker)) {
+      return res.status(403).json({ message: 'Este caso no pertenece a tu jurisdicción' });
+    }
+    const esAbandonadoAvisado = marker.category === 'perros_gatos'
+      && marker.animalTipo === 'abandonado'
+      && Boolean(marker.avisadoAt);
+    if (!esAbandonadoAvisado) {
+      return res.status(400).json({
+        message: 'Solo aplica a animales abandonados que ya fueron avisados a la oficina.',
+      });
+    }
+    if (['rechazado', 'resuelto', 'pendiente_aprobacion'].includes(marker.status)) {
+      return res.status(400).json({ message: 'Este caso no se puede devolver a Reportes en este estado.' });
+    }
+    marker.avisadoAt = null;
+    marker.nuevoDerivadoParaAdmin = false;
+    marker.nuevoParaAdmin = true;
+    marker.colaAdminAt = null;
+    marker.motivoCola = null;
+    await marker.save();
     await marker.populate('tenant', JURISDICTION_FIELDS);
     res.json(sanitizeMarkerResponse(marker, req.adminScope, req.requester));
   } catch (error) {

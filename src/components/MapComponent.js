@@ -151,6 +151,28 @@ const mismosPinesVisibles = (a, b) => {
   return true;
 };
 
+/** Si varios pines caen en el mismo punto, los separa un poco en círculo (~metros). */
+const posicionPinConOffset = (marker, markers) => {
+  const lat = Number(marker.lat);
+  const lng = Number(marker.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return { lat, lng };
+  const clave = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+  const mismos = markers.filter((m) => {
+    const la = Number(m.lat);
+    const ln = Number(m.lng);
+    return Number.isFinite(la) && Number.isFinite(ln)
+      && `${la.toFixed(5)},${ln.toFixed(5)}` === clave;
+  });
+  if (mismos.length <= 1) return { lat, lng };
+  const i = Math.max(0, mismos.findIndex((m) => String(m._id) === String(marker._id)));
+  const angle = (2 * Math.PI * i) / mismos.length - Math.PI / 2;
+  const metros = 14;
+  const dLat = (metros * Math.cos(angle)) / 111320;
+  const dLng = (metros * Math.sin(angle))
+    / (111320 * Math.max(0.2, Math.cos((lat * Math.PI) / 180)));
+  return { lat: lat + dLat, lng: lng + dLng };
+};
+
 /** Capa de pines aislada: no se re-monta si solo cambia la dirección del buscador / pin central */
 const CapaPinesMapa = React.memo(function CapaPinesMapa({
   markers,
@@ -176,7 +198,7 @@ const CapaPinesMapa = React.memo(function CapaPinesMapa({
       return a.index - b.index;
     });
   return ordenados.map(({ marker, index }) => {
-    const posicion = { lat: Number(marker.lat), lng: Number(marker.lng) };
+    const posicion = posicionPinConOffset(marker, markers);
     const clave = marker._id || `nuevo-${index}`;
     const esMio = !isAdmin && userId !== 'anonimo' && (marker.createdBy
       ? String(marker.createdBy).trim().toLowerCase()
@@ -770,26 +792,24 @@ const buscarReparacionesCercanas = (lista, lat, lng) => lista
 
 const TIPOS_NOTIF_PANEL_ADMIN = new Set(['por_aprobar', 'nuevo_reporte', 'nueva_perdida']);
 const RADAR_VISTA_KEY = 'ciudadar-radar-vista';
+const RADAR_PREFS_KEY = 'ciudadar-radar-prefs';
 const MIS_REPORTES_VISTA_KEY = 'ciudadar-mis-reportes-vista';
 const ANIMAL_FILTROS_RADAR = new Set(['todos', 'perdido', 'abandonado', 'adopcion']);
+const CERCA_ORIGEN_DEFAULT = 'gps';
+const CERCA_RADIO_DEFAULT = 2500;
+/** Solo recuerda panel abierto / pestaña. Origen y radio siempre arrancan limpios. */
 const leerRadarVistaGuardada = () => {
   try {
+    localStorage.removeItem(RADAR_PREFS_KEY);
     const raw = sessionStorage.getItem(RADAR_VISTA_KEY);
     if (!raw) return null;
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object') return null;
-    const radio = Number(data.cercaRadio);
     return {
       abierto: !!data.abierto,
       modo: data.modo === 'animales' ? 'animales' : 'cosas',
       seccion: data.seccion === 'activos' ? 'activos' : 'cerca',
       animalFiltro: ANIMAL_FILTROS_RADAR.has(data.animalFiltro) ? data.animalFiltro : 'todos',
-      cercaOrigen: data.cercaOrigen === 'mapa' || data.cercaOrigen === 'vigilada'
-        ? data.cercaOrigen
-        : 'gps',
-      cercaRadio: Number.isFinite(radio)
-        ? Math.min(8000, Math.max(500, radio))
-        : 2500,
       busqueda: typeof data.busqueda === 'string' ? data.busqueda.slice(0, 120) : '',
     };
   } catch {
@@ -987,10 +1007,10 @@ function MapComponent({
   // Filtros: siempre defaults al montar (no se heredan de sesión anterior)
   const [misBusqueda, setMisBusqueda] = useState('');
   const [misBusquedaDebounced, setMisBusquedaDebounced] = useState('');
-  const [misFiltroEstado, setMisFiltroEstado] = useState('');
-  const [misFiltroCategoria, setMisFiltroCategoria] = useState('');
+  const [misFiltroEstado, setMisFiltroEstado] = useState('pendiente');
+  const [misFiltroCategoria, setMisFiltroCategoria] = useState('reparaciones');
   const [misFiltroRegistroCategoria, setMisFiltroRegistroCategoria] = useState('reparaciones');
-  const [misFiltroRegistroTipo, setMisFiltroRegistroTipo] = useState('');
+  const [misFiltroRegistroTipo, setMisFiltroRegistroTipo] = useState('resuelto');
   const [misFiltroRegistroPeriodo, setMisFiltroRegistroPeriodo] = useState('7');
   const [misFiltroRegistroDesde, setMisFiltroRegistroDesde] = useState('');
   const [misFiltroRegistroHasta, setMisFiltroRegistroHasta] = useState('');
@@ -1003,11 +1023,13 @@ function MapComponent({
   const [radarBusqueda, setRadarBusqueda] = useState(() => radarVistaInicial?.busqueda || '');
   const [radarVistaAmpliada, setRadarVistaAmpliada] = useState(false);
   const [perdidasNoLeidasLocal, setPerdidasNoLeidasLocal] = useState(0);
-  const [cercaOrigen, setCercaOrigen] = useState(() => radarVistaInicial?.cercaOrigen || 'gps'); // gps | mapa | vigilada
-  const [cercaRadioMetros, setCercaRadioMetros] = useState(() => radarVistaInicial?.cercaRadio || 2500);
+  const [cercaOrigen, setCercaOrigen] = useState(CERCA_ORIGEN_DEFAULT); // gps | mapa | vigilada
+  const [cercaRadioMetros, setCercaRadioMetros] = useState(CERCA_RADIO_DEFAULT);
   const cercaRadioMetrosRef = useRef(cercaRadioMetros);
   const radarModoRef = useRef(radarModo);
   const animalFiltroRadarRef = useRef(animalFiltroRadar);
+  const markersRef = useRef(markers);
+  markersRef.current = markers;
   const radarRestauradoRef = useRef(!!radarVistaInicial?.abierto && !misReportesVistaInicial?.abierto);
   const misReportesRestauradoRef = useRef(!!misReportesVistaInicial?.abierto);
   const [zonaAlerta, setZonaAlerta] = useState(null); // { lat, lng, radio }
@@ -1645,10 +1667,10 @@ const stopTouchPropagation = (event) => {
   const resetMisFiltros = useCallback(() => {
     setMisBusqueda('');
     setMisBusquedaDebounced('');
-    setMisFiltroEstado('');
-    setMisFiltroCategoria('');
+    setMisFiltroEstado('pendiente');
+    setMisFiltroCategoria('reparaciones');
     setMisFiltroRegistroCategoria('reparaciones');
-    setMisFiltroRegistroTipo('');
+    setMisFiltroRegistroTipo('resuelto');
     setMisFiltroRegistroPeriodo('7');
     setMisFiltroRegistroDesde('');
     setMisFiltroRegistroHasta('');
@@ -1819,6 +1841,7 @@ const stopTouchPropagation = (event) => {
     setCargandoMisLista(true);
     try {
       if (seccionRadar === 'cerca') {
+        // Misma fuente que el mapa general (markers). Nada de otra consulta que invente pines.
         const origen = origenOverride || cercaOrigenRef.current || cercaOrigen;
         const punto = puntoOverride || puntoCercaActivo(origen);
         if (!punto) {
@@ -1829,47 +1852,40 @@ const stopTouchPropagation = (event) => {
           return;
         }
         const radio = Number(cercaRadioMetrosRef.current) || 2500;
-        const params = {
-          cerca: '1',
-          lat: punto.lat,
-          lng: punto.lng,
-          radius: radio,
-          limit: 100,
-          page: 1,
-          category: modo === 'animales' ? 'perros_gatos' : 'cosas_perdidas',
-        };
-        if (modo === 'animales' && animalFiltro && animalFiltro !== 'todos') {
-          params.animalTipo = animalFiltro;
-        }
-        const { data } = await axios.get('http://localhost:5001/api/markers', {
-          headers: { 'x-user-id': userId },
-          params,
-        });
-        if (seq !== perdidasFetchSeqRef.current) return;
         const yo = String(userId || '').trim().toLowerCase();
         const catOk = modo === 'animales' ? 'perros_gatos' : 'cosas_perdidas';
-        const lista = (data.items || [])
-          .map((m) => ({
-            ...normalizarMisItem(m),
-            distanciaMetros: m.distanciaMetros,
-          }))
+        const lista = (markersRef.current || [])
           .filter((m) => {
             if (m.category !== catOk) return false;
+            if (!Number.isFinite(Number(m.lat)) || !Number.isFinite(Number(m.lng))) return false;
             if (modo === 'animales' && animalFiltro && animalFiltro !== 'todos'
               && m.animalTipo !== animalFiltro) {
+              return false;
+            }
+            if (m.eliminadoAt || m.status === 'resuelto' || m.status === 'rechazado'
+              || m.status === 'pendiente_aprobacion') {
               return false;
             }
             if (yo && yo !== 'anonimo'
               && String(m.createdBy || '').trim().toLowerCase() === yo) {
               return false;
             }
-            return true;
-          });
+            const d = distanciaMetros(punto.lat, punto.lng, Number(m.lat), Number(m.lng));
+            return d <= radio;
+          })
+          .map((m) => ({
+            ...m,
+            distanciaMetros: Math.round(
+              distanciaMetros(punto.lat, punto.lng, Number(m.lat), Number(m.lng))
+            ),
+          }))
+          .sort((a, b) => (a.distanciaMetros || 0) - (b.distanciaMetros || 0));
+        if (seq !== perdidasFetchSeqRef.current) return;
         setPerdidasLista(lista);
         setPinesCercaMapa(lista);
         setMisPage(1);
         setMisMeta({
-          total: data.total != null ? data.total : lista.length,
+          total: lista.length,
           hasMore: false,
           limit: pageLimit,
         });
@@ -2125,7 +2141,7 @@ const stopTouchPropagation = (event) => {
   animalFiltroRadarRef.current = animalFiltroRadar;
   cercaRadioMetrosRef.current = Number(cercaRadioMetros) || 2500;
 
-  // Persistir Radar al refrescar (misma pestaña)
+  // Persistir panel Radar al refrescar; origen/radio no se guardan (evita estado viejo roto)
   useEffect(() => {
     if (modoSoloCaso) return;
     try {
@@ -2134,10 +2150,9 @@ const stopTouchPropagation = (event) => {
         modo: radarModo,
         seccion: perdidasSeccion === 'activos' ? 'activos' : 'cerca',
         animalFiltro: animalFiltroRadar,
-        cercaOrigen: cercaOrigen === 'mapa' || cercaOrigen === 'vigilada' ? cercaOrigen : 'gps',
-        cercaRadio: cercaRadioMetros,
         busqueda: radarBusqueda,
       }));
+      localStorage.removeItem(RADAR_PREFS_KEY);
     } catch {
       /* ignore quota / private mode */
     }
@@ -2147,8 +2162,6 @@ const stopTouchPropagation = (event) => {
     radarModo,
     perdidasSeccion,
     animalFiltroRadar,
-    cercaOrigen,
-    cercaRadioMetros,
     radarBusqueda,
   ]);
 
@@ -2176,6 +2189,13 @@ const stopTouchPropagation = (event) => {
     radarRestauradoRef.current = false;
     cargarPerdidasLista(perdidasSeccion, 1);
   }, [userId, modoSoloCaso, mostrarCosasPerdidas, perdidasSeccion, cargarPerdidasLista]);
+
+  // Si el mapa general actualiza markers, la lista Cerca se rearma del mismo set
+  useEffect(() => {
+    if (!mostrarCosasPerdidas || perdidasSeccion !== 'cerca') return;
+    if (!userId || userId === 'anonimo') return;
+    cargarPerdidasLista('cerca', 1);
+  }, [markers, mostrarCosasPerdidas, perdidasSeccion, userId, cargarPerdidasLista]);
 
   // Tras F5: si Mis reportes estaba abierto, recargar la lista
   useEffect(() => {
@@ -2460,10 +2480,10 @@ const stopTouchPropagation = (event) => {
       resetMisFiltros();
       cargarMisLista('activos', 1, {
         q: '',
-        status: '',
-        category: '',
+        status: 'pendiente',
+        category: 'reparaciones',
         registroCategory: 'reparaciones',
-        tipoCierre: '',
+        tipoCierre: 'resuelto',
         periodo: '7',
         desde: '',
         hasta: '',
@@ -2475,8 +2495,14 @@ const stopTouchPropagation = (event) => {
       setMostrarMisReportes(false);
       setMostrarCosasPerdidas(true);
       setPerdidasSeccion('cerca');
+      setCercaOrigen(CERCA_ORIGEN_DEFAULT);
+      setCercaRadioMetros(CERCA_RADIO_DEFAULT);
+      cercaOrigenRef.current = CERCA_ORIGEN_DEFAULT;
+      cercaRadioMetrosRef.current = CERCA_RADIO_DEFAULT;
       setMisPage(1);
-      cargarPerdidasLista('cerca', 1);
+      setPinesCercaMapa([]);
+      setPerdidasLista([]);
+      cargarPerdidasLista('cerca', 1, CERCA_ORIGEN_DEFAULT);
       // El badge de "Nuevo"/cerca se limpia al mostrar Cerca (efecto abajo)
     }
     if (panelVecino === 'filtros') {
@@ -2576,82 +2602,96 @@ const stopTouchPropagation = (event) => {
     fetchRole();
   }, [userId]);
 
-  const [markersMeta, setMarkersMeta] = useState({ total: 0, hasMore: false, limit: 60 });
+  const [markersMeta, setMarkersMeta] = useState({ total: 0, hasMore: false, limit: 100 });
 
-  // Carga filtrada + paginada en el servidor (no trae todo el dataset)
+  // Carga filtrada + paginada. Con "todas", trae también animales y perdidas
+  // en consultas propias para que el mapa general y el Radar usen el mismo set.
   useEffect(() => {
     if (modoSoloCaso) return undefined;
     let cancelado = false;
+    const normalizarMarkerMapa = (marker) => ({
+      ...marker,
+      isSaved: true,
+      category: normalizeCategoryValue(marker.category),
+      status: marker.status || 'pendiente',
+      resolvedAt: marker.resolvedAt || null,
+      caseId: marker.caseId || null,
+      resolvedBy: marker.resolvedBy || null,
+      resolvedByReportedAt: marker.resolvedByReportedAt || null,
+      perdidaTipo: marker.perdidaTipo || '',
+      objeto: marker.objeto || '',
+      contacto: marker.contacto || '',
+      claimedByMe: !!marker.claimedByMe,
+      canChat: !!marker.canChat,
+      claimCount: marker.claimCount || 0,
+      chatAbiertoPorMi: !!marker.chatAbiertoPorMi,
+      confirmacionPerdidaMia: marker.confirmacionPerdidaMia || null,
+      perdidaEsperaOtraParte: !!marker.perdidaEsperaOtraParte,
+      canManage: !!marker.canManage,
+      pideDatosAt: marker.pideDatosAt || null,
+      pideDatosMensaje: marker.pideDatosMensaje || '',
+      respuestaDatosAt: marker.respuestaDatosAt || null,
+      ultimaRespuestaDatosAt: marker.ultimaRespuestaDatosAt || null,
+      eliminadoAt: marker.eliminadoAt || null,
+      motivoEliminacion: marker.motivoEliminacion || '',
+      aprobadoAt: marker.aprobadoAt || null,
+      createdBy: marker.createdBy
+        ? String(marker.createdBy).trim().toLowerCase()
+        : 'anonimo',
+    });
+
     const fetchMarkers = async () => {
       try {
-        const params = {
-          limit: 60,
-          page: 1,
-        };
+        const baseParams = { limit: 100, page: 1 };
+        if (soloMisReportes) baseParams.mine = '1';
+        if (soloMiJurisdiccion) baseParams.myJurisdiction = '1';
+
+        const headers = { 'x-user-id': userId };
+        const url = 'http://localhost:5001/api/markers';
+        let payloads = [];
+
         if (categoryFilter && categoryFilter !== 'todas') {
-          params.category = categoryFilter;
+          const params = { ...baseParams, category: categoryFilter };
+          if (categoryFilter === 'perros_gatos' && animalFilter && animalFilter !== 'todos') {
+            params.animalTipo = animalFilter;
+          }
+          const response = await axios.get(url, { headers, params });
+          if (cancelado) return;
+          payloads = [response.data];
+        } else {
+          // Tres consultas: mixto + cupo propio de animales + cupo propio de perdidas
+          const [mixto, animales, perdidas] = await Promise.all([
+            axios.get(url, { headers, params: { ...baseParams } }),
+            axios.get(url, { headers, params: { ...baseParams, category: 'perros_gatos' } }),
+            axios.get(url, { headers, params: { ...baseParams, category: 'cosas_perdidas' } }),
+          ]);
+          if (cancelado) return;
+          payloads = [mixto.data, animales.data, perdidas.data];
         }
-        if (categoryFilter === 'perros_gatos' && animalFilter && animalFilter !== 'todos') {
-          params.animalTipo = animalFilter;
-        }
-        if (soloMisReportes) {
-          params.mine = '1';
-        }
-        if (soloMiJurisdiccion) {
-          params.myJurisdiction = '1';
-        }
-        const response = await axios.get('http://localhost:5001/api/markers', {
-          headers: { 'x-user-id': userId },
-          params,
-        });
-        if (cancelado) return;
-        const payload = response.data;
-        const lista = Array.isArray(payload) ? payload : (payload.items || []);
+
         const ocultos = idsEnBorradoRef.current;
-        const savedMarkers = lista
-          .filter((marker) => !ocultos.has(String(marker._id)))
-          .map((marker) => ({
-            ...marker,
-            isSaved: true,
-            category: normalizeCategoryValue(marker.category),
-            status: marker.status || 'pendiente',
-            resolvedAt: marker.resolvedAt || null,
-            caseId: marker.caseId || null,
-            resolvedBy: marker.resolvedBy || null,
-            resolvedByReportedAt: marker.resolvedByReportedAt || null,
-            perdidaTipo: marker.perdidaTipo || '',
-            objeto: marker.objeto || '',
-            contacto: marker.contacto || '',
-            claimedByMe: !!marker.claimedByMe,
-            canChat: !!marker.canChat,
-            claimCount: marker.claimCount || 0,
-            chatAbiertoPorMi: !!marker.chatAbiertoPorMi,
-            confirmacionPerdidaMia: marker.confirmacionPerdidaMia || null,
-            perdidaEsperaOtraParte: !!marker.perdidaEsperaOtraParte,
-            canManage: !!marker.canManage,
-            pideDatosAt: marker.pideDatosAt || null,
-            pideDatosMensaje: marker.pideDatosMensaje || '',
-            respuestaDatosAt: marker.respuestaDatosAt || null,
-            ultimaRespuestaDatosAt: marker.ultimaRespuestaDatosAt || null,
-            eliminadoAt: marker.eliminadoAt || null,
-            motivoEliminacion: marker.motivoEliminacion || '',
-            aprobadoAt: marker.aprobadoAt || null,
-            createdBy: marker.createdBy
-              ? String(marker.createdBy).trim().toLowerCase()
-              : 'anonimo',
-          }));
+        const byId = new Map();
+        payloads.forEach((payload) => {
+          const lista = Array.isArray(payload) ? payload : (payload.items || []);
+          lista.forEach((marker) => {
+            if (!marker?._id || ocultos.has(String(marker._id))) return;
+            byId.set(String(marker._id), normalizarMarkerMapa(marker));
+          });
+        });
+        const savedMarkers = Array.from(byId.values());
         const idsVisibles = new Set(savedMarkers.map((m) => String(m._id)));
         const extrasAdmin = [...casosAdminForzadosRef.current.values()]
           .filter((m) => !idsVisibles.has(String(m._id)) && !ocultos.has(String(m._id)));
         setMarkers([...savedMarkers, ...extrasAdmin]);
-        if (!Array.isArray(payload)) {
+        const principal = payloads[0];
+        if (principal && !Array.isArray(principal)) {
           setMarkersMeta({
-            total: payload.total || savedMarkers.length,
-            hasMore: !!payload.hasMore,
-            limit: payload.limit || 60,
+            total: savedMarkers.length,
+            hasMore: !!principal.hasMore,
+            limit: principal.limit || 100,
           });
         } else {
-          setMarkersMeta({ total: savedMarkers.length, hasMore: false, limit: 60 });
+          setMarkersMeta({ total: savedMarkers.length, hasMore: false, limit: 100 });
         }
       } catch (error) {
         console.error('Error fetching markers:', error);
@@ -4838,45 +4878,25 @@ const renderOficinas = (tipo, jurisdiccion) => {
       : (soloMiJurisdiccion
         ? markers.filter((m) => m.canManage)
         : markers);
-    // Radar: Míos = tu lista. Cerca = pines del mapa general + búsqueda (si no, solo aparecen al “barrer” con el radio)
+    // Radar: exactamente los mismos pines de esa categoría que el mapa general.
+    // (La lista de Cerca solo filtra por radio; no agrega casos de otra consulta.)
     const visibleMarkers = (() => {
       if (!mostrarCosasPerdidas || modoSoloCaso) return visibleMarkersBase;
       const catRadar = radarModo === 'animales' ? 'perros_gatos' : 'cosas_perdidas';
-      const yo = String(userId || '').trim().toLowerCase();
       const sirve = (m) => {
         if (m.category !== catRadar) return false;
         if (!Number.isFinite(Number(m.lat)) || !Number.isFinite(Number(m.lng))) return false;
+        if (m.eliminadoAt || m.status === 'resuelto' || m.status === 'rechazado') return false;
         if (radarModo === 'animales' && animalFiltroRadar && animalFiltroRadar !== 'todos'
           && m.animalTipo !== animalFiltroRadar) {
           return false;
-        }
-        if (perdidasSeccion === 'cerca' && yo && yo !== 'anonimo') {
-          const dueno = String(m.createdBy || '').trim().toLowerCase();
-          if (dueno === yo) return false;
         }
         return true;
       };
       if (perdidasSeccion === 'activos') {
         return perdidasLista.filter(sirve);
       }
-      // Cerca: no reemplazar el mapa por la búsqueda; unir mapa cargado + resultados del radio
-      // (si solo usamos el radio, los pines fuera del círculo desaparecen hasta “barrer”)
-      const punto = puntoCercaActivo(cercaOrigen);
-      const radio = Number(cercaRadioMetros) || 2500;
-      const dentroDelCirculo = (m) => {
-        if (!punto || !Number.isFinite(punto.lat) || !Number.isFinite(punto.lng)) return true;
-        return distanciaMetros(punto.lat, punto.lng, Number(m.lat), Number(m.lng)) <= radio;
-      };
-      const byId = new Map();
-      visibleMarkersBase.filter(sirve).forEach((m) => byId.set(String(m._id), m));
-      // Resultados del radio: solo los que siguen dentro (al achicar no quedan pegados afuera)
-      pinesCercaMapa.filter((m) => sirve(m) && dentroDelCirculo(m)).forEach((m) => {
-        byId.set(String(m._id), m);
-      });
-      perdidasLista.filter((m) => sirve(m) && dentroDelCirculo(m)).forEach((m) => {
-        byId.set(String(m._id), m);
-      });
-      return Array.from(byId.values());
+      return visibleMarkersBase.filter(sirve);
     })();
     const misReportes = misReportesSeccion === 'registro'
       ? misReportesRegistro
@@ -6756,9 +6776,9 @@ const renderOficinas = (tipo, jurisdiccion) => {
                     }}
                     aria-label="Categoría"
                   >
-                    <option value="">
-                      {misReportesSeccion === 'activos' ? 'Todos' : 'Todas las categorías'}
-                    </option>
+                    {misReportesSeccion === 'registro' && (
+                      <option value="">Todas las categorías</option>
+                    )}
                     <option value="reparaciones">Reparaciones</option>
                     <option value="perros_gatos">Perros y gatos</option>
                     <option value="familias">Familias</option>
@@ -6770,7 +6790,6 @@ const renderOficinas = (tipo, jurisdiccion) => {
                       onChange={(e) => setMisFiltroEstado(e.target.value)}
                       aria-label="Estado"
                     >
-                      <option value="">Todos</option>
                       <option value="pendiente_aprobacion">En revisión</option>
                       <option value="pendiente">Publicado</option>
                       <option value="en_proceso">En atención</option>
@@ -6783,7 +6802,6 @@ const renderOficinas = (tipo, jurisdiccion) => {
                         onChange={(e) => setMisFiltroRegistroTipo(e.target.value)}
                         aria-label="Tipo de cierre"
                       >
-                        <option value="">Todo tipo de cierre</option>
                         <option value="resuelto">Resuelto</option>
                         <option value="anulado">Anulado</option>
                         <option value="vencido">Vencido</option>
